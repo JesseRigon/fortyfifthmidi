@@ -33,6 +33,18 @@ static void check(const char* what, int got, int want)
     }
 }
 
+/* Like check(), but for values that are plain numbers rather than pitch
+ * classes - printing an octave as a note name would be gibberish. */
+static void checkInt(const char* what, int got, int want)
+{
+    if (got == want) {
+        std::printf("  ok    %-30s %d\n", what, got);
+    } else {
+        std::printf("  FAIL  %-30s got %d, want %d\n", what, got, want);
+        ++failures;
+    }
+}
+
 static void checkStr(const char* what, const char* got, const char* want)
 {
     const bool ok = (got != nullptr && std::strcmp(got, want) == 0);
@@ -143,6 +155,69 @@ int main()
             ++failures;
         }
     }
+
+    /*
+     * Keyboard mapping. The real check is not that the table says what it says,
+     * but that the cell it lands on genuinely PLAYS that degree - decoded by
+     * degreeInKey(), which the wheel's own highlighting uses. If the two ever
+     * disagree the keyboard would play chords the wheel does not light up.
+     *
+     * Checked in all 12 keys, because the offsets are relative and an error in
+     * one ring's cell arithmetic would show up only after transposing.
+     */
+    std::printf("\n=== keyboard mapping: degree agrees in all 12 keys ===\n");
+    struct { int note; const char* degree; const char* name; } kMap[] = {
+        { 4,  "III",  "E  -> III"  },
+        { 5,  "IV",   "F  -> IV"   },
+        { 7,  "I",    "G  -> I"    },
+        { 9,  "V",    "A  -> V"    },
+        { 11, "II",   "B  -> II"   },
+        { 3,  "vii°", "D# -> vii°" },
+        { 6,  "ii",   "F# -> ii"   },
+        { 8,  "iii",  "G# -> iii"  },
+        { 10, "vi",   "A# -> vi"   },
+    };
+
+    for (const auto& m : kMap) {
+        bool allKeys = true;
+        for (int key = 0; key < 12 && allKeys; ++key) {
+            int  pos;
+            Ring ring;
+            if (! cellForMidiNote(m.note, key, pos, ring)) {
+                allKeys = false;
+                break;
+            }
+            const char* deg = degreeInKey(pos, ring, key);
+            if (deg == nullptr || std::strcmp(deg, m.degree) != 0)
+                allKeys = false;
+        }
+
+        if (allKeys) {
+            std::printf("  ok    %-30s %s in every key\n", m.name, m.degree);
+        } else {
+            std::printf("  FAIL  %-30s does not resolve to %s\n",
+                        m.name, m.degree);
+            ++failures;
+        }
+    }
+
+    std::printf("\n=== unmapped keys stay silent ===\n");
+    for (int pc = 0; pc <= 2; ++pc) {
+        int  pos;
+        Ring ring;
+        if (! cellForMidiNote(pc, 0, pos, ring)) {
+            std::printf("  ok    %-30s ignored\n", kPitch[pc]);
+        } else {
+            std::printf("  FAIL  %-30s should be unmapped\n", kPitch[pc]);
+            ++failures;
+        }
+    }
+
+    /* The controller's octave is absolute - middle C (60) is octave 4. */
+    std::printf("\n=== octave follows the controller ===\n");
+    checkInt("note 60 -> octave 4", octaveForMidiNote(60), 4);
+    checkInt("note 48 -> octave 3", octaveForMidiNote(48), 3);
+    checkInt("note 72 -> octave 5", octaveForMidiNote(72), 5);
 
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "PASS" : "FAIL",

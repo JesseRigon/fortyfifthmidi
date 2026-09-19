@@ -73,6 +73,7 @@ protected:
         }
 
         drawCenterReadout(cx, cy, ringInnerRadius(kRingKey, outer));
+        drawOctaveSlider();
         drawControls();
 
         drawMonitor();
@@ -246,8 +247,14 @@ protected:
              * diatonic set follows the key you are playing in - unless the key
              * is locked, in which case the chord still sounds but the reference
              * wedge stays put. */
-            if (ring == kRingKey && ! fKeyLocked)
+            if (ring == kRingKey && ! fKeyLocked) {
                 fSelectedKey = pos;
+                /* The DSP needs the key too now: an incoming MIDI note selects
+                 * a cell by degree, so it cannot be resolved without it. */
+                char kb[16];
+                std::snprintf(kb, sizeof(kb), "%d", fSelectedKey);
+                setState("selectedKey", kb);
+            }
 
             /* In latch mode a press on the lit selection turns it off, matching
              * the DSP's toggle. */
@@ -267,9 +274,20 @@ protected:
             return true;
         }
 
+        /* A slider drag ends without touching the wheel's gesture state. */
+        if (fSliderDrag) {
+            fSliderDrag = false;
+            return true;
+        }
+
         if (fDragging) {
             fDragging = false;
-            sendGesture("release", fActivePosition, fActiveRing);
+            /* Position 0 rather than fActivePosition: a latch toggle clears the
+             * active cell to -1, which the DSP rejects as out of range - and a
+             * dropped release is a stuck note. Release stops everything
+             * regardless of which cell it names, so any valid value serves. */
+            sendGesture("release",
+                        fActivePosition < 0 ? 0 : fActivePosition, fActiveRing);
 
             /* Latched selections stay lit because they are still sounding;
              * momentary ones must go dark, or the highlight lies about what is
@@ -300,6 +318,13 @@ protected:
 
     bool onMotion(const MotionEvent& ev) override
     {
+        /* Dragging the octave slider transposes whatever is sounding. The DSP
+         * rebuilds held groups at the new octave, so the chord travels. */
+        if (fSliderDrag) {
+            setOctave(octaveAtY(ev.pos.getY()));
+            return true;
+        }
+
         if (! fDragging)
             return false;
 
@@ -358,17 +383,36 @@ protected:
                              / ringWeightTotal());
     }
 
+    /* ---- octave slider -----------------------------------------------------
+     *
+     * Vertical, down the left edge, so on a touch screen it falls under the
+     * left hand while the right plays the wheel - and so it can be DRAGGED
+     * while notes sound, which is what makes it an instrument control rather
+     * than a preference. Dragging it glides the sounding chord through the
+     * octaves, using the same glide machinery as movement between cells.
+     */
+    static constexpr float kSliderW     = 46.0f;
+    static constexpr float kOctaveMin   = 1.0f;
+    static constexpr float kOctaveMax   = 7.0f;
+
     /* The wheel is centred in whatever the chrome leaves behind, so nothing
      * overlaps. Two control rows above; the monitor below, which is just its
-     * header bar until expanded. */
+     * header bar until expanded; the octave slider down the left. */
     float chromeTop() const { return kDropY + kDropH + 10.0f; }
+
+    /* Horizontal space the slider claims, so the wheel never sits under it. */
+    float chromeLeft() const { return kSliderW + 16.0f; }
 
     float chromeBottom() const
     {
         return kHeaderH + (fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f);
     }
 
-    float wheelCentreX() const { return getWidth() * 0.5f; }
+    /* Centred in the space left of the slider, not of the window. */
+    float wheelCentreX() const
+    {
+        return chromeLeft() + (getWidth() - chromeLeft()) * 0.5f;
+    }
 
     float wheelCentreY() const
     {
@@ -378,7 +422,7 @@ protected:
     float wheelRadius() const
     {
         const float usableH = getHeight() - chromeTop() - chromeBottom();
-        const float usableW = getWidth();
+        const float usableW = getWidth() - chromeLeft();
         return (usableW < usableH ? usableW : usableH) * 0.46f;
     }
 
@@ -443,6 +487,8 @@ protected:
     Button latchButton() const { return { 10.0f,  8.0f,  78.0f, 22.0f }; }
     Button glideButton() const { return { 94.0f,  8.0f,  92.0f, 22.0f }; }
     Button keyLockButton() const { return { 192.0f, 8.0f, 96.0f, 22.0f }; }
+    /* Bypass chord generation: the wheel becomes a note selector. */
+    Button singleNoteButton() const { return { 294.0f, 8.0f, 104.0f, 22.0f }; }
 
     /*
      * Row 2: one dropdown pair per ring. Extensions and voicings are per-ring,
@@ -472,6 +518,87 @@ protected:
         return { anchor.x, anchor.y + anchor.h + 2.0f + index * kMenuRowH,
                  anchor.w < 120.0f ? 140.0f : anchor.w, kMenuRowH };
     }
+
+    Button octaveSlider() const
+    {
+        const float top = chromeTop();
+        return { 8.0f, top,
+                 kSliderW, getHeight() - top - chromeBottom() - 8.0f };
+    }
+
+    /* Octave under a y coordinate. Inverted: up is higher, as on a keyboard. */
+    int octaveAtY(double py) const
+    {
+        const Button s = octaveSlider();
+        float t = static_cast<float>(py - s.y) / s.h;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+
+        const int span = static_cast<int>(kOctaveMax - kOctaveMin);
+        return static_cast<int>(kOctaveMax) -
+               static_cast<int>(t * span + 0.5f);
+    }
+
+    void drawOctaveSlider()
+    {
+        const Button s = octaveSlider();
+
+        beginPath();
+        roundedRect(s.x, s.y, s.w, s.h, 6.0f);
+        fillColor(Color(0.12f, 0.13f, 0.17f));
+        fill();
+        strokeColor(Color(0.26f, 0.28f, 0.34f));
+        strokeWidth(1.0f);
+        stroke();
+
+        const int span = static_cast<int>(kOctaveMax - kOctaveMin);
+        const float rowH = s.h / (span + 1);
+
+        for (int i = 0; i <= span; ++i) {
+            const int   oct = static_cast<int>(kOctaveMax) - i;
+            const float y   = s.y + i * rowH;
+            const bool  on  = (oct == fOctave);
+
+            if (on) {
+                beginPath();
+                roundedRect(s.x + 3.0f, y + 2.0f, s.w - 6.0f, rowH - 4.0f, 4.0f);
+                fillColor(Color(0.30f, 0.62f, 0.45f));
+                fill();
+            }
+
+            char lbl[8];
+            std::snprintf(lbl, sizeof(lbl), "%d", oct);
+
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(13.0f);
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            fillColor(on ? Color(0.96f, 0.98f, 0.96f)
+                         : Color(0.55f, 0.59f, 0.66f));
+            text(s.x + s.w * 0.5f, y + rowH * 0.5f, lbl, nullptr);
+        }
+
+        /* Label the control, below the last row. */
+        fontSize(9.5f);
+        fillColor(Color(0.45f, 0.48f, 0.55f));
+        text(s.x + s.w * 0.5f, s.y + s.h + 1.0f, "OCT", nullptr);
+    }
+
+    /* Push a new octave to the DSP. Dragging sends every step, so a sounding
+     * chord glides through the octaves as the finger moves. */
+    void setOctave(int oct)
+    {
+        if (oct < static_cast<int>(kOctaveMin)) oct = static_cast<int>(kOctaveMin);
+        if (oct > static_cast<int>(kOctaveMax)) oct = static_cast<int>(kOctaveMax);
+        if (oct == fOctave)
+            return;
+
+        fOctave = oct;
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", fOctave);
+        setState("octave", buf);
+        repaint();
+    }
+
 
     static bool hit(const Button& b, double px, double py)
     {
@@ -526,6 +653,9 @@ protected:
         drawButton(keyLockButton(),
                    fKeyLocked ? "Key: locked" : "Key: follows",
                    fKeyLocked);
+        drawButton(singleNoteButton(),
+                   fSingleNotes ? "Single notes" : "Chords",
+                   fSingleNotes);
 
         /* Per-ring dropdowns, labelled by ring so the mapping is unambiguous. */
         static const char* const kRingTag[kRingCount] = { "Maj", "Min", "Dim" };
@@ -629,6 +759,15 @@ protected:
             return true;   /* click-away closes without selecting */
         }
 
+        /* Octave slider: takes the press and keeps receiving motion, so it can
+         * be dragged through the octaves while notes sound. */
+        if (hit(octaveSlider(), px, py)) {
+            fSliderDrag = true;
+            setOctave(octaveAtY(py));
+            repaint();
+            return true;
+        }
+
         /* Panic first: it sits inside the header bar. */
         if (hit(panicButton(), px, py)) {
             setState("panic", "1");
@@ -660,10 +799,18 @@ protected:
             return true;
         }
 
-        /* Key lock is purely a UI concern - the DSP never needs to know which
-         * wedge is highlighted. */
+        /* Key lock is purely a UI concern for the highlight - but the DSP does
+         * need the key itself, for resolving incoming MIDI notes. */
         if (hit(keyLockButton(), px, py)) {
             fKeyLocked = ! fKeyLocked;
+            repaint();
+            return true;
+        }
+
+        if (hit(singleNoteButton(), px, py)) {
+            fSingleNotes = ! fSingleNotes;
+            std::snprintf(buf, sizeof(buf), "%d", fSingleNotes ? 1 : 0);
+            setState("singleNotes", buf);
             repaint();
             return true;
         }
@@ -760,7 +907,8 @@ protected:
     /* The header bar is always present; the log below it only when expanded. */
     Button monitorHeader() const
     {
-        return { 0.0f, getHeight() - kHeaderH, getWidth(), kHeaderH };
+        return { 0.0f, getHeight() - kHeaderH,
+                 static_cast<float>(getWidth()), kHeaderH };
     }
 
     Button panicButton() const
@@ -906,6 +1054,17 @@ private:
     /* When locked, clicking the key ring plays the chord but leaves the
      * highlighted wedge where it is. */
     bool fKeyLocked = false;
+
+    /* Bypass chord generation and sound the root alone. */
+    bool fSingleNotes = false;
+
+    /* Octave for pointer and touch input. Mirrors the DSP's setting; a played
+     * MIDI note carries its own octave instead. */
+    int  fOctave = 4;
+
+    /* A drag that started on the octave slider, kept separate from the wheel's
+     * drag so the two gestures cannot interfere. */
+    bool fSliderDrag = false;
 
     DISTRHO_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FortyFifthUI)
 };

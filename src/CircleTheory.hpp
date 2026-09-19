@@ -430,6 +430,93 @@ inline bool sameShape(ChordType a, ChordType b)
 /* Cells per ring, for callers that only have the enum. */
 inline int cellsForRing(Ring ring) { return kRingSegments[ring]; }
 
+/*
+ * ---- keyboard mapping --------------------------------------------------
+ *
+ * An incoming MIDI note triggers a cell, so a controller keyboard can play the
+ * wheel. The mapping is by DEGREE, not by absolute chord: the same physical key
+ * plays I in whatever key is selected, so the keyboard transposes with the wheel
+ * rather than fighting it.
+ *
+ * The layout is chosen for the hand, not for pitch order. G is the tonic because
+ * it falls under the right thumb, with IV and V to either side, and the minors
+ * sit on the black keys just above their related majors:
+ *
+ *        D#     F#  G#  A#            vii  ii  iii  vi
+ *      E   F   G   A   B              III  IV  I    V   II
+ *
+ * C, C# and D are deliberately unmapped and stay silent - they are left free for
+ * later assignment rather than being given arbitrary meanings now.
+ */
+struct KeyMapEntry {
+    int  semitone;    /* pitch class within the octave, 0 = C */
+    Ring ring;
+    int  offset;      /* cells clockwise from the selected key's own cell */
+    bool mapped;
+};
+
+/*
+ * Offsets are expressed in each ring's own cell units, measured from the key's
+ * position - exactly the relationship degreeInKey() decodes:
+ *
+ *   key ring (12 cells)    IV = -1, I = 0, V = +1, II = +2, III = +4
+ *   minor ring (24 cells)  ii = -1, iii = 0, vi = +1   (key occupies cell 2k)
+ *   dim ring (12 cells)    vii = 0
+ */
+static constexpr KeyMapEntry kKeyMap[12] = {
+    /* C  */ { 0,  kRingKey,   0, false },
+    /* C# */ { 1,  kRingKey,   0, false },
+    /* D  */ { 2,  kRingKey,   0, false },
+    /* D# */ { 3,  kRingDim,   0, true  },   /* vii */
+    /* E  */ { 4,  kRingKey,   4, true  },   /* III */
+    /* F  */ { 5,  kRingKey,  -1, true  },   /* IV  */
+    /* F# */ { 6,  kRingMinor,-1, true  },   /* ii  */
+    /* G  */ { 7,  kRingKey,   0, true  },   /* I   */
+    /* G# */ { 8,  kRingMinor, 0, true  },   /* iii */
+    /* A  */ { 9,  kRingKey,   1, true  },   /* V   */
+    /* A# */ { 10, kRingMinor, 1, true  },   /* vi  */
+    /* B  */ { 11, kRingKey,   2, true  },   /* II  */
+};
+
+/*
+ * Resolve an incoming MIDI note to a wheel cell in the given key.
+ *
+ * Returns false for the unmapped pitch classes, which the caller should ignore
+ * entirely. outPosition is a cell index in outRing's own numbering.
+ */
+inline bool cellForMidiNote(int midiNote, int keyIndex,
+                            int& outPosition, Ring& outRing)
+{
+    const int pc = ((midiNote % 12) + 12) % 12;
+    const KeyMapEntry& e = kKeyMap[pc];
+
+    if (! e.mapped)
+        return false;
+
+    outRing = e.ring;
+
+    /* The minor ring runs at double resolution, so the key's own cell is 2k
+     * there and offsets are in half-width cells. */
+    const int base = (e.ring == kRingMinor) ? keyIndex * 2 : keyIndex;
+    const int n    = kRingSegments[e.ring];
+
+    outPosition = ((base + e.offset) % n + n) % n;
+    return true;
+}
+
+/*
+ * Octave a played note asks for, as the chord's base octave.
+ *
+ * The controller's own octave is absolute: playing the mapped G in the second
+ * octave sounds the chord there, so the keyboard behaves like an instrument
+ * rather than like a switch. MIDI note 60 is C4 by the convention used here,
+ * hence the -1.
+ */
+inline int octaveForMidiNote(int midiNote)
+{
+    return (midiNote / 12) - 1;
+}
+
 /* How a cell relates to the selected key, for colouring. */
 enum CellRole {
     kCellOutside = 0,  /* not in the key */

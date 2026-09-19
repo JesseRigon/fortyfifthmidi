@@ -122,6 +122,8 @@ protected:
         kStateBendRange,
         kStateGesture,
         kStatePanic,
+        kStateSelectedKey,
+        kStateSingleNotes,
         kStateCount
     };
 
@@ -212,6 +214,20 @@ protected:
                 state.label = "Panic";
                 state.defaultValue = "";
                 break;
+            case kStateSelectedKey:
+                /* Which key the wheel is centred on. Previously a pure UI
+                 * concern, but the keyboard mapping is by degree, so the DSP
+                 * must know the key to resolve an incoming note to a cell. */
+                state.key = "selectedKey";
+                state.label = "Selected Key";
+                state.defaultValue = "0";
+                break;
+            case kStateSingleNotes:
+                /* Bypass chord generation: sound the root alone. */
+                state.key = "singleNotes";
+                state.label = "Single Notes";
+                state.defaultValue = "0";
+                break;
         }
     }
 
@@ -230,8 +246,16 @@ protected:
                 static_cast<Voicing>(((v % kVoicingCount) + kVoicingCount)
                                      % kVoicingCount);
         }
-        else if (std::strcmp(key, "octave") == 0)
-            fOctave = v;
+        else if (std::strcmp(key, "octave") == 0) {
+            if (v != fOctave) {
+                fOctave = v;
+                /* Ask the audio thread to move anything already sounding. The
+                 * slider is a performance control - dragging it while a chord
+                 * is held must carry that chord with it, not merely change
+                 * where the next one starts. */
+                fOctaveMoved.store(true, std::memory_order_release);
+            }
+        }
         else if (std::strcmp(key, "velocity") == 0)
             fVelocity = static_cast<uint8_t>(v < 1 ? 1 : (v > 127 ? 127 : v));
         else if (std::strcmp(key, "velocityRandom") == 0)
@@ -255,6 +279,10 @@ protected:
             fGlideTimeMs = v;
         else if (std::strcmp(key, "bendRange") == 0)
             fBendRange = v;
+        else if (std::strcmp(key, "selectedKey") == 0)
+            fSelectedKey.store(((v % 12) + 12) % 12, std::memory_order_release);
+        else if (std::strcmp(key, "singleNotes") == 0)
+            fSingleNotes = (v != 0);
         else if (std::strcmp(key, "panic") == 0)
             fPanic.store(true, std::memory_order_release);
         else if (std::strcmp(key, "gesture") == 0)
@@ -279,7 +307,14 @@ protected:
 
         if (std::sscanf(value, "%15[^:]:%d:%d", verb, &position, &ring) != 3)
             return;
-        if (position < 0 || position > 11 || ring < 0 || ring >= kRingCount)
+        if (ring < 0 || ring >= kRingCount)
+            return;
+
+        /* Validate against the ring's OWN cell count, not a fixed 12. The minor
+         * ring has 24, so a hardcoded upper bound silently discarded half of it
+         * - cells 12-23 produced no sound at all, because the gesture was
+         * dropped here before the audio thread ever saw it. */
+        if (position < 0 || position >= segmentsInRing(static_cast<Ring>(ring)))
             return;
 
         int kind;
@@ -310,6 +345,9 @@ protected:
         else if (std::strcmp(key, "glideMode") == 0)       v = static_cast<int>(fGlideMode);
         else if (std::strcmp(key, "glideTimeMs") == 0)     v = fGlideTimeMs;
         else if (std::strcmp(key, "bendRange") == 0)       v = fBendRange;
+        else if (std::strcmp(key, "selectedKey") == 0)
+            v = fSelectedKey.load(std::memory_order_acquire);
+        else if (std::strcmp(key, "singleNotes") == 0)  v = fSingleNotes ? 1 : 0;
 
         std::snprintf(buf, sizeof(buf), "%d", v);
         return String(buf);
@@ -329,6 +367,11 @@ protected:
 
         fDragSource  = -1;
         fGlideSource = -1;
+        /* A pedal or note left down across a restart would defer releases
+         * forever, so clear the input state too. */
+        fPedalDown        = false;
+        fLastKeyboardNote = -1;
+        fHeldKeyCount     = 0;
         fPanic.store(true, std::memory_order_release);
     }
 
@@ -347,11 +390,6 @@ protected:
     void run(const float**, float**, uint32_t frames,
              const MidiEvent* midiEvents, uint32_t midiEventCount) override
     {
-        /* Pass through anything an upstream controller sent us, so the plugin can
-         * sit in a chain without swallowing notes. */
-        for (uint32_t i = 0; i < midiEventCount; ++i)
-            writeMidiEvent(midiEvents[i]);
-
         /* Announce the bend range once, before any glide can need it (spec 6.2
          * step 2). Doing it here rather than in activate() guarantees the host has
          * a real event buffer to receive it. */
@@ -365,8 +403,21 @@ protected:
         if (fPanic.exchange(false, std::memory_order_acquire)) {
             stopAllGroups(0);
             zeroAllBends(0);
-            fGlideActive = false;
+            fGlideActive  = false;
+            /* A panic is a full reset: forget the pedal and the keys too, or a
+             * pedal believed to be down would defer every later release. */
+            fPedalDown    = false;
+            fHeldKeyCount = 0;
         }
+
+        /* Incoming MIDI, before gestures: a controller note triggers a cell just
+         * as a click does, so it must be handled by the same machinery. */
+        for (uint32_t i = 0; i < midiEventCount; ++i)
+            handleMidiIn(midiEvents[i]);
+
+        /* The octave slider moved: carry sounding chords with it. */
+        if (fOctaveMoved.exchange(false, std::memory_order_acquire))
+            retuneToOctave(0);
 
         /* Claim whatever gesture the UI left for us, if any. */
         const int32_t packed = fPendingGesture.exchange(kNoGesture,
@@ -502,9 +553,22 @@ private:
          * so the ramp can interpolate per voice rather than uniformly. */
         uint8_t   target[kMaxGroupNotes] = {0};
         bool      mpe       = false;
+        /* The octave this group was built at. A pointer gesture takes the
+         * slider's value, but a played note takes the octave it was played in,
+         * so the two cannot share one global. Stored per group because a glide
+         * rebuilds the chord and must land in the same octave it started in. */
+        int       octave    = 4;
+        /* Note number that started this group, or -1 for a pointer gesture.
+         * Note-off has to find the group its own note began, which source
+         * alone cannot identify once two octaves play the same cell. */
+        int       midiNote  = -1;
+        /* Key released, but the sustain pedal is holding the sound on. */
+        bool      deferred  = false;
     };
 
-    static constexpr int kMaxGroups = 4;
+    /* Enough for a two-handed chord on the keyboard with the pedal down, which
+     * is the realistic worst case now that notes can trigger cells. */
+    static constexpr int kMaxGroups = 10;
 
     VoiceGroup fGroup[kMaxGroups];
     uint8_t    fHeld[128] = {0};
@@ -513,6 +577,17 @@ private:
     {
         for (int i = 0; i < kMaxGroups; ++i)
             if (fGroup[i].active && fGroup[i].source == source)
+                return &fGroup[i];
+        return nullptr;
+    }
+
+    /* Find the group a specific played note started. Two octaves of the same
+     * key map to the same cell, so source is ambiguous and the note number is
+     * the only thing that identifies the group to release. */
+    VoiceGroup* findGroupByNote(int midiNote)
+    {
+        for (int i = 0; i < kMaxGroups; ++i)
+            if (fGroup[i].active && fGroup[i].midiNote == midiNote)
                 return &fGroup[i];
         return nullptr;
     }
@@ -543,18 +618,28 @@ private:
      * the smooth motion. Either way the refcount is what governs note-off.
      */
     void startGroup(uint32_t frame, int source, int root, ChordType type,
-                    Ring ring, uint8_t velocity, bool retriggerDuplicates)
+                    Ring ring, uint8_t velocity, bool retriggerDuplicates,
+                    int octave, int midiNote = -1)
     {
         VoiceGroup* g = allocGroup();
         if (g == nullptr) {
-            /* All slots busy: reuse the oldest rather than dropping the gesture. */
-            stopGroup(frame, &fGroup[0]);
-            g = &fGroup[0];
+            /* All slots busy. Evict a pointer-triggered group first: a keyboard
+             * group has a key physically down, and stealing it would leave the
+             * player holding a silent note with no way to retrigger it. */
+            for (int i = 0; i < kMaxGroups && g == nullptr; ++i)
+                if (fGroup[i].midiNote < 0)
+                    g = &fGroup[i];
+            if (g == nullptr)
+                g = &fGroup[0];
+            stopGroup(frame, g);
         }
 
         uint8_t notes[kMaxGroupNotes];
-        int n = buildChord(root, type, fOctave * 12, notes, kMaxChordTones);
-        n = applyVoicing(notes, n, fRingVoicing[ring], kMaxGroupNotes);
+        int n = buildChord(root, type, octave * 12, notes, kMaxChordTones);
+        /* Voicings rearrange chord tones; with a single note there is nothing
+         * to rearrange, and a doubling mode would quietly make it two notes. */
+        if (! fSingleNotes)
+            n = applyVoicing(notes, n, fRingVoicing[ring], kMaxGroupNotes);
 
         const bool mpe = (fGlideMode == kGlideMpe);
 
@@ -566,6 +651,8 @@ private:
         g->velocity = velocity;
         g->count    = n;
         g->mpe      = mpe;
+        g->octave   = octave;
+        g->midiNote = midiNote;
 
         for (int i = 0; i < n; ++i) {
             const uint8_t note = notes[i];
@@ -605,6 +692,11 @@ private:
         g->active = false;
         g->count  = 0;
         g->source = -1;
+        /* Clear the identity too. A recycled slot that kept a stale note number
+         * would be found by the next lookup for that note and silence the wrong
+         * chord - the same class of bookkeeping slip that stranded notes before. */
+        g->midiNote = -1;
+        g->deferred = false;
     }
 
     /* MPE member channels start at 2 (channel 1 is the master zone), wrapping
@@ -619,6 +711,16 @@ private:
         for (int i = 0; i < kMaxGroups; ++i)
             stopGroup(frame, &fGroup[i]);
         fNoteOffCountdown = 0;
+
+        /* Nothing is sounding, so nothing may still be referenced. A stale
+         * last-note would make the next keypress try to glide from a group
+         * that no longer exists.
+         *
+         * The held-key stack is deliberately NOT cleared here: a pointer
+         * release calls this too, and the player's fingers are still on the
+         * keyboard. Only a genuine reset - panic, activate, All Notes Off -
+         * may forget which keys are down. */
+        fLastKeyboardNote = -1;
 
         /*
          * Belt and braces: with every group gone, nothing may still be counted
@@ -705,6 +807,10 @@ private:
         const uint8_t vel    = g->velocity;
         const int     source = g->source;
         const bool    wasMpe = g->mpe;
+        /* Carry the originating note across the rebuild, or the key holding
+         * this chord could no longer release it. The octave comes from
+         * fGlideTargetOct, since a glide may have crossed octaves. */
+        const int     note   = g->midiNote;
         uint8_t       chans[kMaxGroupNotes];
         const int     nchan  = g->count;
         for (int i = 0; i < nchan; ++i)
@@ -712,7 +818,8 @@ private:
 
         stopGroup(0, g);
         startGroup(0, source, fGlideTargetRoot, fGlideTargetType,
-                   fGlideTargetRing, vel, /* retriggerDuplicates */ false);
+                   fGlideTargetRing, vel, /* retriggerDuplicates */ false,
+                   fGlideTargetOct, note);
 
         /* Zero every channel that carried a bend, not just the base one. */
         if (wasMpe) {
@@ -765,7 +872,8 @@ private:
                     fGlideActive = false;
                     stopAllGroups(0);
                     fGestureVelocity = pickVelocity();
-                    startGroup(0, source, root, type, r, fGestureVelocity, true);
+                    startGroup(0, source, root, type, r, fGestureVelocity, true,
+                               fOctave);
                     fDragSource = source;
                     break;
                 }
@@ -780,7 +888,8 @@ private:
                  * attacks; with glide on it is left alone so nothing retriggers
                  * mid-movement. */
                 startGroup(0, source, root, type, r, fGestureVelocity,
-                           /* retriggerDuplicates */ fGlideMode == kGlideOff);
+                           /* retriggerDuplicates */ fGlideMode == kGlideOff,
+                           fOctave);
                 fDragSource = source;
 
                 fNoteOffCountdown = fHoldToSustain
@@ -813,10 +922,14 @@ private:
 
                 if (! canGlide) {
                     /* Retrigger cleanly (spec 6.2 step 5). Shared pitches are
-                     * resent so the new chord attacks properly. */
-                    const uint8_t vel = g->velocity;
+                     * resent so the new chord attacks properly. Keep the
+                     * group's own octave: a move must not relocate a chord the
+                     * keyboard placed in a particular octave. */
+                    const uint8_t vel  = g->velocity;
+                    const int     oct  = g->octave;
+                    const int     note = g->midiNote;
                     stopGroup(0, g);
-                    startGroup(0, source, root, type, r, vel, true);
+                    startGroup(0, source, root, type, r, vel, true, oct, note);
                     fDragSource = source;
                     break;
                 }
@@ -825,6 +938,8 @@ private:
                 fGlideTargetRoot  = root;
                 fGlideTargetType  = type;
                 fGlideTargetRing  = r;
+                /* A pointer drag stays in the octave the group already has. */
+                fGlideTargetOct   = g->octave;
                 fGlideSource      = g->source;
                 fGlideElapsed     = 0;
                 fGlideDuration    = static_cast<uint32_t>(
@@ -835,9 +950,13 @@ private:
                      * voice with no counterpart (the chords differ in size) stays
                      * where it is and is resolved by the snap at the end. */
                     uint8_t want[kMaxGroupNotes];
-                    int n = buildChord(root, type, fOctave * 12, want,
+                    int n = buildChord(root, type, g->octave * 12, want,
                                        kMaxChordTones);
-                    n = applyVoicing(want, n, fRingVoicing[r], kMaxGroupNotes);
+                    /* Match what startGroup will build, or the targets would
+                     * describe a chord the snap never produces. */
+                    if (! fSingleNotes)
+                        n = applyVoicing(want, n, fRingVoicing[r],
+                                         kMaxGroupNotes);
 
                     for (int i = 0; i < g->count; ++i)
                         g->target[i] = (i < n) ? want[i] : g->note[i];
@@ -853,9 +972,11 @@ private:
 
                 /* Nothing to travel, but the voicing or shape may still differ. */
                 if (! fGlideActive && (type != g->type || r != g->ring)) {
-                    const uint8_t vel = g->velocity;
+                    const uint8_t vel  = g->velocity;
+                    const int     oct  = g->octave;
+                    const int     note = g->midiNote;
                     stopGroup(0, g);
-                    startGroup(0, source, root, type, r, vel, false);
+                    startGroup(0, source, root, type, r, vel, false, oct, note);
                     fDragSource = source;
                 }
                 break;
@@ -893,9 +1014,328 @@ private:
         }
     }
 
-    /* A ring's quality is fixed; the per-ring extension builds on it. */
+    /*
+     * Move sounding pointer-triggered chords to the current octave.
+     *
+     * An octave shift moves every voice by exactly twelve semitones, so the
+     * chord shape is unchanged - which is precisely the condition spec 6.1
+     * requires for a single uniform pitch bend. So the slider glides for free
+     * in ordinary glide mode, with no MPE needed.
+     *
+     * Keyboard groups are deliberately left alone: a played note's octave is
+     * determined by the key that was struck, and having the slider drag it
+     * out from under the player's hand would be wrong.
+     */
+    void retuneToOctave(uint32_t frame)
+    {
+        VoiceGroup* g = nullptr;
+        for (int i = 0; i < kMaxGroups; ++i) {
+            if (fGroup[i].active && fGroup[i].midiNote < 0) {
+                g = &fGroup[i];
+                break;
+            }
+        }
+        if (g == nullptr || g->octave == fOctave)
+            return;
+
+        const int delta = (fOctave - g->octave) * 12;
+
+        /* Glide off, or a glide already running: move immediately rather than
+         * queueing a second ramp on top of the first. */
+        if (fGlideMode == kGlideOff || fGlideActive) {
+            const uint8_t vel  = g->velocity;
+            const int     src  = g->source;
+            const int     root = g->root;
+            const ChordType ty = g->type;
+            const Ring      rg = g->ring;
+
+            if (fGlideActive) {
+                fGlideActive = false;
+                zeroAllBends(frame);
+            }
+
+            stopGroup(frame, g);
+            startGroup(frame, src, root, ty, rg, vel, false, fOctave);
+            return;
+        }
+
+        fGlideTargetSemis = delta;
+        fGlideTargetRoot  = g->root;
+        fGlideTargetType  = g->type;
+        fGlideTargetRing  = g->ring;
+        fGlideTargetOct   = fOctave;
+        fGlideSource      = g->source;
+        fGlideElapsed     = 0;
+        fGlideDuration    = static_cast<uint32_t>(
+            fGlideTimeMs * fSampleRate / 1000.0);
+
+        if (fGlideMode == kGlideMpe) {
+            /* Every voice travels the same octave, so the targets are simply
+             * the current notes shifted. */
+            for (int i = 0; i < g->count; ++i) {
+                const int t = g->note[i] + delta;
+                g->target[i] = (t >= 0 && t <= 127)
+                    ? static_cast<uint8_t>(t) : g->note[i];
+            }
+        }
+
+        fGlideActive = true;
+    }
+
+    /* ---- MIDI input: the keyboard plays the wheel -------------------------
+     *
+     * A controller note selects a cell by DEGREE, so the same physical key
+     * plays I in whatever key is selected and the keyboard transposes with the
+     * wheel. The octave played is the octave sounded - the keyboard behaves
+     * like an instrument, not like a bank of switches.
+     *
+     * Mapped notes are CONSUMED rather than passed through: forwarding them
+     * would sound the raw note alongside the chord it triggered. Everything
+     * else is forwarded untouched, so the plugin can still sit in a chain.
+     */
+    void handleMidiIn(const MidiEvent& ev)
+    {
+        if (ev.size < 2) {
+            writeMidiEvent(ev);
+            return;
+        }
+
+        const uint8_t status = ev.data[0] & 0xF0;
+        const uint8_t d1     = ev.data[1];
+        const uint8_t d2     = (ev.size > 2) ? ev.data[2] : 0;
+
+        /* Sustain pedal (CC 64). Held, it defers releases instead of blocking
+         * them: notes keep starting and stopping as played, but nothing is
+         * actually silenced until the pedal comes up. That is what makes the
+         * playing legato rather than merely latched. */
+        if (status == 0xB0 && d1 == 64) {
+            const bool down = (d2 >= 64);
+            if (fPedalDown && ! down) {
+                fPedalDown = false;
+                releaseDeferred(ev.frame);
+            } else {
+                fPedalDown = down;
+            }
+            writeMidiEvent(ev);   /* downstream instruments may want it too */
+            return;
+        }
+
+        /* All Notes Off / All Sound Off: honour them ourselves as well, or our
+         * groups would outlive the host's own silence request. */
+        if (status == 0xB0 && (d1 == 120 || d1 == 123)) {
+            fPedalDown    = false;
+            fHeldKeyCount = 0;
+            stopAllGroups(ev.frame);
+            zeroAllBends(ev.frame);
+            fGlideActive = false;
+            writeMidiEvent(ev);
+            return;
+        }
+
+        const bool isNoteOn  = (status == 0x90 && d2 > 0);
+        const bool isNoteOff = (status == 0x80) || (status == 0x90 && d2 == 0);
+
+        if (! isNoteOn && ! isNoteOff) {
+            writeMidiEvent(ev);
+            return;
+        }
+
+        int  position;
+        Ring ring;
+        if (! cellForMidiNote(d1, fSelectedKey.load(std::memory_order_acquire),
+                              position, ring)) {
+            /* Unmapped pitch class: not ours, so leave it alone. */
+            writeMidiEvent(ev);
+            return;
+        }
+
+        if (isNoteOn)
+            noteOnCell(ev.frame, d1, position, ring, d2);
+        else
+            noteOffCell(ev.frame, d1);
+    }
+
+    /*
+     * A played note starts its own group. Unlike a pointer gesture there is no
+     * drag, but a second note while the first is held is still an overlap - and
+     * that is how chords stack up under the fingers.
+     */
+    void noteOnCell(uint32_t frame, int midiNote, int position, Ring ring,
+                    uint8_t velocity)
+    {
+        pushHeldKey(midiNote);
+
+        /* Retriggering the same key: retire the old group first, or its notes
+         * would be orphaned by the new one taking the same identity. */
+        VoiceGroup* existing = findGroupByNote(midiNote);
+        if (existing != nullptr)
+            stopGroup(frame, existing);
+
+        const int       root = rootForPosition(position, ring);
+        const ChordType type = chordTypeForRing(ring);
+        const int       oct  = octaveForMidiNote(midiNote);
+        const int    source  = (static_cast<int>(ring) << 8) | position;
+
+        /*
+         * Velocity comes from the key, not from the velocity setting. A played
+         * note carries the performer's intent and overriding it would make the
+         * keyboard feel dead; the randomise amount still applies as a spread
+         * around what was played.
+         */
+        uint8_t vel = velocity;
+        if (fVelocityRandom > 0) {
+            const int spread = fVelocityRandom * 2 + 1;
+            int r = vel - fVelocityRandom + (std::rand() % spread);
+            if (r < 1)   r = 1;
+            if (r > 127) r = 127;
+            vel = static_cast<uint8_t>(r);
+        }
+
+        /*
+         * Glide between overlapping played notes, so a legato line moves rather
+         * than restarts. The most recent keyboard group is the one to move,
+         * which mirrors how a monosynth's glide follows the last key down.
+         */
+        VoiceGroup* from = fLastKeyboardNote >= 0
+            ? findGroupByNote(fLastKeyboardNote) : nullptr;
+
+        if (from != nullptr && from->midiNote != midiNote &&
+            fGlideMode != kGlideOff) {
+
+            const bool shapeKept = sameShape(from->type, type);
+            const bool canGlide  = (fGlideMode == kGlideMpe) ||
+                                   (fGlideMode == kGlideOn && shapeKept);
+
+            /* Octave changes are exactly what the vertical slider produces when
+             * dragged, and a glide across them is the instrumental gesture the
+             * feature exists for - so distance is measured in real semitones,
+             * not just pitch class. */
+            if (canGlide) {
+                const int semis = (root - from->root) +
+                                  (oct - from->octave) * 12;
+
+                fGlideTargetSemis = semis;
+                fGlideTargetRoot  = root;
+                fGlideTargetType  = type;
+                fGlideTargetRing  = ring;
+                fGlideTargetOct   = oct;
+                fGlideSource      = from->source;
+                fGlideElapsed     = 0;
+                fGlideDuration    = static_cast<uint32_t>(
+                    fGlideTimeMs * fSampleRate / 1000.0);
+
+                /* The gliding group becomes this note's group: the key that is
+                 * now down owns what is sounding, so its release ends it. */
+                from->midiNote = midiNote;
+
+                if (fGlideMode == kGlideMpe) {
+                    uint8_t want[kMaxGroupNotes];
+                    int n = buildChord(root, type, oct * 12, want,
+                                       kMaxChordTones);
+                    if (! fSingleNotes)
+                        n = applyVoicing(want, n, fRingVoicing[ring],
+                                         kMaxGroupNotes);
+                    for (int i = 0; i < from->count; ++i)
+                        from->target[i] = (i < n) ? want[i] : from->note[i];
+
+                    bool moves = false;
+                    for (int i = 0; i < from->count && ! moves; ++i)
+                        moves = (from->target[i] != from->note[i]);
+                    fGlideActive = moves;
+                } else {
+                    fGlideActive = (semis != 0);
+                }
+
+                if (fGlideActive) {
+                    fLastKeyboardNote = midiNote;
+                    return;
+                }
+
+                /* Nothing to travel: fall through and start normally. */
+                from->midiNote = fLastKeyboardNote;
+            }
+        }
+
+        startGroup(frame, source, root, type, ring, vel,
+                   /* retriggerDuplicates */ fGlideMode == kGlideOff,
+                   oct, midiNote);
+
+        fLastKeyboardNote = midiNote;
+    }
+
+    /* Release the group a played note started - deferring while the pedal is
+     * down, which is what turns held notes into a legato phrase. */
+    void noteOffCell(uint32_t frame, int midiNote)
+    {
+        removeHeldKey(midiNote);
+
+        VoiceGroup* g = findGroupByNote(midiNote);
+        if (g == nullptr) {
+            /* This key handed its group to a later one during a glide. Nothing
+             * of ours to stop, but the sounding group may now belong to a key
+             * that is no longer down - resolved below by the fallback. */
+            if (fLastKeyboardNote == midiNote)
+                fLastKeyboardNote = topHeldKey();
+            return;
+        }
+
+        /*
+         * A glide gave this group to the key that is lifting, but an earlier key
+         * may still be held. Hand the group back to it rather than silencing it:
+         * the player still has a finger down, so the phrase continues. This is
+         * what makes overlapping legato behave like an instrument instead of
+         * cutting out whenever the newer of two keys is released.
+         */
+        const int fallback = topHeldKey();
+        if (! fPedalDown && fallback >= 0 && fallback != midiNote &&
+            findGroupByNote(fallback) == nullptr) {
+            g->midiNote       = fallback;
+            fLastKeyboardNote = fallback;
+            return;
+        }
+
+        if (fPedalDown) {
+            g->deferred = true;
+        } else {
+            if (fGlideActive && fGlideSource == g->source) {
+                fGlideActive = false;
+                zeroAllBends(frame);
+            }
+            stopGroup(frame, g);
+        }
+
+        if (fLastKeyboardNote == midiNote)
+            fLastKeyboardNote = topHeldKey();
+    }
+
+    /* Pedal up: everything whose key was already released now stops. */
+    void releaseDeferred(uint32_t frame)
+    {
+        for (int i = 0; i < kMaxGroups; ++i) {
+            if (fGroup[i].active && fGroup[i].deferred) {
+                if (fGlideActive && fGlideSource == fGroup[i].source) {
+                    fGlideActive = false;
+                    zeroAllBends(frame);
+                }
+                stopGroup(frame, &fGroup[i]);
+            }
+        }
+    }
+
+    /*
+     * A ring's quality is fixed; the per-ring extension builds on it.
+     *
+     * Single-note mode bypasses chord generation entirely and sounds only the
+     * root, turning the wheel into a note selector - useful for basslines and
+     * melodies that should follow the same key-relative layout. It is applied
+     * here because this is the one place every trigger path passes through:
+     * pointer, keyboard and glide all ask this question, so the override
+     * cannot be missed by one of them.
+     */
     ChordType chordTypeForRing(Ring ring) const
     {
+        if (fSingleNotes)
+            return kChordSingleNote;
         return extendChord(defaultChordForRing(ring), fRingExtension[ring]);
     }
 
@@ -920,6 +1360,8 @@ private:
     /* Latch: a selection keeps sounding after the pointer is released, until it
      * is clicked again or another selection replaces it. */
     bool      fLatchEnabled   = false;
+    /* Bypass chord generation and sound the root alone. */
+    bool      fSingleNotes    = false;
     GlideMode fGlideMode      = kGlideOn;
     int       fGlideTimeMs    = 120;
     int       fBendRange      = 12;
@@ -953,6 +1395,67 @@ private:
     int       fGlideTargetRoot  = 0;
     ChordType fGlideTargetType  = kChordMajor;
     Ring      fGlideTargetRing  = kRingKey;
+    /* Octave to resolve at. A keyboard glide can cross octaves, so the snap at
+     * the end must know where it is landing rather than assuming it stayed. */
+    int       fGlideTargetOct   = 4;
+
+    /* ---- MIDI input state -------------------------------------------------- */
+
+    /* Which key the wheel is centred on. Written by the UI thread through
+     * setState, read by the audio thread to resolve an incoming note. */
+    std::atomic<int> fSelectedKey { 0 };
+
+    /* Sustain pedal (CC 64). While down, releases are deferred rather than
+     * ignored, so the phrase sustains without the notes losing their identity. */
+    bool fPedalDown = false;
+
+    /*
+     * Keys physically down, in the order they were pressed.
+     *
+     * A glide hands one group from key to key, so the group belongs to whichever
+     * key claimed it last. That alone is not enough: releasing that key while an
+     * earlier one is still held would end the sound with a finger still on the
+     * keyboard. The stack lets the group fall back to the key underneath, which
+     * is how a legato monosynth behaves.
+     */
+    static constexpr int kMaxHeldKeys = 16;
+    int fHeldKey[kMaxHeldKeys] = {0};
+    int fHeldKeyCount = 0;
+
+    void pushHeldKey(int note)
+    {
+        for (int i = 0; i < fHeldKeyCount; ++i)
+            if (fHeldKey[i] == note)
+                return;
+        if (fHeldKeyCount < kMaxHeldKeys)
+            fHeldKey[fHeldKeyCount++] = note;
+    }
+
+    void removeHeldKey(int note)
+    {
+        for (int i = 0; i < fHeldKeyCount; ++i) {
+            if (fHeldKey[i] == note) {
+                for (int j = i; j < fHeldKeyCount - 1; ++j)
+                    fHeldKey[j] = fHeldKey[j + 1];
+                --fHeldKeyCount;
+                return;
+            }
+        }
+    }
+
+    /* Most recently pressed key still down, or -1. */
+    int topHeldKey() const
+    {
+        return fHeldKeyCount > 0 ? fHeldKey[fHeldKeyCount - 1] : -1;
+    }
+
+    /* The most recent played note still sounding, for glide between
+     * overlapping keys. -1 when none. */
+    int  fLastKeyboardNote = -1;
+
+    /* Set by the UI when the octave slider moves, consumed by run() so held
+     * chords travel with it. */
+    std::atomic<bool> fOctaveMoved { false };
 
     DISTRHO_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FortyFifthPlugin)
 };
