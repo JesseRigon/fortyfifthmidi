@@ -772,6 +772,12 @@ protected:
         if (hit(panicButton(), px, py)) {
             setState("panic", "1");
             fLog.clear();
+            /* Nothing is sounding after a panic, so the chord view must not go
+             * on claiming otherwise. */
+            std::memset(fSounding, 0, sizeof(fSounding));
+            fSoundingCount = 0;
+            fChordDirty    = false;
+            fLastChord.clear();
             repaint();
             return true;
         }
@@ -854,10 +860,15 @@ protected:
 
         switch (status) {
             case 0x90:
+                /* Collect the note into the chord being assembled, so the log
+                 * can show what actually sounded together rather than only a
+                 * run of separate note-ons. */
+                noteOnForChord(b);
                 std::snprintf(line, sizeof(line), "NoteOn   %-4s(%3d) vel %d",
                               noteName(b), b, c);
                 break;
             case 0x80:
+                noteOffForChord(b);
                 std::snprintf(line, sizeof(line), "NoteOff  %-4s(%3d)",
                               noteName(b), b);
                 break;
@@ -875,6 +886,180 @@ protected:
                 std::snprintf(line, sizeof(line), "raw      %02X %02X %02X", a, b, c);
                 break;
         }
+
+        fLog.push_back(line);
+        while (fLog.size() > kLogLines)
+            fLog.pop_front();
+    }
+
+    /* ---- chord view --------------------------------------------------------
+     *
+     * The per-event lines say what was sent; they do not say what is SOUNDING.
+     * Reading three note-ons and holding them in your head is exactly the sort
+     * of thing the monitor should do for you - especially when checking whether
+     * a chord sits in the key, where the set of notes is the whole question.
+     *
+     * So the sounding set is tracked, named, and printed as one line whenever
+     * it changes.
+     */
+
+    void noteOnForChord(uint8_t note)
+    {
+        if (! fSounding[note]) {
+            fSounding[note] = true;
+            ++fSoundingCount;
+        }
+        fChordDirty = true;
+    }
+
+    void noteOffForChord(uint8_t note)
+    {
+        if (fSounding[note]) {
+            fSounding[note] = false;
+            if (fSoundingCount > 0)
+                --fSoundingCount;
+        }
+        fChordDirty = true;
+    }
+
+    /*
+     * Name the sounding set by its interval pattern, reduced to pitch classes
+     * and rotated so each note in turn is treated as the root. Matching the
+     * pattern rather than assuming the lowest note is the root is what lets an
+     * inversion be recognised - "C/E" rather than a puzzle.
+     */
+    static bool nameChord(const bool* sounding, char* out, size_t outSize)
+    {
+        int  pcs[12];
+        int  npc = 0;
+        int  lowest = -1;
+
+        bool seen[12] = { false };
+        for (int n = 0; n < 128; ++n) {
+            if (! sounding[n])
+                continue;
+            if (lowest < 0)
+                lowest = n;
+            if (! seen[n % 12]) {
+                seen[n % 12] = true;
+                if (npc < 12)
+                    pcs[npc++] = n % 12;
+            }
+        }
+
+        if (npc == 0)
+            return false;
+
+        static const char* const kPC[12] = {
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+        };
+
+        if (npc == 1) {
+            std::snprintf(out, outSize, "%s", kPC[pcs[0]]);
+            return true;
+        }
+
+        /* Try each pitch class as the root and look for a known shape. */
+        for (int r = 0; r < npc; ++r) {
+            const int root = pcs[r];
+
+            int rel[12];
+            int nrel = 0;
+            for (int i = 0; i < npc; ++i)
+                rel[nrel++] = ((pcs[i] - root) % 12 + 12) % 12;
+
+            /* Sort, so the comparison is against a canonical pattern. */
+            for (int i = 1; i < nrel; ++i) {
+                const int v = rel[i];
+                int j = i - 1;
+                while (j >= 0 && rel[j] > v) { rel[j + 1] = rel[j]; --j; }
+                rel[j + 1] = v;
+            }
+
+            for (int t = 0; t < kChordTypeCount; ++t) {
+                const ChordShape& sh = kChordShape[t];
+
+                /* Reduce the shape to sorted, unique pitch classes too. */
+                int want[12];
+                int nwant = 0;
+                bool wseen[12] = { false };
+                for (int i = 0; i < sh.count; ++i) {
+                    const int pc = ((sh.interval[i] % 12) + 12) % 12;
+                    if (! wseen[pc]) { wseen[pc] = true; want[nwant++] = pc; }
+                }
+                for (int i = 1; i < nwant; ++i) {
+                    const int v = want[i];
+                    int j = i - 1;
+                    while (j >= 0 && want[j] > v) { want[j + 1] = want[j]; --j; }
+                    want[j + 1] = v;
+                }
+
+                if (nwant != nrel)
+                    continue;
+
+                bool same = true;
+                for (int i = 0; i < nrel && same; ++i)
+                    same = (rel[i] == want[i]);
+
+                if (! same)
+                    continue;
+
+                /* Name the bass when it is not the root, since that is the
+                 * difference between a chord and its inversion. */
+                if (lowest >= 0 && (lowest % 12) != root) {
+                    std::snprintf(out, outSize, "%s%s/%s",
+                                  kPC[root], sh.suffix, kPC[lowest % 12]);
+                } else {
+                    std::snprintf(out, outSize, "%s%s", kPC[root], sh.suffix);
+                }
+                return true;
+            }
+        }
+
+        std::snprintf(out, outSize, "(%d notes)", npc);
+        return true;
+    }
+
+    /* Emit the chord line if the sounding set changed. Called once per drain,
+     * so the notes of one chord are summarised together rather than producing
+     * a line per note. */
+    void flushChordLine()
+    {
+        if (! fChordDirty)
+            return;
+        fChordDirty = false;
+
+        if (fSoundingCount == 0) {
+            if (! fLastChord.empty()) {
+                fLastChord.clear();
+                fLog.push_back("         -- silence --");
+                while (fLog.size() > kLogLines)
+                    fLog.pop_front();
+            }
+            return;
+        }
+
+        char notes[96] = {0};
+        for (int n = 0; n < 128; ++n) {
+            if (! fSounding[n])
+                continue;
+            char one[16];
+            std::snprintf(one, sizeof(one), "%s ", noteName(static_cast<uint8_t>(n)));
+            if (std::strlen(notes) + std::strlen(one) < sizeof(notes) - 1)
+                std::strcat(notes, one);
+        }
+
+        char name[32] = {0};
+        nameChord(fSounding, name, sizeof(name));
+
+        char line[128];
+        std::snprintf(line, sizeof(line), "CHORD    %-9s %s", name, notes);
+
+        /* Only report a genuine change, or a chord would reprint every time a
+         * voice is re-sent. */
+        if (fLastChord == line)
+            return;
+        fLastChord = line;
 
         fLog.push_back(line);
         while (fLog.size() > kLogLines)
@@ -1013,14 +1198,26 @@ protected:
             any = true;
         }
 
-        if (any)
+        /* Once, after the whole block is drained: the notes of a chord arrive
+         * together, so summarising here gives one line per chord rather than
+         * one per note. */
+        if (any) {
+            flushChordLine();
             repaint();
+        }
     }
 
     std::deque<std::string> fLog;
     /* Collapsed by default: the wheel is the point, the log is for debugging. */
     bool         fMonitorOpen = false;
     MonitorRing* fRing        = nullptr;
+
+    /* What is currently sounding, rebuilt from the note-on/note-off stream, so
+     * the log can report the chord rather than only the events that made it. */
+    bool        fSounding[128] = { false };
+    int         fSoundingCount = 0;
+    bool        fChordDirty    = false;
+    std::string fLastChord;
 
 private:
     int  fActivePosition = -1;
