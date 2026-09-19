@@ -3,15 +3,29 @@
 Written 2026-09-18. Read this first if you are picking the project up inside the
 container.
 
-## State: never compiled
+## State: builds clean, does not yet emit MIDI
 
-**No code in this repo has ever been built.** The scaffold was written on the
-Windows side, and the WSL distro has no toolchain (`gcc`, `make`, `cmake` all
-absent — they are installed in the *container*, not in WSL). The build was about
-to be verified in Docker when work stopped.
+Updated 2026-09-18 after the first successful build.
 
-Treat every source file as unverified. Expect compile errors on the first
-`make`, and expect them in the places called out under "Known risks" below.
+The devcontainer is up and `make` succeeds. Both formats build and load-check:
+
+```
+bin/FortyFifthMidi.clap                                  clap_entry
+bin/FortyFifthMidi.vst3/Contents/x86_64-linux/*.so       GetPluginFactory, ModuleEntry
+```
+
+The CLAP reports `note-effect`, which is the spec §3 categorisation. The NanoVG
+UI code compiled without changes, contrary to what was expected.
+
+One bug was found and fixed: in `src/Makefile`, `NAME`/`FILES_DSP`/`FILES_UI`
+must be assigned **before** `include ../dpf/Makefile.plugins.mk`. Assigned after,
+DPF never sees them, skips compiling the sources, and the link fails with
+`undefined reference to createPlugin()`.
+
+**What still does not work: clicking the wheel emits no MIDI.** The UI updates
+its own visuals only. That is the next task — see "Not implemented" below.
+
+Committed as `36c8324` on `main`. Not pushed: the GitHub remote does not exist yet.
 
 ## What exists
 
@@ -55,39 +69,59 @@ and the remote repo may not exist yet.
   original — see spec §4.1.
 - **Spelling is "fortyfifth"**, no U. Corrected from the original request.
 
+## How to build
+
+The workspace already exists. From WSL:
+
+```bash
+devpod up ~/src/fortyfifthmidi --ide vscode     # or --ide none
+```
+
+To build without an interactive shell (`devpod ssh` was failing at the tunnel
+layer, so target the container by id — `docker ps --filter name=fortyfifthmidi`):
+
+```bash
+docker exec -u vscode <container-id> bash /workspaces/fortyfifthmidi/dev/ci-build.sh
+docker exec -u vscode <container-id> bash /workspaces/fortyfifthmidi/dev/ci-verify.sh
+```
+
+**Do not stop, delete or prune any other container.** `fruitful-orchard-wsl` runs
+alongside this one and is in active use.
+
 ## Immediate next steps
 
-1. **Build it.** `devpod up ~/src/fortyfifthmidi --ide vscode`, then `make`.
-   Fix what breaks; nothing is verified.
+1. **Wire the UI to the DSP.** The whole point of the plugin, and entirely absent.
 2. **Convert `dpf/` to a real submodule.** It is currently a plain clone with its
-   own `.git`, so the pin the spec asks for does not exist:
+   own `.git`, excluded from the commit via `.git/info/exclude`, so the pin the
+   spec asks for does not exist:
    ```bash
    rm -rf dpf
    git submodule add https://github.com/DISTRHO/DPF.git dpf
    git submodule update --init --recursive
    ```
    `scripts/20-dpf.sh` already handles both the submodule and clone-fallback
-   paths, so it needs no change.
-3. **Make the first commit** once something compiles.
+   paths, so it needs no change. Remove the `/dpf/` line from
+   `.git/info/exclude` when doing this.
+3. **Create the GitHub remote** and push. Origin is set to
+   `https://github.com/JesseRigon/fortyfifthmidi.git` but the repo does not exist.
 
-## Known risks (where the first build will likely fail)
+## Known risks (compiles, but unverified against a host)
 
-- **`FortyFifthUI.cpp` NanoVG calls** are written from the DPF API as I recalled
-  it, not against the checked-out headers. `arc()` winding constants
-  (`NanoVG::CW`/`CCW`), `textAlign` flags and `Color` construction are the most
-  likely mismatches.
-- **`DISTRHO_PLUGIN_VST3_CATEGORIES`** is set to `"Instrument|Tools"`. Spec §3
-  wants MIDI-effect categorisation, and the right VST3 string for a MIDI-only
-  plugin may differ in this DPF revision. Verify what hosts actually show.
+Building is not the same as working. None of the following has been checked in a
+real DAW, because the container has no host to load into.
+
+- **`DISTRHO_PLUGIN_VST3_CATEGORIES`** is `"Instrument|Tools"`. The CLAP side
+  correctly reports `note-effect`, but whether hosts show the VST3 as a MIDI
+  effect is unconfirmed. Check what Reaper/Bitwig actually display.
 - **Zero audio buses** (`NUM_INPUTS`/`NUM_OUTPUTS` both 0) is the correct intent
-  per spec §3, but some DPF paths assume at least one bus. If it misbehaves,
-  investigate before adding a dummy bus — a silent audio bus would violate §3.
+  per spec §3 and it builds, but host behaviour is untested. If something
+  misbehaves, investigate before adding a dummy bus — a silent audio bus would
+  violate §3.
 - **`run()` ignores `frames` for note-length timing.** `fNoteOffCountdown` is
-  decremented in frames but set from milliseconds nowhere; hold-to-sustain is the
-  only working mode right now.
-- **`kStateCount` is used in the constructor** before the enum is declared later
-  in the class body. This compiles in-class in C++ but is worth a look if the
-  compiler complains.
+  decremented in frames but never set from milliseconds, so the note-length
+  setting does nothing; hold-to-sustain is the only mode that could work.
+- **Glide is unreachable.** `advanceGlide()` and the snap-and-reset resolution
+  are written but nothing ever sets `fGlideActive`, because the UI is not wired.
 
 ## Not implemented at all
 
