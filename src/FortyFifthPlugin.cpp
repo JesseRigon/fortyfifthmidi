@@ -44,7 +44,7 @@ public:
                  0 /* programs */,
                  kStateCount)
     {
-        std::memset(fVoice, 0, sizeof(fVoice));
+        std::memset(fHeld, 0, sizeof(fHeld));
     }
 
 protected:
@@ -77,9 +77,11 @@ protected:
         kStateVelocityRandom,
         kStateNoteLengthMs,
         kStateHoldToSustain,
+        kStateLatch,
         kStateGlideEnabled,
         kStateGlideTimeMs,
         kStateBendRange,
+        kStateChordAuto,
         kStateGesture,
         kStateCount
     };
@@ -117,6 +119,11 @@ protected:
                 state.label = "Hold To Sustain";
                 state.defaultValue = "1";
                 break;
+            case kStateLatch:
+                state.key = "latch";
+                state.label = "Latch";
+                state.defaultValue = "0";
+                break;
             case kStateGlideEnabled:
                 state.key = "glideEnabled";
                 state.label = "Glide";
@@ -131,6 +138,13 @@ protected:
                 state.key = "bendRange";
                 state.label = "Pitch Bend Range (semitones)";
                 state.defaultValue = "12";
+                break;
+            case kStateChordAuto:
+                /* Set when the user picks "Auto", returning chord choice to the
+                 * per-ring defaults. */
+                state.key = "chordAuto";
+                state.label = "Chord Auto";
+                state.defaultValue = "1";
                 break;
             case kStateGesture:
                 /* Transient UI -> DSP channel, not a persisted setting. */
@@ -162,12 +176,16 @@ protected:
             fNoteLengthMs = v;
         else if (std::strcmp(key, "holdToSustain") == 0)
             fHoldToSustain = (v != 0);
+        else if (std::strcmp(key, "latch") == 0)
+            fLatchEnabled = (v != 0);
         else if (std::strcmp(key, "glideEnabled") == 0)
             fGlideEnabled = (v != 0);
         else if (std::strcmp(key, "glideTimeMs") == 0)
             fGlideTimeMs = v;
         else if (std::strcmp(key, "bendRange") == 0)
             fBendRange = v;
+        else if (std::strcmp(key, "chordAuto") == 0)
+            fChordTypeIsExplicit = false;   /* back to per-ring defaults */
         else if (std::strcmp(key, "gesture") == 0)
             queueGesture(value);
 
@@ -219,6 +237,7 @@ protected:
         else if (std::strcmp(key, "velocityRandom") == 0)  v = fVelocityRandom;
         else if (std::strcmp(key, "noteLengthMs") == 0)    v = fNoteLengthMs;
         else if (std::strcmp(key, "holdToSustain") == 0)   v = fHoldToSustain ? 1 : 0;
+        else if (std::strcmp(key, "latch") == 0)           v = fLatchEnabled ? 1 : 0;
         else if (std::strcmp(key, "glideEnabled") == 0)    v = fGlideEnabled ? 1 : 0;
         else if (std::strcmp(key, "glideTimeMs") == 0)     v = fGlideTimeMs;
         else if (std::strcmp(key, "bendRange") == 0)       v = fBendRange;
@@ -234,7 +253,10 @@ protected:
         fSampleRate  = getSampleRate();
         fNeedsRpn    = true;
         fGlideActive = false;
-        fVoiceCount  = 0;
+
+        for (int i = 0; i < kMaxGroups; ++i)
+            fGroup[i].active = false;
+        std::memset(fHeld, 0, sizeof(fHeld));
     }
 
     /*
@@ -266,10 +288,11 @@ protected:
         if (fGlideActive)
             advanceGlide(frames);
 
-        if (! fHoldToSustain && fVoiceCount > 0 && fNoteOffCountdown > 0) {
+        /* Fixed-length mode: the countdown, not the release, ends the note. */
+        if (! fHoldToSustain && fNoteOffCountdown > 0) {
             fNoteOffCountdown -= static_cast<int32_t>(frames);
             if (fNoteOffCountdown <= 0)
-                releaseAllVoices(0);
+                stopAllGroups(0);
         }
     }
 
@@ -352,11 +375,119 @@ private:
         return static_cast<uint8_t>(v);
     }
 
-    void releaseAllVoices(uint32_t frame)
+    /* ---- voice groups -----------------------------------------------------
+     *
+     * A "group" is one sounding selection. Several can overlap: two fingers down,
+     * or a latched selection while a new one is pressed. fHeld counts how many
+     * groups want each pitch, so a pitch is only silenced when the last group
+     * that wanted it goes away - without that, releasing one chord would cut
+     * notes another chord is still holding (C major and A minor share C and E).
+     */
+
+    struct VoiceGroup {
+        bool      active    = false;
+        int       source    = -1;   /* packed position|ring that started it */
+        int       root      = 0;
+        ChordType type      = kChordMajor;
+        uint8_t   velocity  = 100;
+        int       count     = 0;
+        uint8_t   note[kMaxChordTones] = {0};
+        bool      owns[kMaxChordTones] = {false}; /* false = a dup we did not send */
+    };
+
+    static constexpr int kMaxGroups = 4;
+
+    VoiceGroup fGroup[kMaxGroups];
+    uint8_t    fHeld[128] = {0};
+
+    VoiceGroup* findGroup(int source)
     {
-        for (int i = 0; i < fVoiceCount; ++i)
-            sendRaw(frame, 0x80 | fChannel, fVoice[i], 0);
-        fVoiceCount       = 0;
+        for (int i = 0; i < kMaxGroups; ++i)
+            if (fGroup[i].active && fGroup[i].source == source)
+                return &fGroup[i];
+        return nullptr;
+    }
+
+    VoiceGroup* allocGroup()
+    {
+        for (int i = 0; i < kMaxGroups; ++i)
+            if (! fGroup[i].active)
+                return &fGroup[i];
+        return nullptr;
+    }
+
+    int activeGroupCount() const
+    {
+        int n = 0;
+        for (int i = 0; i < kMaxGroups; ++i)
+            if (fGroup[i].active)
+                ++n;
+        return n;
+    }
+
+    /*
+     * Start a chord as its own group.
+     *
+     * retriggerDuplicates decides what happens to a pitch another group already
+     * holds. With glide off we resend it, because the fresh attack is the point of
+     * a non-glide overlap. With glide on we skip it, since retriggering undercuts
+     * the smooth motion. Either way the refcount is what governs note-off.
+     */
+    void startGroup(uint32_t frame, int source, int root, ChordType type,
+                    uint8_t velocity, bool retriggerDuplicates)
+    {
+        VoiceGroup* g = allocGroup();
+        if (g == nullptr) {
+            /* All slots busy: reuse the oldest rather than dropping the gesture. */
+            stopGroup(frame, &fGroup[0]);
+            g = &fGroup[0];
+        }
+
+        uint8_t notes[kMaxChordTones];
+        const int n = buildChord(root, type, fOctave * 12, notes, kMaxChordTones);
+
+        g->active   = true;
+        g->source   = source;
+        g->root     = root;
+        g->type     = type;
+        g->velocity = velocity;
+        g->count    = n;
+
+        for (int i = 0; i < n; ++i) {
+            const uint8_t note = notes[i];
+            const bool    dup  = (fHeld[note] > 0);
+
+            g->note[i] = note;
+            g->owns[i] = true;
+
+            if (! dup || retriggerDuplicates)
+                sendRaw(frame, 0x90 | fChannel, note, velocity);
+
+            ++fHeld[note];
+        }
+    }
+
+    /* Release one group, silencing only the pitches no other group still wants. */
+    void stopGroup(uint32_t frame, VoiceGroup* g)
+    {
+        if (g == nullptr || ! g->active)
+            return;
+
+        for (int i = 0; i < g->count; ++i) {
+            const uint8_t note = g->note[i];
+            if (fHeld[note] > 0 && --fHeld[note] == 0)
+                sendRaw(frame, 0x80 | fChannel, note, 0);
+        }
+
+        g->active = false;
+        g->count  = 0;
+        g->source = -1;
+    }
+
+    void stopAllGroups(uint32_t frame)
+    {
+        for (int i = 0; i < kMaxGroups; ++i)
+            stopGroup(frame, &fGroup[i]);
         fNoteOffCountdown = 0;
     }
 
@@ -367,6 +498,14 @@ private:
      * holds real, editable note numbers rather than permanently bent ones. */
     void advanceGlide(uint32_t frames)
     {
+        VoiceGroup* g = findGroup(fGlideSource);
+        if (g == nullptr) {
+            /* The gliding group went away underneath us. */
+            fGlideActive = false;
+            sendPitchBend(0, 0.0f);
+            return;
+        }
+
         fGlideElapsed += frames;
 
         const float progress = fGlideDuration > 0
@@ -375,13 +514,18 @@ private:
 
         if (progress >= 1.0f) {
             sendPitchBend(0, static_cast<float>(fGlideTargetSemis));
-            releaseAllVoices(0);
-            triggerChordInternal(0, fGlideTargetRoot, fGlideTargetType, fGlideVelocity);
+
+            /* Snap-and-reset: retire the bent notes, restate the true ones, zero
+             * the bend. Glide is on by definition here, so duplicates are skipped
+             * rather than retriggered. */
+            const uint8_t vel    = g->velocity;
+            const int     source = g->source;
+            stopGroup(0, g);
+            startGroup(0, source, fGlideTargetRoot, fGlideTargetType, vel,
+                       /* retriggerDuplicates */ false);
             sendPitchBend(0, 0.0f);
 
-            fGlideActive     = false;
-            fCurrentRoot     = fGlideTargetRoot;
-            fCurrentType     = fGlideTargetType;
+            fGlideActive      = false;
             fGlideTargetSemis = 0;
         } else {
             sendPitchBend(0, progress * static_cast<float>(fGlideTargetSemis));
@@ -403,21 +547,44 @@ private:
         const int       root = rootForPosition(position, r);
         const ChordType type = chordTypeForRing(r);
 
+        const int source = (ring << 8) | position;
+
         switch (kind) {
             case kGesturePress: {
-                /* A press always starts clean: abandon any glide and any voices
-                 * still sounding from a previous gesture. */
-                fGlideActive = false;
-                releaseAllVoices(0);
+                /*
+                 * Latch mode: a selection keeps sounding after the pointer is
+                 * released. Clicking it again turns it off; clicking a different
+                 * one replaces it. So exactly one latched selection sounds at a
+                 * time, and a press is a toggle rather than a start.
+                 */
+                if (fLatchEnabled) {
+                    VoiceGroup* same = findGroup(source);
+                    if (same != nullptr) {
+                        if (fGlideActive && fGlideSource == source) {
+                            fGlideActive = false;
+                            sendPitchBend(0, 0.0f);
+                        }
+                        stopGroup(0, same);
+                        break;
+                    }
 
+                    fGlideActive = false;
+                    stopAllGroups(0);
+                    fGestureVelocity = pickVelocity();
+                    startGroup(0, source, root, type, fGestureVelocity, true);
+                    break;
+                }
+
+                /*
+                 * Momentary mode: the selection sounds while held. Pressing a
+                 * second one while the first is down is an overlap, which is
+                 * where harmonising happens - the earlier group is left alone.
+                 */
                 fGestureVelocity = pickVelocity();
-                triggerChordInternal(0, root, type, fGestureVelocity);
+                startGroup(0, source, root, type, fGestureVelocity,
+                           /* retriggerDuplicates */ ! fGlideEnabled);
+                fDragSource = source;
 
-                fCurrentRoot = root;
-                fCurrentType = type;
-
-                /* Fixed-length mode arms a countdown; hold-to-sustain waits for
-                 * the release gesture instead. */
                 fNoteOffCountdown = fHoldToSustain
                     ? 0
                     : static_cast<int32_t>(fNoteLengthMs * fSampleRate / 1000.0);
@@ -425,55 +592,63 @@ private:
             }
 
             case kGestureMove: {
-                if (fVoiceCount == 0)
+                /* A drag moves the group it started, identified by the source it
+                 * currently carries. */
+                VoiceGroup* g = findGroup(fDragSource);
+                if (g == nullptr)
                     break;
 
                 if (! fGlideEnabled) {
-                    /* Glide off: retrigger immediately at the new root (spec 6.2
-                     * step 5). No bend is involved. */
-                    releaseAllVoices(0);
-                    triggerChordInternal(0, root, type, fGestureVelocity);
-                    fCurrentRoot = root;
-                    fCurrentType = type;
+                    /* Glide off: restate at the new root immediately (spec 6.2
+                     * step 5), retriggering shared pitches for a fresh attack. */
+                    const uint8_t vel = g->velocity;
+                    stopGroup(0, g);
+                    startGroup(0, source, root, type, vel, true);
+                    fDragSource = source;
                     break;
                 }
 
-                /* Glide on: ramp a single uniform bend across all held voices
-                 * (spec 6.1). Re-aiming mid-glide restarts the ramp from the
-                 * root we are currently sounding. */
-                fGlideTargetSemis = shortestSemitoneDelta(fCurrentRoot, root);
+                /* Glide on: one uniform bend carries every voice (spec 6.1).
+                 * Re-aiming mid-glide ramps onward from the current root. */
+                fGlideTargetSemis = shortestSemitoneDelta(g->root, root);
                 fGlideTargetRoot  = root;
                 fGlideTargetType  = type;
-                fGlideVelocity    = fGestureVelocity;
+                fGlideSource      = g->source;
                 fGlideElapsed     = 0;
                 fGlideDuration    = static_cast<uint32_t>(
                     fGlideTimeMs * fSampleRate / 1000.0);
                 fGlideActive      = (fGlideTargetSemis != 0);
 
-                /* A zero-distance move (different ring, same root) still needs
-                 * the chord shape updated. */
-                if (! fGlideActive && type != fCurrentType) {
-                    releaseAllVoices(0);
-                    triggerChordInternal(0, root, type, fGestureVelocity);
-                    fCurrentType = type;
+                /* Same root, different ring: no distance to travel, but the chord
+                 * shape still has to change. */
+                if (! fGlideActive && type != g->type) {
+                    const uint8_t vel = g->velocity;
+                    stopGroup(0, g);
+                    startGroup(0, source, root, type, vel, false);
+                    fDragSource = source;
                 }
                 break;
             }
 
             case kGestureRelease: {
-                /* Resolve an in-flight glide to true pitches before releasing, so
-                 * a clip never ends on a bent note (spec 6.2 step 4a). */
-                if (fGlideActive) {
+                /* Latched selections ignore the release - that is the point. */
+                if (fLatchEnabled)
+                    break;
+
+                VoiceGroup* g = findGroup(fDragSource);
+                if (g == nullptr)
+                    g = findGroup(source);
+
+                /* Resolve an in-flight glide first, so a clip never ends on a
+                 * bent note (spec 6.2 step 4a). */
+                if (fGlideActive && g != nullptr && fGlideSource == g->source) {
                     fGlideActive = false;
-                    releaseAllVoices(0);
                     sendPitchBend(0, 0.0f);
-                    fCurrentRoot = fGlideTargetRoot;
-                    fCurrentType = fGlideTargetType;
-                } else if (fHoldToSustain) {
-                    releaseAllVoices(0);
                 }
-                /* In fixed-length mode the countdown owns the note-off, so a
-                 * release does nothing. */
+
+                if (fHoldToSustain)
+                    stopGroup(0, g);
+                /* In fixed-length mode the countdown owns the note-off. */
                 break;
             }
         }
@@ -491,15 +666,6 @@ private:
         return defaultChordForRing(ring);
     }
 
-    void triggerChordInternal(uint32_t frame, int rootPitchClass,
-                              ChordType type, uint8_t velocity)
-    {
-        const int base = fOctave * 12;
-        fVoiceCount = buildChord(rootPitchClass, type, base, fVoice, kMaxVoices);
-
-        for (int i = 0; i < fVoiceCount; ++i)
-            sendRaw(frame, 0x90 | fChannel, fVoice[i], velocity);
-    }
 
     /* ---- settings: live state, never automation (spec section 5) ---------- */
     ChordType fChordType      = kChordMajor;
@@ -514,19 +680,21 @@ private:
     int       fVelocityRandom = 0;
     int       fNoteLengthMs   = 500;
     bool      fHoldToSustain  = true;
+    /* Latch: a selection keeps sounding after the pointer is released, until it
+     * is clicked again or another selection replaces it. */
+    bool      fLatchEnabled   = false;
     bool      fGlideEnabled   = true;
     int       fGlideTimeMs    = 120;
     int       fBendRange      = 12;
 
     /* ---- runtime voicing state -------------------------------------------- */
-    uint8_t  fVoice[kMaxVoices];
-    int      fVoiceCount  = 0;
     uint8_t  fChannel     = 0;
-    int      fCurrentRoot = 0;
-    ChordType fCurrentType = kChordMajor;
     double   fSampleRate  = 48000.0;
     bool     fNeedsRpn    = true;
     int32_t  fNoteOffCountdown = 0;
+    /* The group a drag is currently moving, as a packed position|ring. */
+    int      fDragSource  = -1;
+    int      fGlideSource = -1;
 
     /* Written by setState() on the UI thread, claimed by run() on the audio
      * thread. See queueGesture(). */
@@ -540,7 +708,6 @@ private:
     int       fGlideTargetSemis = 0;
     int       fGlideTargetRoot  = 0;
     ChordType fGlideTargetType  = kChordMajor;
-    uint8_t   fGlideVelocity    = 100;
 
     DISTRHO_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FortyFifthPlugin)
 };
