@@ -1,0 +1,11 @@
+bin/
+build/
+*.o
+*.d
+*.so
+*.dll
+*.dylib
+*.clap
+*.vst3
+compile_commands.json
+.cache/
