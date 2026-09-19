@@ -16,6 +16,10 @@
 #include <cstdint>
 #include <cstddef>
 
+#if FORTYFIFTH_MIDI_MONITOR
+# include <atomic>
+#endif
+
 namespace fortyfifth {
 
 /* Chromatic pitch class of each of the 12 circle-of-fifths positions, starting at
@@ -143,6 +147,53 @@ inline int buildChord(int rootPitchClass,
     }
     return written;
 }
+
+#if FORTYFIFTH_MIDI_MONITOR
+/*
+ * Test-rig plumbing, standalone build only.
+ *
+ * DPF offers no way to get this data across: the UI can setState() but has no
+ * getState(), Plugin::updateStateValue() must not be called during run(), and
+ * there is no plugin-side idle hook to call it from. In the standalone build,
+ * however, the DSP and UI live in one process, so they can share a ring buffer
+ * directly. The DSP writes from the audio thread, the UI drains it from uiIdle().
+ *
+ * This is emphatically NOT how a shipping plugin should communicate - in a real
+ * host the UI may be in a different process entirely. It is compiled only into
+ * the standalone target and never into the CLAP or VST3.
+ */
+struct MonitorRing {
+    static constexpr uint32_t kCapacity = 256;
+
+    uint32_t              slot[kCapacity] = {0};
+    std::atomic<uint32_t> write { 0 };
+    std::atomic<uint32_t> read  { 0 };
+
+    /* Audio thread. Never blocks, never allocates; drops events when full. */
+    void push(uint32_t word)
+    {
+        const uint32_t w = write.load(std::memory_order_relaxed);
+        if (w - read.load(std::memory_order_acquire) >= kCapacity)
+            return;
+        slot[w % kCapacity] = word;
+        write.store(w + 1, std::memory_order_release);
+    }
+
+    /* UI thread. Returns false when drained. */
+    bool pop(uint32_t& out)
+    {
+        const uint32_t r = read.load(std::memory_order_relaxed);
+        if (r == write.load(std::memory_order_acquire))
+            return false;
+        out = slot[r % kCapacity];
+        read.store(r + 1, std::memory_order_release);
+        return true;
+    }
+};
+
+/* Defined in FortyFifthPlugin.cpp. */
+MonitorRing& monitorRing();
+#endif /* FORTYFIFTH_MIDI_MONITOR */
 
 } /* namespace fortyfifth */
 

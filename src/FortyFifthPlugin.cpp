@@ -15,9 +15,22 @@
 #include "DistrhoPlugin.hpp"
 #include "CircleTheory.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#if FORTYFIFTH_MIDI_MONITOR
+namespace fortyfifth {
+/* One ring per process, shared by the DSP and UI of the standalone test rig.
+ * Function-local static so construction order is not a concern. */
+MonitorRing& monitorRing()
+{
+    static MonitorRing ring;
+    return ring;
+}
+} /* namespace fortyfifth */
+#endif
 
 START_NAMESPACE_DISTRHO
 
@@ -67,6 +80,7 @@ protected:
         kStateGlideEnabled,
         kStateGlideTimeMs,
         kStateBendRange,
+        kStateGesture,
         kStateCount
     };
 
@@ -118,6 +132,12 @@ protected:
                 state.label = "Pitch Bend Range (semitones)";
                 state.defaultValue = "12";
                 break;
+            case kStateGesture:
+                /* Transient UI -> DSP channel, not a persisted setting. */
+                state.key = "gesture";
+                state.label = "Gesture";
+                state.defaultValue = "";
+                break;
         }
     }
 
@@ -125,8 +145,13 @@ protected:
     {
         const int v = std::atoi(value);
 
-        if (std::strcmp(key, "chordType") == 0)
+        if (std::strcmp(key, "chordType") == 0) {
             fChordType = static_cast<ChordType>(v % kChordTypeCount);
+            /* The host replays defaults at startup; only a change made after that
+             * counts as the user overriding the per-ring default. */
+            if (fStateInitialised)
+                fChordTypeIsExplicit = true;
+        }
         else if (std::strcmp(key, "octave") == 0)
             fOctave = v;
         else if (std::strcmp(key, "velocity") == 0)
@@ -143,9 +168,44 @@ protected:
             fGlideTimeMs = v;
         else if (std::strcmp(key, "bendRange") == 0)
             fBendRange = v;
+        else if (std::strcmp(key, "gesture") == 0)
+            queueGesture(value);
+
+        /* The first gesture proves the UI is live, so anything after this point
+         * is a real user action rather than the host restoring defaults. */
+        if (std::strcmp(key, "gesture") == 0)
+            fStateInitialised = true;
 
         /* A gesture in progress keeps the settings it started with, so that a
          * control change mid-drag cannot rewrite notes already emitted. */
+    }
+
+    /*
+     * setState() runs on the main/UI thread, but MIDI may only be emitted from
+     * run() on the audio thread. So a gesture is parsed here and handed over as a
+     * single atomic word, which run() claims and acts on. One slot is enough: a
+     * pointer gesture cannot outrun the audio callback, and if two arrive within a
+     * block the later one is the current truth anyway.
+     */
+    void queueGesture(const char* value)
+    {
+        char verb[16] = {0};
+        int  position = 0;
+        int  ring     = 0;
+
+        if (std::sscanf(value, "%15[^:]:%d:%d", verb, &position, &ring) != 3)
+            return;
+        if (position < 0 || position > 11 || ring < 0 || ring >= kRingCount)
+            return;
+
+        int kind;
+        if (std::strcmp(verb, "press") == 0)        kind = kGesturePress;
+        else if (std::strcmp(verb, "move") == 0)    kind = kGestureMove;
+        else if (std::strcmp(verb, "release") == 0) kind = kGestureRelease;
+        else return;
+
+        fPendingGesture.store((kind << 16) | (ring << 8) | position,
+                              std::memory_order_release);
     }
 
     String getState(const char* key) const override
@@ -197,6 +257,12 @@ protected:
             fNeedsRpn = false;
         }
 
+        /* Claim whatever gesture the UI left for us, if any. */
+        const int32_t packed = fPendingGesture.exchange(kNoGesture,
+                                                        std::memory_order_acquire);
+        if (packed != kNoGesture)
+            handleGesture(packed);
+
         if (fGlideActive)
             advanceGlide(frames);
 
@@ -209,6 +275,15 @@ protected:
 
 private:
     static constexpr int kMaxVoices = 5;
+
+    /* Gesture kinds, packed into the atomic handoff word as
+     * (kind << 16) | (ring << 8) | position. */
+    enum GestureKind {
+        kGesturePress = 1,
+        kGestureMove,
+        kGestureRelease
+    };
+    static constexpr int32_t kNoGesture = -1;
 
     /* ---- MIDI emission helpers ------------------------------------------- */
 
@@ -223,7 +298,23 @@ private:
         ev.data[3] = 0;
         ev.dataExt = nullptr;
         writeMidiEvent(ev);
+
+        monitorLog(a, b, c);
     }
+
+#if FORTYFIFTH_MIDI_MONITOR
+    /* Test rig only: mirror every emitted message into the shared ring the UI
+     * drains for its event log. See MonitorRing in CircleTheory.hpp for why this
+     * bypasses DPF's state channel entirely. */
+    void monitorLog(uint8_t a, uint8_t b, uint8_t c)
+    {
+        monitorRing().push((static_cast<uint32_t>(a) << 16) |
+                           (static_cast<uint32_t>(b) << 8)  |
+                            static_cast<uint32_t>(c));
+    }
+#else
+    void monitorLog(uint8_t, uint8_t, uint8_t) {}
+#endif
 
     /* RPN 0,0 - pitch bend sensitivity, in semitones (spec section 7). */
     void sendBendRangeRpn(uint32_t frame)
@@ -297,6 +388,109 @@ private:
         }
     }
 
+    /*
+     * Act on a gesture claimed from the UI. Settings are read here, once, at the
+     * moment the gesture arrives - this is the point where spec section 5's rule
+     * takes physical effect, because everything downstream is concrete MIDI.
+     */
+    void handleGesture(int32_t packed)
+    {
+        const int kind     = (packed >> 16) & 0xFF;
+        const int ring     = (packed >> 8) & 0xFF;
+        const int position = packed & 0xFF;
+
+        const Ring      r    = static_cast<Ring>(ring);
+        const int       root = rootForPosition(position, r);
+        const ChordType type = chordTypeForRing(r);
+
+        switch (kind) {
+            case kGesturePress: {
+                /* A press always starts clean: abandon any glide and any voices
+                 * still sounding from a previous gesture. */
+                fGlideActive = false;
+                releaseAllVoices(0);
+
+                fGestureVelocity = pickVelocity();
+                triggerChordInternal(0, root, type, fGestureVelocity);
+
+                fCurrentRoot = root;
+                fCurrentType = type;
+
+                /* Fixed-length mode arms a countdown; hold-to-sustain waits for
+                 * the release gesture instead. */
+                fNoteOffCountdown = fHoldToSustain
+                    ? 0
+                    : static_cast<int32_t>(fNoteLengthMs * fSampleRate / 1000.0);
+                break;
+            }
+
+            case kGestureMove: {
+                if (fVoiceCount == 0)
+                    break;
+
+                if (! fGlideEnabled) {
+                    /* Glide off: retrigger immediately at the new root (spec 6.2
+                     * step 5). No bend is involved. */
+                    releaseAllVoices(0);
+                    triggerChordInternal(0, root, type, fGestureVelocity);
+                    fCurrentRoot = root;
+                    fCurrentType = type;
+                    break;
+                }
+
+                /* Glide on: ramp a single uniform bend across all held voices
+                 * (spec 6.1). Re-aiming mid-glide restarts the ramp from the
+                 * root we are currently sounding. */
+                fGlideTargetSemis = shortestSemitoneDelta(fCurrentRoot, root);
+                fGlideTargetRoot  = root;
+                fGlideTargetType  = type;
+                fGlideVelocity    = fGestureVelocity;
+                fGlideElapsed     = 0;
+                fGlideDuration    = static_cast<uint32_t>(
+                    fGlideTimeMs * fSampleRate / 1000.0);
+                fGlideActive      = (fGlideTargetSemis != 0);
+
+                /* A zero-distance move (different ring, same root) still needs
+                 * the chord shape updated. */
+                if (! fGlideActive && type != fCurrentType) {
+                    releaseAllVoices(0);
+                    triggerChordInternal(0, root, type, fGestureVelocity);
+                    fCurrentType = type;
+                }
+                break;
+            }
+
+            case kGestureRelease: {
+                /* Resolve an in-flight glide to true pitches before releasing, so
+                 * a clip never ends on a bent note (spec 6.2 step 4a). */
+                if (fGlideActive) {
+                    fGlideActive = false;
+                    releaseAllVoices(0);
+                    sendPitchBend(0, 0.0f);
+                    fCurrentRoot = fGlideTargetRoot;
+                    fCurrentType = fGlideTargetType;
+                } else if (fHoldToSustain) {
+                    releaseAllVoices(0);
+                }
+                /* In fixed-length mode the countdown owns the note-off, so a
+                 * release does nothing. */
+                break;
+            }
+        }
+    }
+
+    /* The ring supplies the chord shape unless the user picked an explicit type.
+     * "Single" is treated as an explicit choice so single-note mode works on
+     * every ring. */
+    ChordType chordTypeForRing(Ring ring) const
+    {
+        if (fChordType == kChordSingleNote)
+            return kChordSingleNote;
+        if (fChordTypeIsExplicit)
+            return fChordType;
+        return defaultChordForRing(ring);
+    }
+
     void triggerChordInternal(uint32_t frame, int rootPitchClass,
                               ChordType type, uint8_t velocity)
     {
@@ -309,6 +503,12 @@ private:
 
     /* ---- settings: live state, never automation (spec section 5) ---------- */
     ChordType fChordType      = kChordMajor;
+    /* Until the user picks a chord type, each ring supplies its own (majors on
+     * the outer ring, minors on the inner). Once chosen, the choice wins
+     * everywhere - otherwise picking "maj7" would silently do nothing on the
+     * minor ring. */
+    bool      fChordTypeIsExplicit = false;
+    bool      fStateInitialised    = false;
     int       fOctave         = 4;
     uint8_t   fVelocity       = 100;
     int       fVelocityRandom = 0;
@@ -327,6 +527,12 @@ private:
     double   fSampleRate  = 48000.0;
     bool     fNeedsRpn    = true;
     int32_t  fNoteOffCountdown = 0;
+
+    /* Written by setState() on the UI thread, claimed by run() on the audio
+     * thread. See queueGesture(). */
+    std::atomic<int32_t> fPendingGesture { kNoGesture };
+    uint8_t   fGestureVelocity = 100;
+
 
     bool      fGlideActive      = false;
     uint32_t  fGlideElapsed     = 0;
