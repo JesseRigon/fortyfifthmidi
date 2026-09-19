@@ -9,3 +9,4 @@ build/
 *.vst3
 compile_commands.json
 .cache/
+/bin-win/

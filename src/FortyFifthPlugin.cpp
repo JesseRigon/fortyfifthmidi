@@ -71,17 +71,22 @@ protected:
     /* ---- state (non-automatable settings) -------------------------------- */
 
     enum StateIndex {
-        kStateChordType = 0,
+        /* Per-ring: "ext0".."ext2" and "voice0".."voice2". */
+        kStateExt0 = 0,
+        kStateExt1,
+        kStateExt2,
+        kStateVoice0,
+        kStateVoice1,
+        kStateVoice2,
         kStateOctave,
         kStateVelocity,
         kStateVelocityRandom,
         kStateNoteLengthMs,
         kStateHoldToSustain,
         kStateLatch,
-        kStateGlideEnabled,
+        kStateGlideMode,
         kStateGlideTimeMs,
         kStateBendRange,
-        kStateChordAuto,
         kStateGesture,
         kStateCount
     };
@@ -89,11 +94,33 @@ protected:
     void initState(uint32_t index, State& state) override
     {
         switch (index) {
-            case kStateChordType:
-                state.key = "chordType";
-                state.label = "Chord Type";
-                state.defaultValue = "1"; /* major */
+            case kStateExt0:
+            case kStateExt1:
+            case kStateExt2: {
+                static const char* const kKeys[3]   = { "ext0", "ext1", "ext2" };
+                static const char* const kLabels[3] = {
+                    "Key Ring Extension", "Minor Ring Extension",
+                    "Dim Ring Extension"
+                };
+                const int r = index - kStateExt0;
+                state.key = kKeys[r];
+                state.label = kLabels[r];
+                state.defaultValue = "0";
                 break;
+            }
+            case kStateVoice0:
+            case kStateVoice1:
+            case kStateVoice2: {
+                static const char* const kKeys[3]   = { "voice0", "voice1", "voice2" };
+                static const char* const kLabels[3] = {
+                    "Key Ring Voicing", "Minor Ring Voicing", "Dim Ring Voicing"
+                };
+                const int r = index - kStateVoice0;
+                state.key = kKeys[r];
+                state.label = kLabels[r];
+                state.defaultValue = "0";
+                break;
+            }
             case kStateOctave:
                 state.key = "octave";
                 state.label = "Octave Offset";
@@ -124,9 +151,9 @@ protected:
                 state.label = "Latch";
                 state.defaultValue = "0";
                 break;
-            case kStateGlideEnabled:
-                state.key = "glideEnabled";
-                state.label = "Glide";
+            case kStateGlideMode:
+                state.key = "glideMode";
+                state.label = "Glide Mode";   /* 0 off, 1 on, 2 MPE */
                 state.defaultValue = "1";
                 break;
             case kStateGlideTimeMs:
@@ -138,13 +165,6 @@ protected:
                 state.key = "bendRange";
                 state.label = "Pitch Bend Range (semitones)";
                 state.defaultValue = "12";
-                break;
-            case kStateChordAuto:
-                /* Set when the user picks "Auto", returning chord choice to the
-                 * per-ring defaults. */
-                state.key = "chordAuto";
-                state.label = "Chord Auto";
-                state.defaultValue = "1";
                 break;
             case kStateGesture:
                 /* Transient UI -> DSP channel, not a persisted setting. */
@@ -159,12 +179,16 @@ protected:
     {
         const int v = std::atoi(value);
 
-        if (std::strcmp(key, "chordType") == 0) {
-            fChordType = static_cast<ChordType>(v % kChordTypeCount);
-            /* The host replays defaults at startup; only a change made after that
-             * counts as the user overriding the per-ring default. */
-            if (fStateInitialised)
-                fChordTypeIsExplicit = true;
+        /* Per-ring keys: extN and voiceN, where N is the ring index. */
+        if (std::strncmp(key, "ext", 3) == 0 && key[3] >= '0' && key[3] <= '2') {
+            fRingExtension[key[3] - '0'] =
+                static_cast<Extension>(((v % kExtCount) + kExtCount) % kExtCount);
+        }
+        else if (std::strncmp(key, "voice", 5) == 0 &&
+                 key[5] >= '0' && key[5] <= '2') {
+            fRingVoicing[key[5] - '0'] =
+                static_cast<Voicing>(((v % kVoicingCount) + kVoicingCount)
+                                     % kVoicingCount);
         }
         else if (std::strcmp(key, "octave") == 0)
             fOctave = v;
@@ -178,21 +202,21 @@ protected:
             fHoldToSustain = (v != 0);
         else if (std::strcmp(key, "latch") == 0)
             fLatchEnabled = (v != 0);
-        else if (std::strcmp(key, "glideEnabled") == 0)
-            fGlideEnabled = (v != 0);
+        else if (std::strcmp(key, "glideMode") == 0) {
+            const GlideMode prev = fGlideMode;
+            fGlideMode = static_cast<GlideMode>(
+                ((v % kGlideModeCount) + kGlideModeCount) % kGlideModeCount);
+            /* Entering MPE needs the bend range announced on the member
+             * channels, which have never been told. */
+            if (prev != fGlideMode && fGlideMode == kGlideMpe)
+                fNeedsRpn = true;
+        }
         else if (std::strcmp(key, "glideTimeMs") == 0)
             fGlideTimeMs = v;
         else if (std::strcmp(key, "bendRange") == 0)
             fBendRange = v;
-        else if (std::strcmp(key, "chordAuto") == 0)
-            fChordTypeIsExplicit = false;   /* back to per-ring defaults */
         else if (std::strcmp(key, "gesture") == 0)
             queueGesture(value);
-
-        /* The first gesture proves the UI is live, so anything after this point
-         * is a real user action rather than the host restoring defaults. */
-        if (std::strcmp(key, "gesture") == 0)
-            fStateInitialised = true;
 
         /* A gesture in progress keeps the settings it started with, so that a
          * control change mid-drag cannot rewrite notes already emitted. */
@@ -231,14 +255,17 @@ protected:
         char buf[16];
         int  v = 0;
 
-        if (std::strcmp(key, "chordType") == 0)            v = static_cast<int>(fChordType);
+        if (std::strncmp(key, "ext", 3) == 0 && key[3] >= '0' && key[3] <= '2')
+            v = static_cast<int>(fRingExtension[key[3] - '0']);
+        else if (std::strncmp(key, "voice", 5) == 0 && key[5] >= '0' && key[5] <= '2')
+            v = static_cast<int>(fRingVoicing[key[5] - '0']);
         else if (std::strcmp(key, "octave") == 0)          v = fOctave;
         else if (std::strcmp(key, "velocity") == 0)        v = fVelocity;
         else if (std::strcmp(key, "velocityRandom") == 0)  v = fVelocityRandom;
         else if (std::strcmp(key, "noteLengthMs") == 0)    v = fNoteLengthMs;
         else if (std::strcmp(key, "holdToSustain") == 0)   v = fHoldToSustain ? 1 : 0;
         else if (std::strcmp(key, "latch") == 0)           v = fLatchEnabled ? 1 : 0;
-        else if (std::strcmp(key, "glideEnabled") == 0)    v = fGlideEnabled ? 1 : 0;
+        else if (std::strcmp(key, "glideMode") == 0)       v = static_cast<int>(fGlideMode);
         else if (std::strcmp(key, "glideTimeMs") == 0)     v = fGlideTimeMs;
         else if (std::strcmp(key, "bendRange") == 0)       v = fBendRange;
 
@@ -340,9 +367,9 @@ private:
 #endif
 
     /* RPN 0,0 - pitch bend sensitivity, in semitones (spec section 7). */
-    void sendBendRangeRpn(uint32_t frame)
+    void sendBendRangeRpnOn(uint32_t frame, uint8_t channel)
     {
-        const uint8_t cc = 0xB0 | fChannel;
+        const uint8_t cc = 0xB0 | (channel & 0x0F);
         sendRaw(frame, cc, 101, 0);                                  /* RPN MSB */
         sendRaw(frame, cc, 100, 0);                                  /* RPN LSB */
         sendRaw(frame, cc, 6, static_cast<uint8_t>(fBendRange));     /* data MSB */
@@ -351,14 +378,27 @@ private:
         sendRaw(frame, cc, 100, 127);
     }
 
-    void sendPitchBend(uint32_t frame, float semitones)
+    /* Announce the bend range everywhere it could be needed. In MPE mode each
+     * member channel needs its own announcement, since a receiving instrument
+     * tracks bend sensitivity per channel. */
+    void sendBendRangeRpn(uint32_t frame)
+    {
+        sendBendRangeRpnOn(frame, fChannel);
+
+        if (fGlideMode == kGlideMpe) {
+            for (int i = 0; i < kMaxGroupNotes; ++i)
+                sendBendRangeRpnOn(frame, mpeChannelFor(i));
+        }
+    }
+
+    void sendPitchBend(uint32_t frame, uint8_t channel, float semitones)
     {
         const float norm = semitones / static_cast<float>(fBendRange);
         int value = 8192 + static_cast<int>(norm * 8191.0f);
         if (value < 0)     value = 0;
         if (value > 16383) value = 16383;
 
-        sendRaw(frame, 0xE0 | fChannel,
+        sendRaw(frame, 0xE0 | (channel & 0x0F),
                 static_cast<uint8_t>(value & 0x7F),
                 static_cast<uint8_t>((value >> 7) & 0x7F));
     }
@@ -384,15 +424,25 @@ private:
      * notes another chord is still holding (C major and A minor share C and E).
      */
 
+    /* Room for the doubling voicings, which add a voice. */
+    static constexpr int kMaxGroupNotes = kMaxChordTones + 1;
+
     struct VoiceGroup {
         bool      active    = false;
         int       source    = -1;   /* packed position|ring that started it */
         int       root      = 0;
         ChordType type      = kChordMajor;
+        Ring      ring      = kRingKey;
         uint8_t   velocity  = 100;
         int       count     = 0;
-        uint8_t   note[kMaxChordTones] = {0};
-        bool      owns[kMaxChordTones] = {false}; /* false = a dup we did not send */
+        uint8_t   note[kMaxGroupNotes] = {0};
+        /* Per-voice channel. In MPE mode each voice gets its own so it can bend
+         * independently; otherwise every voice shares the base channel. */
+        uint8_t   chan[kMaxGroupNotes] = {0};
+        /* Where each voice is heading during an MPE glide, and where it started,
+         * so the ramp can interpolate per voice rather than uniformly. */
+        uint8_t   target[kMaxGroupNotes] = {0};
+        bool      mpe       = false;
     };
 
     static constexpr int kMaxGroups = 4;
@@ -434,7 +484,7 @@ private:
      * the smooth motion. Either way the refcount is what governs note-off.
      */
     void startGroup(uint32_t frame, int source, int root, ChordType type,
-                    uint8_t velocity, bool retriggerDuplicates)
+                    Ring ring, uint8_t velocity, bool retriggerDuplicates)
     {
         VoiceGroup* g = allocGroup();
         if (g == nullptr) {
@@ -443,25 +493,33 @@ private:
             g = &fGroup[0];
         }
 
-        uint8_t notes[kMaxChordTones];
-        const int n = buildChord(root, type, fOctave * 12, notes, kMaxChordTones);
+        uint8_t notes[kMaxGroupNotes];
+        int n = buildChord(root, type, fOctave * 12, notes, kMaxChordTones);
+        n = applyVoicing(notes, n, fRingVoicing[ring], kMaxGroupNotes);
+
+        const bool mpe = (fGlideMode == kGlideMpe);
 
         g->active   = true;
         g->source   = source;
         g->root     = root;
         g->type     = type;
+        g->ring     = ring;
         g->velocity = velocity;
         g->count    = n;
+        g->mpe      = mpe;
 
         for (int i = 0; i < n; ++i) {
             const uint8_t note = notes[i];
             const bool    dup  = (fHeld[note] > 0);
 
-            g->note[i] = note;
-            g->owns[i] = true;
+            g->note[i]   = note;
+            g->target[i] = note;
+            g->chan[i]   = mpe ? mpeChannelFor(i) : fChannel;
 
-            if (! dup || retriggerDuplicates)
-                sendRaw(frame, 0x90 | fChannel, note, velocity);
+            /* In MPE every voice owns its channel, so a duplicate pitch on a
+             * different channel is not really a duplicate - always send it. */
+            if (mpe || ! dup || retriggerDuplicates)
+                sendRaw(frame, 0x90 | g->chan[i], note, velocity);
 
             ++fHeld[note];
         }
@@ -475,13 +533,26 @@ private:
 
         for (int i = 0; i < g->count; ++i) {
             const uint8_t note = g->note[i];
-            if (fHeld[note] > 0 && --fHeld[note] == 0)
-                sendRaw(frame, 0x80 | fChannel, note, 0);
+
+            if (g->mpe) {
+                /* Dedicated channel: nothing else can be relying on this note. */
+                sendRaw(frame, 0x80 | g->chan[i], note, 0);
+                if (fHeld[note] > 0) --fHeld[note];
+            } else if (fHeld[note] > 0 && --fHeld[note] == 0) {
+                sendRaw(frame, 0x80 | g->chan[i], note, 0);
+            }
         }
 
         g->active = false;
         g->count  = 0;
         g->source = -1;
+    }
+
+    /* MPE member channels start at 2 (channel 1 is the master zone), wrapping
+     * within the 15 available. */
+    uint8_t mpeChannelFor(int voiceIndex) const
+    {
+        return static_cast<uint8_t>(1 + (voiceIndex % 15));
     }
 
     void stopAllGroups(uint32_t frame)
@@ -502,7 +573,7 @@ private:
         if (g == nullptr) {
             /* The gliding group went away underneath us. */
             fGlideActive = false;
-            sendPitchBend(0, 0.0f);
+            sendPitchBend(0, fChannel, 0.0f);
             return;
         }
 
@@ -512,24 +583,57 @@ private:
             ? static_cast<float>(fGlideElapsed) / static_cast<float>(fGlideDuration)
             : 1.0f;
 
-        if (progress >= 1.0f) {
-            sendPitchBend(0, static_cast<float>(fGlideTargetSemis));
-
-            /* Snap-and-reset: retire the bent notes, restate the true ones, zero
-             * the bend. Glide is on by definition here, so duplicates are skipped
-             * rather than retriggered. */
-            const uint8_t vel    = g->velocity;
-            const int     source = g->source;
-            stopGroup(0, g);
-            startGroup(0, source, fGlideTargetRoot, fGlideTargetType, vel,
-                       /* retriggerDuplicates */ false);
-            sendPitchBend(0, 0.0f);
-
-            fGlideActive      = false;
-            fGlideTargetSemis = 0;
-        } else {
-            sendPitchBend(0, progress * static_cast<float>(fGlideTargetSemis));
+        if (progress < 1.0f) {
+            if (g->mpe) {
+                /* Each voice travels its own distance, which is the whole point
+                 * of MPE mode: it makes shape changes glidable. */
+                for (int i = 0; i < g->count; ++i) {
+                    const float delta = static_cast<float>(g->target[i]) -
+                                        static_cast<float>(g->note[i]);
+                    sendPitchBend(0, g->chan[i], progress * delta);
+                }
+            } else {
+                sendPitchBend(0, fChannel,
+                              progress * static_cast<float>(fGlideTargetSemis));
+            }
+            return;
         }
+
+        /* Snap-and-reset (spec 6.2 step 4a): land on the bend, retire the bent
+         * notes, restate the true ones, zero the bend. The recorded clip then
+         * holds real, editable pitches rather than permanently bent ones. */
+        if (g->mpe) {
+            for (int i = 0; i < g->count; ++i) {
+                const float delta = static_cast<float>(g->target[i]) -
+                                    static_cast<float>(g->note[i]);
+                sendPitchBend(0, g->chan[i], delta);
+            }
+        } else {
+            sendPitchBend(0, fChannel, static_cast<float>(fGlideTargetSemis));
+        }
+
+        const uint8_t vel    = g->velocity;
+        const int     source = g->source;
+        const bool    wasMpe = g->mpe;
+        uint8_t       chans[kMaxGroupNotes];
+        const int     nchan  = g->count;
+        for (int i = 0; i < nchan; ++i)
+            chans[i] = g->chan[i];
+
+        stopGroup(0, g);
+        startGroup(0, source, fGlideTargetRoot, fGlideTargetType,
+                   fGlideTargetRing, vel, /* retriggerDuplicates */ false);
+
+        /* Zero every channel that carried a bend, not just the base one. */
+        if (wasMpe) {
+            for (int i = 0; i < nchan; ++i)
+                sendPitchBend(0, chans[i], 0.0f);
+        } else {
+            sendPitchBend(0, fChannel, 0.0f);
+        }
+
+        fGlideActive      = false;
+        fGlideTargetSemis = 0;
     }
 
     /*
@@ -562,7 +666,7 @@ private:
                     if (same != nullptr) {
                         if (fGlideActive && fGlideSource == source) {
                             fGlideActive = false;
-                            sendPitchBend(0, 0.0f);
+                            sendPitchBend(0, fChannel, 0.0f);
                         }
                         stopGroup(0, same);
                         break;
@@ -571,7 +675,8 @@ private:
                     fGlideActive = false;
                     stopAllGroups(0);
                     fGestureVelocity = pickVelocity();
-                    startGroup(0, source, root, type, fGestureVelocity, true);
+                    startGroup(0, source, root, type, r, fGestureVelocity, true);
+                    fDragSource = source;
                     break;
                 }
 
@@ -581,8 +686,11 @@ private:
                  * where harmonising happens - the earlier group is left alone.
                  */
                 fGestureVelocity = pickVelocity();
-                startGroup(0, source, root, type, fGestureVelocity,
-                           /* retriggerDuplicates */ ! fGlideEnabled);
+                /* With glide off, a duplicate pitch is resent so the new chord
+                 * attacks; with glide on it is left alone so nothing retriggers
+                 * mid-movement. */
+                startGroup(0, source, root, type, r, fGestureVelocity,
+                           /* retriggerDuplicates */ fGlideMode == kGlideOff);
                 fDragSource = source;
 
                 fNoteOffCountdown = fHoldToSustain
@@ -598,33 +706,66 @@ private:
                 if (g == nullptr)
                     break;
 
-                if (! fGlideEnabled) {
-                    /* Glide off: restate at the new root immediately (spec 6.2
-                     * step 5), retriggering shared pitches for a fresh attack. */
+                /*
+                 * Whether a glide is possible at all depends on the mode and on
+                 * whether the chord SHAPE changes:
+                 *
+                 *   off  never glide.
+                 *   on   a single bend moves every voice by one interval, which
+                 *        only works when the shape is unchanged. Rings have
+                 *        uniform shapes, so this means "within a ring".
+                 *   mpe  each voice has its own channel and bends independently,
+                 *        so any chord can reach any other.
+                 */
+                const bool shapeKept = sameShape(g->type, type);
+                const bool canGlide  = (fGlideMode == kGlideMpe) ||
+                                       (fGlideMode == kGlideOn && shapeKept);
+
+                if (! canGlide) {
+                    /* Retrigger cleanly (spec 6.2 step 5). Shared pitches are
+                     * resent so the new chord attacks properly. */
                     const uint8_t vel = g->velocity;
                     stopGroup(0, g);
-                    startGroup(0, source, root, type, vel, true);
+                    startGroup(0, source, root, type, r, vel, true);
                     fDragSource = source;
                     break;
                 }
 
-                /* Glide on: one uniform bend carries every voice (spec 6.1).
-                 * Re-aiming mid-glide ramps onward from the current root. */
                 fGlideTargetSemis = shortestSemitoneDelta(g->root, root);
                 fGlideTargetRoot  = root;
                 fGlideTargetType  = type;
+                fGlideTargetRing  = r;
                 fGlideSource      = g->source;
                 fGlideElapsed     = 0;
                 fGlideDuration    = static_cast<uint32_t>(
                     fGlideTimeMs * fSampleRate / 1000.0);
-                fGlideActive      = (fGlideTargetSemis != 0);
 
-                /* Same root, different ring: no distance to travel, but the chord
-                 * shape still has to change. */
-                if (! fGlideActive && type != g->type) {
+                if (fGlideMode == kGlideMpe) {
+                    /* Work out where each voice must land, pairing by index. A
+                     * voice with no counterpart (the chords differ in size) stays
+                     * where it is and is resolved by the snap at the end. */
+                    uint8_t want[kMaxGroupNotes];
+                    int n = buildChord(root, type, fOctave * 12, want,
+                                       kMaxChordTones);
+                    n = applyVoicing(want, n, fRingVoicing[r], kMaxGroupNotes);
+
+                    for (int i = 0; i < g->count; ++i)
+                        g->target[i] = (i < n) ? want[i] : g->note[i];
+
+                    /* Something must actually move for a glide to be worth it. */
+                    bool moves = false;
+                    for (int i = 0; i < g->count && ! moves; ++i)
+                        moves = (g->target[i] != g->note[i]);
+                    fGlideActive = moves;
+                } else {
+                    fGlideActive = (fGlideTargetSemis != 0);
+                }
+
+                /* Nothing to travel, but the voicing or shape may still differ. */
+                if (! fGlideActive && (type != g->type || r != g->ring)) {
                     const uint8_t vel = g->velocity;
                     stopGroup(0, g);
-                    startGroup(0, source, root, type, vel, false);
+                    startGroup(0, source, root, type, r, vel, false);
                     fDragSource = source;
                 }
                 break;
@@ -643,7 +784,12 @@ private:
                  * bent note (spec 6.2 step 4a). */
                 if (fGlideActive && g != nullptr && fGlideSource == g->source) {
                     fGlideActive = false;
-                    sendPitchBend(0, 0.0f);
+                    if (g->mpe) {
+                        for (int i = 0; i < g->count; ++i)
+                            sendPitchBend(0, g->chan[i], 0.0f);
+                    } else {
+                        sendPitchBend(0, fChannel, 0.0f);
+                    }
                 }
 
                 if (fHoldToSustain)
@@ -654,27 +800,25 @@ private:
         }
     }
 
-    /* The ring supplies the chord shape unless the user picked an explicit type.
-     * "Single" is treated as an explicit choice so single-note mode works on
-     * every ring. */
+    /* A ring's quality is fixed; the per-ring extension builds on it. */
     ChordType chordTypeForRing(Ring ring) const
     {
-        if (fChordType == kChordSingleNote)
-            return kChordSingleNote;
-        if (fChordTypeIsExplicit)
-            return fChordType;
-        return defaultChordForRing(ring);
+        return extendChord(defaultChordForRing(ring), fRingExtension[ring]);
     }
 
 
     /* ---- settings: live state, never automation (spec section 5) ---------- */
-    ChordType fChordType      = kChordMajor;
-    /* Until the user picks a chord type, each ring supplies its own (majors on
-     * the outer ring, minors on the inner). Once chosen, the choice wins
-     * everywhere - otherwise picking "maj7" would silently do nothing on the
-     * minor ring. */
-    bool      fChordTypeIsExplicit = false;
-    bool      fStateInitialised    = false;
+    /*
+     * Per-ring settings. A ring's quality is fixed by the wheel (major, minor,
+     * diminished); the user chooses an extension and a voicing for the ring as a
+     * whole, never per cell. Uniformity is what keeps within-ring glide legal:
+     * every cell in a ring yields the same interval pattern, which is exactly
+     * what spec 6.1 requires for a single pitch bend to carry all voices.
+     */
+    Extension fRingExtension[kRingCount] = { kExtNone, kExtNone, kExtNone };
+    Voicing   fRingVoicing[kRingCount]   = {
+        kVoicingRegular, kVoicingRegular, kVoicingRegular
+    };
     int       fOctave         = 4;
     uint8_t   fVelocity       = 100;
     int       fVelocityRandom = 0;
@@ -683,7 +827,7 @@ private:
     /* Latch: a selection keeps sounding after the pointer is released, until it
      * is clicked again or another selection replaces it. */
     bool      fLatchEnabled   = false;
-    bool      fGlideEnabled   = true;
+    GlideMode fGlideMode      = kGlideOn;
     int       fGlideTimeMs    = 120;
     int       fBendRange      = 12;
 
@@ -708,6 +852,7 @@ private:
     int       fGlideTargetSemis = 0;
     int       fGlideTargetRoot  = 0;
     ChordType fGlideTargetType  = kChordMajor;
+    Ring      fGlideTargetRing  = kRingKey;
 
     DISTRHO_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FortyFifthPlugin)
 };

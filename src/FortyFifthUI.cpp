@@ -83,7 +83,7 @@ protected:
 #endif
 
         /* Last, so the open list overlays the wheel and the log. */
-        drawChordMenu();
+        drawOpenMenu();
     }
 
     /* Angular span of one cell on one ring. */
@@ -127,7 +127,8 @@ protected:
          * glance; the diminished ring is dimmest, matching its lighter use. */
         /* A cell belonging to the selected key's wedge is lifted, so the seven
          * diatonic chords read as one shape - the whole point of the wheel. */
-        const bool inWedge = (degreeInKey(index, ring, fSelectedKey) != nullptr);
+        const CellRole role    = roleInKey(index, ring, fSelectedKey);
+        const bool     inWedge = (role != kCellOutside);
 
         if (active) {
             switch (ring) {
@@ -135,7 +136,11 @@ protected:
                 case kRingMinor: fillColor(Color(0.42f, 0.78f, 0.95f)); break;
                 default:         fillColor(Color(0.72f, 0.56f, 0.90f)); break;
             }
-        } else if (inWedge) {
+        } else if (role == kCellSecondary) {
+            /* Borrowed II and III: present but visibly outside the core seven,
+             * so the diatonic wedge still reads as one shape. */
+            fillColor(Color(0.33f, 0.26f, 0.20f));
+        } else if (role == kCellDiatonic) {
             switch (ring) {
                 case kRingKey:   fillColor(Color(0.30f, 0.33f, 0.42f)); break;
                 case kRingMinor: fillColor(Color(0.24f, 0.29f, 0.38f)); break;
@@ -171,18 +176,29 @@ protected:
         textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
         if (active)
             fillColor(Color(0.08f, 0.09f, 0.12f));
-        else if (inWedge)
+        else if (role == kCellSecondary)
+            fillColor(Color(0.92f, 0.82f, 0.66f));
+        else if (role == kCellDiatonic)
             fillColor(Color(0.94f, 0.96f, 0.99f));
         else
             fillColor(Color(0.52f, 0.56f, 0.64f));
-        text(tx, ty, labelForPosition(index, ring), nullptr);
 
-        /* Roman numeral under the chord name, for cells in the active wedge. */
-        if (inWedge && ! active) {
+        /* Nudge up so the numeral below has room. */
+        const float ty0 = inWedge ? ty - size * 0.30f : ty;
+        text(tx, ty0, labelForPosition(index, ring), nullptr);
+
+        /* Roman numeral under the chord name, so the progression can be read
+         * off the wheel directly. */
+        if (inWedge) {
             const char* deg = degreeInKey(index, ring, fSelectedKey);
-            fontSize(size * 0.62f);
-            fillColor(Color(0.55f, 0.72f, 0.92f));
-            text(tx, ty + size * 0.78f, deg, nullptr);
+            fontSize(size * 0.68f);
+            if (active)
+                fillColor(Color(0.15f, 0.16f, 0.20f));
+            else if (role == kCellSecondary)
+                fillColor(Color(0.88f, 0.68f, 0.42f));
+            else
+                fillColor(Color(0.55f, 0.78f, 0.98f));
+            text(tx, ty0 + size * 0.80f, deg, nullptr);
         }
     }
 
@@ -231,9 +247,11 @@ protected:
             if (pos < 0)
                 return false;
 
-            /* Clicking the key ring also re-centres the highlighted wedge, so
-             * the diatonic set follows the key you are playing in. */
-            if (ring == kRingKey)
+            /* Clicking the key ring re-centres the highlighted wedge, so the
+             * diatonic set follows the key you are playing in - unless the key
+             * is locked, in which case the chord still sounds but the reference
+             * wedge stays put. */
+            if (ring == kRingKey && ! fKeyLocked)
                 fSelectedKey = pos;
 
             /* In latch mode a press on the lit selection turns it off, matching
@@ -347,7 +365,8 @@ protected:
 
     /* The wheel is centred in whatever space the control strip and (in the test
      * rig) the event log leave behind, so nothing overlaps. */
-    float chromeTop() const { return 44.0f; }
+    /* Two control rows: toggles, then the per-ring dropdowns. */
+    float chromeTop() const { return kDropY + kDropH + 10.0f; }
 
     float chromeBottom() const
     {
@@ -429,22 +448,38 @@ protected:
 
     struct Button { float x, y, w, h; };
 
-    Button latchButton() const  { return { 10.0f,  10.0f, 82.0f, 24.0f }; }
-    Button glideButton() const  { return { 98.0f,  10.0f, 82.0f, 24.0f }; }
+    /* Row 1: mode toggles. */
+    Button latchButton() const { return { 10.0f,  8.0f,  78.0f, 22.0f }; }
+    Button glideButton() const { return { 94.0f,  8.0f,  92.0f, 22.0f }; }
+    Button keyLockButton() const { return { 192.0f, 8.0f, 96.0f, 22.0f }; }
 
-    /* The dropdown's closed state: click it to open the list below. */
-    Button chordButton() const
+    /*
+     * Row 2: one dropdown pair per ring. Extensions and voicings are per-ring,
+     * never per cell - that uniformity is what keeps every chord in a ring the
+     * same shape, which is the precondition for single-bend glide.
+     */
+    static constexpr float kDropY = 36.0f;
+    static constexpr float kDropH = 22.0f;
+
+    Button extButton(int ring) const
     {
-        return { 188.0f, 10.0f, getWidth() - 198.0f, 24.0f };
+        const float w = (getWidth() - 20.0f) / 3.0f;
+        return { 10.0f + ring * w, kDropY, w * 0.48f - 2.0f, kDropH };
     }
 
-    static constexpr float kMenuRowH = 20.0f;
-
-    /* One row per chord type, plus a leading "Auto" row. */
-    Button chordMenuRow(int index) const
+    Button voiceButton(int ring) const
     {
-        const Button b = chordButton();
-        return { b.x, b.y + b.h + 2.0f + index * kMenuRowH, b.w, kMenuRowH };
+        const float w = (getWidth() - 20.0f) / 3.0f;
+        return { 10.0f + ring * w + w * 0.50f, kDropY, w * 0.50f - 2.0f, kDropH };
+    }
+
+    static constexpr float kMenuRowH = 19.0f;
+
+    /* Menu rows hang below whichever button opened them. */
+    Button menuRow(const Button& anchor, int index) const
+    {
+        return { anchor.x, anchor.y + anchor.h + 2.0f + index * kMenuRowH,
+                 anchor.w < 120.0f ? 140.0f : anchor.w, kMenuRowH };
     }
 
     static bool hit(const Button& b, double px, double py)
@@ -469,49 +504,72 @@ protected:
         text(b.x + b.w * 0.5f, b.y + b.h * 0.5f, label, nullptr);
     }
 
-    void drawControls()
+    /* Compact dropdown: label on the left, caret on the right. */
+    void drawDropdown(const Button& b, const char* label, bool open)
     {
-        drawButton(latchButton(), fLatchEnabled ? "Latch: on" : "Latch: off",
-                   fLatchEnabled);
-        drawButton(glideButton(), fGlideEnabled ? "Glide: on" : "Glide: off",
-                   fGlideEnabled);
-
-        /* Closed dropdown: current selection plus a caret. */
-        const Button cb = chordButton();
         beginPath();
-        roundedRect(cb.x, cb.y, cb.w, cb.h, 4.0f);
+        roundedRect(b.x, b.y, b.w, b.h, 3.0f);
         fillColor(Color(0.13f, 0.14f, 0.18f));
         fill();
-        strokeColor(fMenuOpen ? Color(0.45f, 0.66f, 0.85f)
-                              : Color(0.30f, 0.32f, 0.38f));
+        strokeColor(open ? Color(0.45f, 0.66f, 0.85f) : Color(0.28f, 0.30f, 0.36f));
         strokeWidth(1.0f);
         stroke();
 
         fontFace(NANOVG_DEJAVU_SANS_TTF);
-        fontSize(12.0f);
+        fontSize(10.5f);
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        fillColor(Color(0.85f, 0.88f, 0.92f));
-        text(cb.x + 8.0f, cb.y + cb.h * 0.5f,
-             fChordExplicit ? kChordShape[fChordType].name
-                            : "Auto (ring decides)",
-             nullptr);
+        fillColor(Color(0.82f, 0.86f, 0.91f));
+        text(b.x + 6.0f, b.y + b.h * 0.5f, label, nullptr);
 
         textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
-        fillColor(Color(0.55f, 0.60f, 0.68f));
-        text(cb.x + cb.w - 8.0f, cb.y + cb.h * 0.5f,
-             fMenuOpen ? "▲" : "▼", nullptr);
+        fillColor(Color(0.50f, 0.55f, 0.63f));
+        text(b.x + b.w - 5.0f, b.y + b.h * 0.5f, open ? "▲" : "▼", nullptr);
     }
 
-    /* Drawn after everything else so the open list sits above the wheel. */
-    void drawChordMenu()
+    void drawControls()
     {
-        if (! fMenuOpen)
+        drawButton(latchButton(), fLatchEnabled ? "Latch: on" : "Latch: off",
+                   fLatchEnabled);
+        drawButton(glideButton(), kGlideModeName[fGlideMode],
+                   fGlideMode != kGlideOff);
+        drawButton(keyLockButton(),
+                   fKeyLocked ? "Key: locked" : "Key: follows",
+                   fKeyLocked);
+
+        /* Per-ring dropdowns, labelled by ring so the mapping is unambiguous. */
+        static const char* const kRingTag[kRingCount] = { "Maj", "Min", "Dim" };
+
+        for (int r = 0; r < kRingCount; ++r) {
+            char ext[48], voi[48];
+            std::snprintf(ext, sizeof(ext), "%s: %s",
+                          kRingTag[r], kExtensionName[fRingExt[r]]);
+            std::snprintf(voi, sizeof(voi), "%s", kVoicingName[fRingVoice[r]]);
+
+            drawDropdown(extButton(r), ext,
+                         fOpenMenu == kMenuExt && fOpenMenuRing == r);
+            drawDropdown(voiceButton(r), voi,
+                         fOpenMenu == kMenuVoicing && fOpenMenuRing == r);
+        }
+    }
+
+    /* Unused now that the chord selector is per-ring, but kept because the
+     * toggle buttons still use it. */
+    /* Drawn last so an open list sits above the wheel. */
+    void drawOpenMenu()
+    {
+        if (fOpenMenu == kMenuNone)
             return;
 
-        const int rows = kChordTypeCount + 1;
+        const bool   isExt  = (fOpenMenu == kMenuExt);
+        const int    rows   = isExt ? static_cast<int>(kExtCount)
+                                    : static_cast<int>(kVoicingCount);
+        const Button anchor = isExt ? extButton(fOpenMenuRing)
+                                    : voiceButton(fOpenMenuRing);
+        const int    cur    = isExt ? static_cast<int>(fRingExt[fOpenMenuRing])
+                                    : static_cast<int>(fRingVoice[fOpenMenuRing]);
 
-        const Button first = chordMenuRow(0);
-        const Button last  = chordMenuRow(rows - 1);
+        const Button first = menuRow(anchor, 0);
+        const Button last  = menuRow(anchor, rows - 1);
 
         beginPath();
         roundedRect(first.x - 2.0f, first.y - 2.0f,
@@ -523,12 +581,9 @@ protected:
         stroke();
 
         for (int i = 0; i < rows; ++i) {
-            const Button row = chordMenuRow(i);
-            const bool selected = (i == 0) ? ! fChordExplicit
-                                           : (fChordExplicit &&
-                                              static_cast<int>(fChordType) == i - 1);
+            const Button row = menuRow(anchor, i);
 
-            if (selected) {
+            if (i == cur) {
                 beginPath();
                 rect(row.x, row.y, row.w, row.h);
                 fillColor(Color(0.24f, 0.40f, 0.56f));
@@ -536,21 +591,12 @@ protected:
             }
 
             fontFace(NANOVG_DEJAVU_SANS_TTF);
-            fontSize(12.0f);
+            fontSize(11.0f);
             textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-            fillColor(selected ? Color(0.96f, 0.98f, 1.00f)
+            fillColor(i == cur ? Color(0.96f, 0.98f, 1.00f)
                                : Color(0.78f, 0.82f, 0.88f));
-            text(row.x + 8.0f, row.y + row.h * 0.5f,
-                 (i == 0) ? "Auto (ring decides)" : kChordShape[i - 1].name,
-                 nullptr);
-
-            /* Show the suffix so the naming is unambiguous, e.g. m7b5. */
-            if (i > 0 && kChordShape[i - 1].suffix[0] != '\0') {
-                textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
-                fillColor(Color(0.50f, 0.56f, 0.64f));
-                text(row.x + row.w - 8.0f, row.y + row.h * 0.5f,
-                     kChordShape[i - 1].suffix, nullptr);
-            }
+            text(row.x + 7.0f, row.y + row.h * 0.5f,
+                 isExt ? kExtensionName[i] : kVoicingName[i], nullptr);
         }
     }
 
@@ -558,6 +604,39 @@ protected:
     bool handleControlClick(double px, double py)
     {
         char buf[16];
+
+        /* An open menu swallows clicks first, so a row cannot fall through to
+         * the wheel underneath it. */
+        if (fOpenMenu != kMenuNone) {
+            const bool   isExt  = (fOpenMenu == kMenuExt);
+            const int    rows   = isExt ? static_cast<int>(kExtCount)
+                                        : static_cast<int>(kVoicingCount);
+            const Button anchor = isExt ? extButton(fOpenMenuRing)
+                                        : voiceButton(fOpenMenuRing);
+
+            for (int i = 0; i < rows; ++i) {
+                if (hit(menuRow(anchor, i), px, py)) {
+                    std::snprintf(buf, sizeof(buf), "%d", i);
+                    if (isExt) {
+                        fRingExt[fOpenMenuRing] = static_cast<Extension>(i);
+                        char key[8];
+                        std::snprintf(key, sizeof(key), "ext%d", fOpenMenuRing);
+                        setState(key, buf);
+                    } else {
+                        fRingVoice[fOpenMenuRing] = static_cast<Voicing>(i);
+                        char key[8];
+                        std::snprintf(key, sizeof(key), "voice%d", fOpenMenuRing);
+                        setState(key, buf);
+                    }
+                    fOpenMenu = kMenuNone;
+                    repaint();
+                    return true;
+                }
+            }
+            fOpenMenu = kMenuNone;
+            repaint();
+            return true;   /* click-away closes without selecting */
+        }
 
         if (hit(latchButton(), px, py)) {
             fLatchEnabled = ! fLatchEnabled;
@@ -567,54 +646,39 @@ protected:
             return true;
         }
 
+        /* Glide cycles off -> on -> MPE -> off. */
         if (hit(glideButton(), px, py)) {
-            fGlideEnabled = ! fGlideEnabled;
-            std::snprintf(buf, sizeof(buf), "%d", fGlideEnabled ? 1 : 0);
-            setState("glideEnabled", buf);
+            fGlideMode = static_cast<GlideMode>((fGlideMode + 1) % kGlideModeCount);
+            std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(fGlideMode));
+            setState("glideMode", buf);
             repaint();
             return true;
         }
 
-        /* An open menu swallows clicks first, so a row cannot fall through to the
-         * wheel underneath it. */
-        if (fMenuOpen) {
-            for (int i = 0; i < kChordTypeCount + 1; ++i) {
-                if (hit(chordMenuRow(i), px, py)) {
-                    selectChordType(i);
-                    fMenuOpen = false;
-                    repaint();
-                    return true;
-                }
+        /* Key lock is purely a UI concern - the DSP never needs to know which
+         * wedge is highlighted. */
+        if (hit(keyLockButton(), px, py)) {
+            fKeyLocked = ! fKeyLocked;
+            repaint();
+            return true;
+        }
+
+        for (int r = 0; r < kRingCount; ++r) {
+            if (hit(extButton(r), px, py)) {
+                fOpenMenu = kMenuExt;
+                fOpenMenuRing = r;
+                repaint();
+                return true;
             }
-            fMenuOpen = false;
-            repaint();
-            return true;   /* click-away closes without selecting */
-        }
-
-        if (hit(chordButton(), px, py)) {
-            fMenuOpen = true;
-            repaint();
-            return true;
+            if (hit(voiceButton(r), px, py)) {
+                fOpenMenu = kMenuVoicing;
+                fOpenMenuRing = r;
+                repaint();
+                return true;
+            }
         }
 
         return false;
-    }
-
-    /* Row 0 is "Auto"; rows 1..n map onto the chord vocabulary. */
-    void selectChordType(int row)
-    {
-        if (row == 0) {
-            fChordExplicit = false;
-            setState("chordAuto", "1");
-            return;
-        }
-
-        fChordExplicit = true;
-        fChordType = static_cast<ChordType>(row - 1);
-
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(fChordType));
-        setState("chordType", buf);
     }
 
 
@@ -749,10 +813,23 @@ private:
 
     /* Mirrors of DSP settings, so the UI can render them and toggle them. */
     bool      fLatchEnabled = false;
-    bool      fGlideEnabled = true;
-    ChordType fChordType    = kChordMajor;
-    bool      fChordExplicit = false;
-    bool      fMenuOpen      = false;
+    GlideMode fGlideMode    = kGlideOn;
+
+    /* Per-ring, never per cell: uniform shape within a ring is what makes
+     * single-bend glide valid. */
+    Extension fRingExt[kRingCount]   = { kExtNone, kExtNone, kExtNone };
+    Voicing   fRingVoice[kRingCount] = {
+        kVoicingRegular, kVoicingRegular, kVoicingRegular
+    };
+
+    /* Which dropdown is open, if any. */
+    enum OpenMenu { kMenuNone = 0, kMenuExt, kMenuVoicing };
+    OpenMenu fOpenMenu     = kMenuNone;
+    int      fOpenMenuRing = 0;
+
+    /* When locked, clicking the key ring plays the chord but leaves the
+     * highlighted wedge where it is. */
+    bool fKeyLocked = false;
 
     DISTRHO_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FortyFifthUI)
 };

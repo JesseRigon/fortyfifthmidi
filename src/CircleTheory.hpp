@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 
 #if FORTYFIFTH_MIDI_MONITOR
 # include <atomic>
@@ -200,6 +201,12 @@ inline const char* degreeInKey(int position, Ring ring, int keyIndex)
             if (rel == 11) return "IV";
             if (rel == 0)  return "I";
             if (rel == 1)  return "V";
+            /* Secondary dominants: two and four steps clockwise are the major II
+             * and III - V-of-V and V-of-vi. They are not diatonic to the key, but
+             * they are the chords most often borrowed into it, so the wheel marks
+             * them. */
+            if (rel == 2)  return "II";
+            if (rel == 4)  return "III";
             return nullptr;
         case kRingDim:
             return (rel == 0) ? "vii°" : nullptr;
@@ -227,8 +234,247 @@ inline ChordType defaultChordForRing(Ring ring)
     }
 }
 
+/*
+ * Extension the user asked for, independent of the underlying triad. The chord
+ * selector EXTENDS a cell rather than overriding it: picking "7" on the Em cell
+ * gives Em7, not E7, so the wheel's harmony is respected and the result stays
+ * diatonic to the key.
+ */
+enum Extension {
+    kExtNone = 0,
+    kExt6,
+    kExt7,
+    kExt9,
+    kExtAdd9,
+    kExtSus2,
+    kExtSus4,
+    kExtCount
+};
+
+static constexpr const char* kExtensionName[kExtCount] = {
+    "None (triad)", "6th", "7th", "9th", "Add 9", "Sus 2", "Sus 4"
+};
+
+/*
+ * Apply an extension to a ring's native triad quality. The seventh added depends
+ * on the triad: major triads take a major 7th, minor and diminished triads a
+ * minor 7th (a fully-diminished 7th would need its own selection), which is what
+ * keeps the result inside the parent key.
+ */
+inline ChordType extendChord(ChordType base, Extension ext)
+{
+    if (ext == kExtNone)
+        return base;
+
+    const bool isMinor = (base == kChordMinor);
+    const bool isDim   = (base == kChordDim);
+    const bool isMajor = (base == kChordMajor);
+
+    switch (ext) {
+        case kExt6:
+            if (isMinor) return kChordMinor6;
+            if (isMajor) return kChordMajor6;
+            return base;                       /* no standard dim 6 */
+        case kExt7:
+            if (isMinor) return kChordMinor7;
+            if (isDim)   return kChordMinor7b5; /* half-diminished */
+            if (isMajor) return kChordMajor7;
+            return base;
+        case kExt9:
+            if (isMinor) return kChordMinor9;
+            if (isMajor) return kChordMajor9;
+            return base;
+        case kExtAdd9:
+            if (isMajor) return kChordAdd9;
+            return base;                       /* add9 on minor not in the table */
+        case kExtSus2:
+            if (isDim) return base;
+            return kChordSus2;                 /* sus removes the third entirely */
+        case kExtSus4:
+            if (isDim) return base;
+            return kChordSus4;
+        default:
+            return base;
+    }
+}
+
+/*
+ * Voicing modifiers - how the chord tones are arranged once the notes are
+ * chosen. These rearrange octaves only; they never change which pitch classes
+ * sound, so a chord stays the chord it is.
+ *
+ * Crucially for glide: a modifier is a per-ring setting applied uniformly, so
+ * every cell in a ring produces the same interval pattern. That is what keeps
+ * within-ring glide valid under spec 6.1.
+ */
+enum Voicing {
+    kVoicingRegular = 0,  /* root position, ascending */
+    kVoicingInv1,         /* third in the bass */
+    kVoicingInv2,         /* fifth in the bass */
+    kVoicingHighAsBass,   /* top voice dropped below the rest */
+    kVoicingMidAsBass,    /* middle voice dropped below the rest */
+    kVoicingReverse,      /* stacked downward from the root */
+    kVoicingDrop2,        /* second voice from the top, down an octave */
+    kVoicingDrop3,        /* third voice from the top, down an octave */
+    kVoicingSpread,       /* alternate voices pushed an octave apart */
+    kVoicingOctaveDouble, /* root doubled an octave up */
+    kVoicingPowerRoot,    /* root doubled an octave DOWN, for weight */
+    kVoicingCount
+};
+
+static constexpr const char* kVoicingName[kVoicingCount] = {
+    "Regular",
+    "1st inversion",
+    "2nd inversion",
+    "High as bass",
+    "Mid as bass",
+    "Reverse",
+    "Drop 2",
+    "Drop 3",
+    "Spread",
+    "Octave double",
+    "Power root"
+};
+
+/*
+ * Rearrange the octaves of an already-built chord. Operates in place on MIDI
+ * note numbers; returns the new voice count (only the doubling modes change it).
+ * Anything that would leave the MIDI range is left where it was.
+ */
+inline int applyVoicing(uint8_t* notes, int count, Voicing voicing,
+                        size_t capacity)
+{
+    if (count <= 0)
+        return count;
+
+    auto down = [](uint8_t n) -> uint8_t {
+        return (n >= 12) ? static_cast<uint8_t>(n - 12) : n;
+    };
+    auto up = [](uint8_t n) -> uint8_t {
+        return (n <= 115) ? static_cast<uint8_t>(n + 12) : n;
+    };
+
+    switch (voicing) {
+        case kVoicingRegular:
+            break;
+
+        case kVoicingInv1:
+            if (count >= 2) notes[0] = up(notes[0]);
+            break;
+
+        case kVoicingInv2:
+            if (count >= 3) { notes[0] = up(notes[0]); notes[1] = up(notes[1]); }
+            break;
+
+        case kVoicingHighAsBass:
+            notes[count - 1] = down(notes[count - 1]);
+            break;
+
+        case kVoicingMidAsBass:
+            if (count >= 3) notes[count / 2] = down(notes[count / 2]);
+            break;
+
+        case kVoicingReverse:
+            /* Stack downward from the root instead of upward, inverting the
+             * chord's vertical direction while keeping the same pitch classes. */
+            for (int i = 1; i < count; ++i)
+                notes[i] = down(notes[i]);
+            break;
+
+        case kVoicingDrop2:
+            if (count >= 2) notes[count - 2] = down(notes[count - 2]);
+            break;
+
+        case kVoicingDrop3:
+            if (count >= 3) notes[count - 3] = down(notes[count - 3]);
+            break;
+
+        case kVoicingSpread:
+            for (int i = 1; i < count; i += 2)
+                notes[i] = up(notes[i]);
+            break;
+
+        case kVoicingOctaveDouble:
+            if (static_cast<size_t>(count) < capacity) {
+                notes[count] = up(notes[0]);
+                return count + 1;
+            }
+            break;
+
+        case kVoicingPowerRoot:
+            if (static_cast<size_t>(count) < capacity) {
+                notes[count] = down(notes[0]);
+                return count + 1;
+            }
+            break;
+
+        default:
+            break;
+    }
+    return count;
+}
+
+/* Two chords can share a single pitch bend only if their interval patterns are
+ * identical - that is what spec 6.1's simplification actually requires. Same
+ * ring is not sufficient once extensions are in play. */
+inline bool sameShape(ChordType a, ChordType b)
+{
+    if (a == b)
+        return true;
+    if (kChordShape[a].count != kChordShape[b].count)
+        return false;
+    for (int i = 0; i < kChordShape[a].count; ++i)
+        if (kChordShape[a].interval[i] != kChordShape[b].interval[i])
+            return false;
+    return true;
+}
+
 /* Cells per ring, for callers that only have the enum. */
 inline int cellsForRing(Ring ring) { return kRingSegments[ring]; }
+
+/* How a cell relates to the selected key, for colouring. */
+enum CellRole {
+    kCellOutside = 0,  /* not in the key */
+    kCellDiatonic,     /* I IV V ii iii vi vii - the core wedge */
+    kCellSecondary     /* II III - borrowed secondary dominants */
+};
+
+inline CellRole roleInKey(int position, Ring ring, int keyIndex)
+{
+    const char* deg = degreeInKey(position, ring, keyIndex);
+    if (deg == nullptr)
+        return kCellOutside;
+
+    /* The two secondary dominants are the only all-caps degrees that are not
+     * I, IV or V. */
+    if (std::strcmp(deg, "II") == 0 || std::strcmp(deg, "III") == 0)
+        return kCellSecondary;
+
+    return kCellDiatonic;
+}
+
+/*
+ * How a move between two selections is voiced.
+ *
+ *   kGlideOff   retrigger at the new chord immediately.
+ *   kGlideOn    single uniform pitch bend - only possible when the chord shape
+ *               is unchanged, since every voice must move by the same interval.
+ *               A shape change (C major to Em, or to B dim) falls back to a
+ *               clean retrigger.
+ *   kGlideMpe   one MIDI channel per voice, so voices can bend independently
+ *               and ANY chord can glide to any other. Requires an MPE-capable
+ *               instrument downstream.
+ */
+enum GlideMode {
+    kGlideOff = 0,
+    kGlideOn,
+    kGlideMpe,
+    kGlideModeCount
+};
+
+static constexpr const char* kGlideModeName[kGlideModeCount] = {
+    "Glide: off", "Glide: on", "Glide: MPE"
+};
 
 /*
  * Minor-ring labels, cell by cell. Spelled theoretically rather than simplified -

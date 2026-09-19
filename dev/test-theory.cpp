@@ -102,6 +102,48 @@ int main()
     check("vi  = Em", rootForPosition(3, kRingMinor), 4);
     check("vii = F#", rootForPosition(1, kRingDim),   6);
 
+    /* Extensions must respect the cell's own quality, not override it. */
+    std::printf("\n=== extensions extend, they do not override ===\n");
+    struct { ChordType base; Extension ext; ChordType want; const char* what; } kExt[] = {
+        { kChordMinor, kExt7,    kChordMinor7,   "Em + 7  -> Em7 (not E7)" },
+        { kChordMajor, kExt7,    kChordMajor7,   "C  + 7  -> Cmaj7"        },
+        { kChordDim,   kExt7,    kChordMinor7b5, "B° + 7  -> Bm7b5"   },
+        { kChordMinor, kExt6,    kChordMinor6,   "Em + 6  -> Em6"          },
+        { kChordMajor, kExt9,    kChordMajor9,   "C  + 9  -> Cmaj9"        },
+        { kChordMinor, kExt9,    kChordMinor9,   "Em + 9  -> Em9"          },
+        { kChordMajor, kExtNone, kChordMajor,    "C  + -  -> C"            },
+    };
+    for (const auto& t : kExt) {
+        const ChordType got = extendChord(t.base, t.ext);
+        if (got == t.want) {
+            std::printf("  ok    %s\n", t.what);
+        } else {
+            std::printf("  FAIL  %s  (got %s, want %s)\n",
+                        t.what, kChordShape[got].name, kChordShape[t.want].name);
+            ++failures;
+        }
+    }
+
+    /* sameShape decides whether a single bend can carry the move. */
+    std::printf("\n=== shape comparison gates single-bend glide ===\n");
+    struct { ChordType a, b; bool want; const char* what; } kShape[] = {
+        { kChordMajor,  kChordMajor,  true,  "C -> G  (both major)"        },
+        { kChordMinor,  kChordMinor,  true,  "Em -> Am (both minor)"       },
+        { kChordMajor,  kChordMinor,  false, "C -> Em  (major to minor)"   },
+        { kChordMajor,  kChordDim,    false, "C -> B° (major to dim)" },
+        { kChordMinor7, kChordMinor7, true,  "Em7 -> Am7"                  },
+        { kChordMinor,  kChordMinor7, false, "Em -> Am7 (3 vs 4 notes)"    },
+    };
+    for (const auto& t : kShape) {
+        const bool got = sameShape(t.a, t.b);
+        if (got == t.want) {
+            std::printf("  ok    %-32s %s\n", t.what, got ? "bend" : "retrigger");
+        } else {
+            std::printf("  FAIL  %-32s got %s\n", t.what, got ? "bend" : "retrigger");
+            ++failures;
+        }
+    }
+
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "PASS" : "FAIL",
                 failures, failures == 1 ? "" : "s");
