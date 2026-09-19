@@ -19,18 +19,45 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 
-#if FORTYFIFTH_MIDI_MONITOR
 namespace fortyfifth {
-/* One ring per process, shared by the DSP and UI of the standalone test rig.
- * Function-local static so construction order is not a concern. */
-MonitorRing& monitorRing()
-{
-    static MonitorRing ring;
-    return ring;
+
+/*
+ * Instance -> ring registry, so the UI can find its own plugin's monitor.
+ *
+ * A host can load many instances, and each UI must read the ring belonging to
+ * its own plugin. Registration happens on construction and removal on
+ * destruction, both on the main thread; the mutex guards against a host doing
+ * either concurrently. The audio thread never touches this - it holds a direct
+ * reference to its own ring.
+ */
+namespace {
+    std::mutex gRegistryMutex;
+    std::map<void*, MonitorRing*> gRegistry;
 }
+
+void registerMonitorRing(void* instance, MonitorRing* ring)
+{
+    const std::lock_guard<std::mutex> lock(gRegistryMutex);
+    gRegistry[instance] = ring;
+}
+
+void unregisterMonitorRing(void* instance)
+{
+    const std::lock_guard<std::mutex> lock(gRegistryMutex);
+    gRegistry.erase(instance);
+}
+
+MonitorRing* monitorRingFor(void* instance)
+{
+    const std::lock_guard<std::mutex> lock(gRegistryMutex);
+    const std::map<void*, MonitorRing*>::const_iterator it = gRegistry.find(instance);
+    return (it != gRegistry.end()) ? it->second : nullptr;
+}
+
 } /* namespace fortyfifth */
-#endif
 
 START_NAMESPACE_DISTRHO
 
@@ -45,6 +72,12 @@ public:
                  kStateCount)
     {
         std::memset(fHeld, 0, sizeof(fHeld));
+        registerMonitorRing(this, &fMonitor);
+    }
+
+    ~FortyFifthPlugin() override
+    {
+        unregisterMonitorRing(this);
     }
 
 protected:
@@ -88,6 +121,7 @@ protected:
         kStateGlideTimeMs,
         kStateBendRange,
         kStateGesture,
+        kStatePanic,
         kStateCount
     };
 
@@ -172,6 +206,12 @@ protected:
                 state.label = "Gesture";
                 state.defaultValue = "";
                 break;
+            case kStatePanic:
+                /* All notes off, on demand. */
+                state.key = "panic";
+                state.label = "Panic";
+                state.defaultValue = "";
+                break;
         }
     }
 
@@ -215,6 +255,8 @@ protected:
             fGlideTimeMs = v;
         else if (std::strcmp(key, "bendRange") == 0)
             fBendRange = v;
+        else if (std::strcmp(key, "panic") == 0)
+            fPanic.store(true, std::memory_order_release);
         else if (std::strcmp(key, "gesture") == 0)
             queueGesture(value);
 
@@ -284,6 +326,18 @@ protected:
         for (int i = 0; i < kMaxGroups; ++i)
             fGroup[i].active = false;
         std::memset(fHeld, 0, sizeof(fHeld));
+
+        fDragSource  = -1;
+        fGlideSource = -1;
+        fPanic.store(true, std::memory_order_release);
+    }
+
+    /* The host may keep the plugin loaded across stops. Anything still sounding
+     * when we are deactivated would hang until the host itself intervened, so
+     * ask for a full silence on the next run(). */
+    void deactivate() override
+    {
+        fPanic.store(true, std::memory_order_release);
     }
 
     /*
@@ -304,6 +358,14 @@ protected:
         if (fNeedsRpn) {
             sendBendRangeRpn(0);
             fNeedsRpn = false;
+        }
+
+        /* A panic silences everything, including anything the host or a previous
+         * session left hanging. */
+        if (fPanic.exchange(false, std::memory_order_acquire)) {
+            stopAllGroups(0);
+            zeroAllBends(0);
+            fGlideActive = false;
         }
 
         /* Claim whatever gesture the UI left for us, if any. */
@@ -352,19 +414,16 @@ private:
         monitorLog(a, b, c);
     }
 
-#if FORTYFIFTH_MIDI_MONITOR
-    /* Test rig only: mirror every emitted message into the shared ring the UI
-     * drains for its event log. See MonitorRing in CircleTheory.hpp for why this
-     * bypasses DPF's state channel entirely. */
+    /* Mirror every emitted message into the ring the UI drains for its event
+     * log. See MonitorRing in CircleTheory.hpp for why this bypasses DPF's
+     * state channel. */
     void monitorLog(uint8_t a, uint8_t b, uint8_t c)
     {
-        monitorRing().push((static_cast<uint32_t>(a) << 16) |
-                           (static_cast<uint32_t>(b) << 8)  |
-                            static_cast<uint32_t>(c));
+        fMonitor.push((static_cast<uint32_t>(a) << 16) |
+                      (static_cast<uint32_t>(b) << 8)  |
+                       static_cast<uint32_t>(c));
     }
-#else
-    void monitorLog(uint8_t, uint8_t, uint8_t) {}
-#endif
+
 
     /* RPN 0,0 - pitch bend sensitivity, in semitones (spec section 7). */
     void sendBendRangeRpnOn(uint32_t frame, uint8_t channel)
@@ -560,6 +619,37 @@ private:
         for (int i = 0; i < kMaxGroups; ++i)
             stopGroup(frame, &fGroup[i]);
         fNoteOffCountdown = 0;
+
+        /*
+         * Belt and braces: with every group gone, nothing may still be counted
+         * as held. If a refcount survived - an eviction, a chord rebuilt with a
+         * different voice count, any bookkeeping slip - that pitch would sound
+         * forever, because the count could never reach zero again. Sweep the
+         * table and silence anything left over.
+         */
+        for (int n = 0; n < 128; ++n) {
+            if (fHeld[n] != 0) {
+                fHeld[n] = 0;
+                /* The stranded note could be on any channel we use, and a
+                 * spurious note-off is harmless, so cover them all. */
+                sendRaw(frame, 0x80 | fChannel, static_cast<uint8_t>(n), 0);
+                if (fGlideMode == kGlideMpe) {
+                    for (int i = 0; i < kMaxGroupNotes; ++i)
+                        sendRaw(frame, 0x80 | mpeChannelFor(i),
+                                static_cast<uint8_t>(n), 0);
+                }
+            }
+        }
+    }
+
+    /* Return every channel that might carry a bend to centre. */
+    void zeroAllBends(uint32_t frame)
+    {
+        sendPitchBend(frame, fChannel, 0.0f);
+        if (fGlideMode == kGlideMpe) {
+            for (int i = 0; i < kMaxGroupNotes; ++i)
+                sendPitchBend(frame, mpeChannelFor(i), 0.0f);
+        }
     }
 
     /* ---- glide ------------------------------------------------------------ */
@@ -776,24 +866,27 @@ private:
                 if (fLatchEnabled)
                     break;
 
-                VoiceGroup* g = findGroup(fDragSource);
-                if (g == nullptr)
-                    g = findGroup(source);
-
-                /* Resolve an in-flight glide first, so a clip never ends on a
-                 * bent note (spec 6.2 step 4a). */
-                if (fGlideActive && g != nullptr && fGlideSource == g->source) {
+                /*
+                 * Release EVERYTHING, not just the group the drag thinks it is
+                 * holding.
+                 *
+                 * A drag retires and starts groups as it crosses cells, so more
+                 * than one can be live by the time the pointer comes up, and any
+                 * group the release misses sounds forever. Chasing the exact
+                 * group here was the bug: the pointer is up, so nothing this
+                 * plugin generated should still be sounding. Silence it all and
+                 * the class of stuck-note bugs goes with it.
+                 */
+                if (fGlideActive) {
                     fGlideActive = false;
-                    if (g->mpe) {
-                        for (int i = 0; i < g->count; ++i)
-                            sendPitchBend(0, g->chan[i], 0.0f);
-                    } else {
-                        sendPitchBend(0, fChannel, 0.0f);
-                    }
+                    zeroAllBends(0);
                 }
 
-                if (fHoldToSustain)
-                    stopGroup(0, g);
+                if (fHoldToSustain) {
+                    stopAllGroups(0);
+                    fDragSource = -1;
+                    fGlideSource = -1;
+                }
                 /* In fixed-length mode the countdown owns the note-off. */
                 break;
             }
@@ -844,6 +937,13 @@ private:
      * thread. See queueGesture(). */
     std::atomic<int32_t> fPendingGesture { kNoGesture };
     uint8_t   fGestureVelocity = 100;
+
+    /* DSP -> UI event log. Always built; the UI reads it via direct access. */
+    MonitorRing fMonitor;
+
+    /* Set from the UI or on (de)activate; consumed by run() to silence
+     * everything. */
+    std::atomic<bool> fPanic { false };
 
 
     bool      fGlideActive      = false;

@@ -40,6 +40,13 @@
 #define DISTRHO_PLUGIN_WANT_STATE  1
 #define DISTRHO_PLUGIN_WANT_FULL_STATE 1
 
+/* The MIDI monitor reads the DSP's event ring directly from the UI. DPF hosts
+ * the UI in the plugin's own process for every format we ship (CLAP, VST3 and
+ * the standalone), so this is a pointer hand-off, not IPC. It is the only way
+ * to get the data across: the UI has setState but no getState, and
+ * updateStateValue() must not be called from run(). */
+#define DISTRHO_PLUGIN_WANT_DIRECT_ACCESS 1
+
 #define DISTRHO_PLUGIN_CLAP_FEATURES   "note-effect", "utility"
 #define DISTRHO_PLUGIN_VST3_CATEGORIES "Instrument|Tools"
 

@@ -17,9 +17,7 @@
 #include <cstddef>
 #include <cstring>
 
-#if FORTYFIFTH_MIDI_MONITOR
-# include <atomic>
-#endif
+#include <atomic>
 
 namespace fortyfifth {
 
@@ -536,19 +534,19 @@ inline int buildChord(int rootPitchClass,
     return written;
 }
 
-#if FORTYFIFTH_MIDI_MONITOR
 /*
- * Test-rig plumbing, standalone build only.
+ * Lock-free ring carrying emitted MIDI from the DSP to the UI's event log.
  *
- * DPF offers no way to get this data across: the UI can setState() but has no
+ * DPF offers no ordinary route for this: the UI can setState() but has no
  * getState(), Plugin::updateStateValue() must not be called during run(), and
- * there is no plugin-side idle hook to call it from. In the standalone build,
- * however, the DSP and UI live in one process, so they can share a ring buffer
- * directly. The DSP writes from the audio thread, the UI drains it from uiIdle().
+ * there is no plugin-side idle hook to call it from. What DPF does offer is
+ * DISTRHO_PLUGIN_WANT_DIRECT_ACCESS, which hands the UI a pointer to the plugin
+ * instance - legitimate here because DPF hosts the UI in the plugin's own
+ * process for CLAP, VST3 and the standalone alike.
  *
- * This is emphatically NOT how a shipping plugin should communicate - in a real
- * host the UI may be in a different process entirely. It is compiled only into
- * the standalone target and never into the CLAP or VST3.
+ * The DSP writes from the audio thread and never blocks or allocates; the UI
+ * drains from uiIdle(). Events are dropped when the ring is full, which is the
+ * right trade for a monitor: it must never stall the audio thread.
  */
 struct MonitorRing {
     static constexpr uint32_t kCapacity = 256;
@@ -579,9 +577,19 @@ struct MonitorRing {
     }
 };
 
-/* Defined in FortyFifthPlugin.cpp. */
-MonitorRing& monitorRing();
-#endif /* FORTYFIFTH_MIDI_MONITOR */
+/*
+ * Bridge between the two translation units.
+ *
+ * getPluginInstancePointer() hands the UI a void* to the Plugin. Casting that to
+ * the concrete plugin class from FortyFifthUI.cpp is not possible: each file
+ * compiles its own DPF symbols, so the class definition is not shared. Instead
+ * the plugin registers its ring here at construction and the UI looks it up.
+ *
+ * Defined in FortyFifthPlugin.cpp.
+ */
+MonitorRing* monitorRingFor(void* pluginInstance);
+void registerMonitorRing(void* pluginInstance, MonitorRing* ring);
+void unregisterMonitorRing(void* pluginInstance);
 
 } /* namespace fortyfifth */
 

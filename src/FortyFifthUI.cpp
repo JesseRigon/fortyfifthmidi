@@ -17,13 +17,10 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-
-#if FORTYFIFTH_MIDI_MONITOR
-# include <cstdlib>
-# include <deque>
-# include <string>
-#endif
+#include <deque>
+#include <string>
 
 START_NAMESPACE_DISTRHO
 
@@ -31,9 +28,9 @@ using namespace fortyfifth;
 
 class FortyFifthUI : public UI
 {
-#if FORTYFIFTH_MIDI_MONITOR
     static constexpr size_t kLogLines = 14;
-#endif
+    /* Always-visible header bar for the collapsible monitor. */
+    static constexpr float  kHeaderH  = 22.0f;
 
 public:
     FortyFifthUI()
@@ -78,9 +75,7 @@ protected:
         drawCenterReadout(cx, cy, ringInnerRadius(kRingKey, outer));
         drawControls();
 
-#if FORTYFIFTH_MIDI_MONITOR
         drawMonitor();
-#endif
 
         /* Last, so the open list overlays the wheel and the log. */
         drawOpenMenu();
@@ -363,18 +358,14 @@ protected:
                              / ringWeightTotal());
     }
 
-    /* The wheel is centred in whatever space the control strip and (in the test
-     * rig) the event log leave behind, so nothing overlaps. */
-    /* Two control rows: toggles, then the per-ring dropdowns. */
+    /* The wheel is centred in whatever the chrome leaves behind, so nothing
+     * overlaps. Two control rows above; the monitor below, which is just its
+     * header bar until expanded. */
     float chromeTop() const { return kDropY + kDropH + 10.0f; }
 
     float chromeBottom() const
     {
-#if FORTYFIFTH_MIDI_MONITOR
-        return kLogLines * 14.0f + 16.0f;
-#else
-        return 8.0f;
-#endif
+        return kHeaderH + (fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f);
     }
 
     float wheelCentreX() const { return getWidth() * 0.5f; }
@@ -638,6 +629,20 @@ protected:
             return true;   /* click-away closes without selecting */
         }
 
+        /* Panic first: it sits inside the header bar. */
+        if (hit(panicButton(), px, py)) {
+            setState("panic", "1");
+            fLog.clear();
+            repaint();
+            return true;
+        }
+
+        if (hit(monitorHeader(), px, py)) {
+            fMonitorOpen = ! fMonitorOpen;
+            repaint();
+            return true;
+        }
+
         if (hit(latchButton(), px, py)) {
             fLatchEnabled = ! fLatchEnabled;
             std::snprintf(buf, sizeof(buf), "%d", fLatchEnabled ? 1 : 0);
@@ -682,8 +687,12 @@ protected:
     }
 
 
-#if FORTYFIFTH_MIDI_MONITOR
-    /* ---- test-rig MIDI monitor (standalone build only) -------------------- */
+    /* ---- MIDI monitor ------------------------------------------------------
+     *
+     * Built into every format, not just the standalone: seeing the exact note,
+     * velocity and bend stream is as useful inside a DAW as outside it, and it
+     * is what turns "a note is stuck" into "this note-off never went out".
+     * Collapsed by default so it costs nothing until asked for. */
 
     /* Decode one packed message into something a human can check against the
      * spec: note numbers with names, bend in semitones, RPN by name. */
@@ -748,45 +757,110 @@ protected:
         }
     }
 
+    /* The header bar is always present; the log below it only when expanded. */
+    Button monitorHeader() const
+    {
+        return { 0.0f, getHeight() - kHeaderH, getWidth(), kHeaderH };
+    }
+
+    Button panicButton() const
+    {
+        return { getWidth() - 62.0f, getHeight() - kHeaderH + 3.0f, 54.0f,
+                 kHeaderH - 6.0f };
+    }
+
     void drawMonitor()
     {
         const float w = getWidth();
         const float h = getHeight();
-        const float panelH = kLogLines * 14.0f + 16.0f;
-        const float top = h - panelH;
+        const float logH = fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f;
+        const float top  = h - kHeaderH - logH;
+
+        /* Expanded log body. */
+        if (fMonitorOpen) {
+            beginPath();
+            rect(0, top, w, logH);
+            fillColor(Color(0.05f, 0.06f, 0.08f, 0.96f));
+            fill();
+
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(11.0f);
+            textAlign(ALIGN_LEFT | ALIGN_TOP);
+
+            if (fLog.empty()) {
+                fillColor(Color(0.45f, 0.48f, 0.55f));
+                text(10.0f, top + 6.0f,
+                     "No events yet - click the wheel.", nullptr);
+            } else {
+                float y = top + 6.0f;
+                for (const std::string& line : fLog) {
+                    fillColor(Color(0.62f, 0.85f, 0.65f));
+                    text(10.0f, y, line.c_str(), nullptr);
+                    y += 14.0f;
+                }
+            }
+        }
+
+        /* Header bar: disclosure triangle, title, panic. */
+        const Button hdr = monitorHeader();
+        beginPath();
+        rect(hdr.x, hdr.y, hdr.w, hdr.h);
+        fillColor(Color(0.12f, 0.13f, 0.17f));
+        fill();
 
         beginPath();
-        rect(0, top, w, panelH);
-        fillColor(Color(0.05f, 0.06f, 0.08f, 0.92f));
-        fill();
+        moveTo(0.0f, hdr.y);
+        lineTo(w, hdr.y);
+        strokeColor(Color(0.26f, 0.28f, 0.34f));
+        strokeWidth(1.0f);
+        stroke();
 
         fontFace(NANOVG_DEJAVU_SANS_TTF);
         fontSize(11.0f);
-        textAlign(ALIGN_LEFT | ALIGN_TOP);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.72f, 0.76f, 0.83f));
 
-        if (fLog.empty()) {
-            fillColor(Color(0.45f, 0.48f, 0.55f));
-            text(10.0f, top + 8.0f,
-                 "MIDI monitor - click the wheel to emit events", nullptr);
-            return;
-        }
+        char title[64];
+        std::snprintf(title, sizeof(title), "%s  MIDI Monitor%s",
+                      fMonitorOpen ? "▼" : "▶",
+                      fMonitorOpen ? "" : "  (click to expand)");
+        text(10.0f, hdr.y + hdr.h * 0.5f, title, nullptr);
 
-        float y = top + 8.0f;
-        for (const std::string& line : fLog) {
-            fillColor(Color(0.62f, 0.85f, 0.65f));
-            text(10.0f, y, line.c_str(), nullptr);
-            y += 14.0f;
-        }
+        const Button pb = panicButton();
+        beginPath();
+        roundedRect(pb.x, pb.y, pb.w, pb.h, 3.0f);
+        fillColor(Color(0.42f, 0.18f, 0.18f));
+        fill();
+        strokeColor(Color(0.60f, 0.28f, 0.28f));
+        strokeWidth(1.0f);
+        stroke();
+
+        fontSize(10.5f);
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+        fillColor(Color(0.95f, 0.85f, 0.85f));
+        text(pb.x + pb.w * 0.5f, pb.y + pb.h * 0.5f, "Panic", nullptr);
     }
 
-    /* Drain the shared ring on the UI thread. uiIdle runs at roughly frame rate,
-     * which is ample for a human-readable log. */
+    /* Drain this instance's ring on the UI thread. uiIdle runs at roughly frame
+     * rate, which is ample for a human-readable log. */
     void uiIdle() override
     {
+        if (fRing == nullptr) {
+            /* The plugin registers its ring at construction; look it up once. */
+            fRing = monitorRingFor(getPluginInstancePointer());
+            if (fRing == nullptr)
+                return;
+        }
+
+        /* Only drain while the log is visible, so a collapsed panel cannot grow
+         * an unbounded backlog of work. The ring drops its own overflow. */
+        if (! fMonitorOpen)
+            return;
+
         uint32_t word;
         bool     any = false;
 
-        while (monitorRing().pop(word)) {
+        while (fRing->pop(word)) {
             pushLogLine(word);
             any = true;
         }
@@ -796,7 +870,9 @@ protected:
     }
 
     std::deque<std::string> fLog;
-#endif /* FORTYFIFTH_MIDI_MONITOR */
+    /* Collapsed by default: the wheel is the point, the log is for debugging. */
+    bool         fMonitorOpen = false;
+    MonitorRing* fRing        = nullptr;
 
 private:
     int  fActivePosition = -1;

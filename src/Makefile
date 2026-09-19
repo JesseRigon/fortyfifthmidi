@@ -15,14 +15,10 @@ FILES_UI = \
 
 include ../dpf/Makefile.plugins.mk
 
-# The MIDI monitor is a test rig, not a feature: it exists so a developer can see
-# the exact note/bend stream the plugin emits, which audio alone cannot show. It
-# is compiled ONLY into the standalone build - `make monitor` below - so the
-# shipping CLAP and VST3 contain none of it.
-#
-# Keeping it out of the plugin builds matters: spec section 3 requires a MIDI-only
-# plugin, and a monitor state key on the shipping artifact would be visible to
-# hosts as saved state.
+# The MIDI monitor is built into every format. Seeing the exact note, velocity
+# and bend stream is as useful inside a DAW as outside one - it is what turns
+# "a note is stuck" into "this note-off never went out". The panel is collapsed
+# by default, and the UI only drains the event ring while it is open.
 
 BUILD_CXX_FLAGS += -I.
 
@@ -32,9 +28,9 @@ TARGETS = clap vst3
 
 all: $(TARGETS)
 
-# Standalone test rig with the event log enabled. Needs a display; under WSL,
-# WSLg provides one. See docs/TESTING.md.
-monitor:
-	$(MAKE) jack BUILD_CXX_FLAGS="$(BUILD_CXX_FLAGS) -DFORTYFIFTH_MIDI_MONITOR=1"
+# Standalone build, for looking at the UI without a host. Needs a display; under
+# WSL, WSLg provides one. Kept as a separate target because `all` deliberately
+# ships only the plugin formats.
+monitor: jack
 
 .PHONY: all monitor
