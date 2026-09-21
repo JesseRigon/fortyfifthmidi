@@ -489,6 +489,8 @@ protected:
     Button keyLockButton() const { return { 192.0f, 8.0f, 96.0f, 22.0f }; }
     /* Bypass chord generation: the wheel becomes a note selector. */
     Button singleNoteButton() const { return { 294.0f, 8.0f, 104.0f, 22.0f }; }
+    /* Settle each chord near the last instead of stacking from its own root. */
+    Button voiceLeadButton() const { return { 404.0f, 8.0f, 126.0f, 22.0f }; }
 
     /*
      * Row 2: one dropdown pair per ring. Extensions and voicings are per-ring,
@@ -656,6 +658,18 @@ protected:
         drawButton(singleNoteButton(),
                    fSingleNotes ? "Single notes" : "Chords",
                    fSingleNotes);
+        /*
+         * Say when leading is switched on but not actually in force. Plain
+         * glide suspends it, because a single bend cannot express a
+         * re-inversion - so claiming "smooth" there would be a lie the user
+         * could hear but not explain.
+         */
+        const bool leadSuppressed = fVoiceLeading && fGlideMode == kGlideOn;
+        drawButton(voiceLeadButton(),
+                   leadSuppressed   ? "Lead: off (glide)"
+                   : fVoiceLeading  ? "Lead: smooth"
+                                    : "Lead: root pos",
+                   fVoiceLeading && ! leadSuppressed);
 
         /* Per-ring dropdowns, labelled by ring so the mapping is unambiguous. */
         static const char* const kRingTag[kRingCount] = { "Maj", "Min", "Dim" };
@@ -817,6 +831,14 @@ protected:
             fSingleNotes = ! fSingleNotes;
             std::snprintf(buf, sizeof(buf), "%d", fSingleNotes ? 1 : 0);
             setState("singleNotes", buf);
+            repaint();
+            return true;
+        }
+
+        if (hit(voiceLeadButton(), px, py)) {
+            fVoiceLeading = ! fVoiceLeading;
+            std::snprintf(buf, sizeof(buf), "%d", fVoiceLeading ? 1 : 0);
+            setState("voiceLeading", buf);
             repaint();
             return true;
         }
@@ -1254,6 +1276,10 @@ private:
 
     /* Bypass chord generation and sound the root alone. */
     bool fSingleNotes = false;
+
+    /* On by default: without it a progression leaps about, because every chord
+     * stacks upward from its own root. */
+    bool fVoiceLeading = true;
 
     /* Octave for pointer and touch input. Mirrors the DSP's setting; a played
      * MIDI note carries its own octave instead. */

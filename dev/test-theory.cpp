@@ -219,6 +219,120 @@ int main()
     checkInt("note 48 -> octave 3", octaveForMidiNote(48), 3);
     checkInt("note 72 -> octave 5", octaveForMidiNote(72), 5);
 
+    /*
+     * Voice leading. The complaint it answers: built naively, a I-vi-IV-V in C
+     * leaps around because every chord stacks upward from its own root, so Am
+     * lands nearly an octave above C and the notes they share are sounded in
+     * different places. Checked by the two properties that matter - the chord
+     * must keep its pitch classes, and it must stop leaping.
+     */
+    std::printf("\n=== voice leading keeps the harmony, kills the leap ===\n");
+    {
+        /* I - vi - IV - V in C, the progression that exposed this. */
+        const int kRoots[4]  = { 0, 9, 5, 7 };
+        const ChordType kTys[4] = {
+            kChordMajor, kChordMinor, kChordMajor, kChordMajor
+        };
+
+        uint8_t prev[8];
+        int     prevCount = 0;
+        int     worstLead = 0;
+        int     worstRaw  = 0;
+        bool    pcOk      = true;
+
+        uint8_t rawPrev[8];
+        int     rawPrevCount = 0;
+
+        for (int c = 0; c < 4; ++c) {
+            uint8_t raw[8];
+            const int rawN = buildChord(kRoots[c], kTys[c], 4 * 12, raw,
+                                        kMaxChordTones);
+
+            uint8_t led[8];
+            std::memcpy(led, raw, sizeof(uint8_t) * rawN);
+            applyVoiceLeading(led, rawN, prev, prevCount, 60);
+
+            /* Property 1: same pitch classes - only octaves may change. */
+            for (int i = 0; i < rawN; ++i) {
+                bool found = false;
+                for (int j = 0; j < rawN && ! found; ++j)
+                    found = (led[j] % 12 == raw[i] % 12);
+                if (! found) pcOk = false;
+            }
+
+            /* Property 2: how far the lowest voice jumps between chords. */
+            if (prevCount > 0) {
+                const int d = (led[0] > prev[0]) ? led[0] - prev[0]
+                                                 : prev[0] - led[0];
+                if (d > worstLead) worstLead = d;
+            }
+            if (rawPrevCount > 0) {
+                const int d = (raw[0] > rawPrev[0]) ? raw[0] - rawPrev[0]
+                                                    : rawPrev[0] - raw[0];
+                if (d > worstRaw) worstRaw = d;
+            }
+
+            std::memcpy(prev, led, sizeof(uint8_t) * rawN);
+            prevCount = rawN;
+            std::memcpy(rawPrev, raw, sizeof(uint8_t) * rawN);
+            rawPrevCount = rawN;
+        }
+
+        if (pcOk) {
+            std::printf("  ok    %-30s only octaves changed\n",
+                        "harmony is preserved");
+        } else {
+            std::printf("  FAIL  %-30s pitch classes changed\n",
+                        "harmony is preserved");
+            ++failures;
+        }
+
+        if (worstLead < worstRaw) {
+            std::printf("  ok    %-30s %d semitones, was %d\n",
+                        "bass movement is reduced", worstLead, worstRaw);
+        } else {
+            std::printf("  FAIL  %-30s %d semitones, was %d\n",
+                        "bass movement is reduced", worstLead, worstRaw);
+            ++failures;
+        }
+
+        if (worstLead <= 6) {
+            std::printf("  ok    %-30s max %d semitones\n",
+                        "no voice leaps a tritone", worstLead);
+        } else {
+            std::printf("  FAIL  %-30s max %d semitones\n",
+                        "no voice leaps a tritone", worstLead);
+            ++failures;
+        }
+    }
+
+    /* Common tones must actually be held, not merely be present somewhere. */
+    std::printf("\n=== C -> Am holds the shared notes ===\n");
+    {
+        uint8_t c[8];
+        const int cn = buildChord(0, kChordMajor, 4 * 12, c, kMaxChordTones);
+
+        uint8_t a[8];
+        const int an = buildChord(9, kChordMinor, 4 * 12, a, kMaxChordTones);
+        applyVoiceLeading(a, an, c, cn, 60);
+
+        /* C major is C E G; A minor is A C E. C and E are shared and should
+         * come back at exactly the pitches C major sounded them at. */
+        int held = 0;
+        for (int i = 0; i < an; ++i)
+            for (int j = 0; j < cn; ++j)
+                if (a[i] == c[j]) ++held;
+
+        if (held >= 2) {
+            std::printf("  ok    %-30s %d common tones held\n",
+                        "C and E stay put", held);
+        } else {
+            std::printf("  FAIL  %-30s only %d held\n",
+                        "C and E stay put", held);
+            ++failures;
+        }
+    }
+
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "PASS" : "FAIL",
                 failures, failures == 1 ? "" : "s");

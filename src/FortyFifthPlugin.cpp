@@ -124,6 +124,7 @@ protected:
         kStatePanic,
         kStateSelectedKey,
         kStateSingleNotes,
+        kStateVoiceLeading,
         kStateCount
     };
 
@@ -228,6 +229,13 @@ protected:
                 state.label = "Single Notes";
                 state.defaultValue = "0";
                 break;
+            case kStateVoiceLeading:
+                /* On by default: without it a progression leaps about, because
+                 * every chord stacks upward from its own root. */
+                state.key = "voiceLeading";
+                state.label = "Voice Leading";
+                state.defaultValue = "1";
+                break;
         }
     }
 
@@ -274,6 +282,12 @@ protected:
              * channels, which have never been told. */
             if (prev != fGlideMode && fGlideMode == kGlideMpe)
                 fNeedsRpn = true;
+
+            /* The mode decides whether voice leading applies at all, so a
+             * change makes the stored reference chord describe a voicing the
+             * new mode would not have produced. Drop it and start fresh. */
+            if (prev != fGlideMode)
+                fLastChordCount = 0;
         }
         else if (std::strcmp(key, "glideTimeMs") == 0)
             fGlideTimeMs = v;
@@ -283,6 +297,13 @@ protected:
             fSelectedKey.store(((v % 12) + 12) % 12, std::memory_order_release);
         else if (std::strcmp(key, "singleNotes") == 0)
             fSingleNotes = (v != 0);
+        else if (std::strcmp(key, "voiceLeading") == 0) {
+            fVoiceLeading = (v != 0);
+            /* Turning it off must not leave the next chord leading from a
+             * reference the user can no longer see the effect of. */
+            if (! fVoiceLeading)
+                fLastChordCount = 0;
+        }
         else if (std::strcmp(key, "panic") == 0)
             fPanic.store(true, std::memory_order_release);
         else if (std::strcmp(key, "gesture") == 0)
@@ -348,6 +369,7 @@ protected:
         else if (std::strcmp(key, "selectedKey") == 0)
             v = fSelectedKey.load(std::memory_order_acquire);
         else if (std::strcmp(key, "singleNotes") == 0)  v = fSingleNotes ? 1 : 0;
+        else if (std::strcmp(key, "voiceLeading") == 0) v = fVoiceLeading ? 1 : 0;
 
         std::snprintf(buf, sizeof(buf), "%d", v);
         return String(buf);
@@ -635,11 +657,7 @@ private:
         }
 
         uint8_t notes[kMaxGroupNotes];
-        int n = buildChord(root, type, octave * 12, notes, kMaxChordTones);
-        /* Voicings rearrange chord tones; with a single note there is nothing
-         * to rearrange, and a doubling mode would quietly make it two notes. */
-        if (! fSingleNotes)
-            n = applyVoicing(notes, n, fRingVoicing[ring], kMaxGroupNotes);
+        const int n = buildCellChord(root, type, ring, octave, notes);
 
         const bool mpe = (fGlideMode == kGlideMpe);
 
@@ -668,6 +686,15 @@ private:
                 sendRaw(frame, 0x90 | g->chan[i], note, velocity);
 
             ++fHeld[note];
+        }
+
+        /* Remember this chord as the reference the next one leads from. Kept
+         * even after the chord stops, so a gap between chords still leads
+         * smoothly rather than resetting to root position. */
+        if (! fSingleNotes) {
+            fLastChordCount = (n > kMaxGroupNotes) ? kMaxGroupNotes : n;
+            for (int i = 0; i < fLastChordCount; ++i)
+                fLastChord[i] = g->note[i];
         }
     }
 
@@ -905,20 +932,9 @@ private:
                 if (g == nullptr)
                     break;
 
-                /*
-                 * Whether a glide is possible at all depends on the mode and on
-                 * whether the chord SHAPE changes:
-                 *
-                 *   off  never glide.
-                 *   on   a single bend moves every voice by one interval, which
-                 *        only works when the shape is unchanged. Rings have
-                 *        uniform shapes, so this means "within a ring".
-                 *   mpe  each voice has its own channel and bends independently,
-                 *        so any chord can reach any other.
-                 */
-                const bool shapeKept = sameShape(g->type, type);
-                const bool canGlide  = (fGlideMode == kGlideMpe) ||
-                                       (fGlideMode == kGlideOn && shapeKept);
+                /* See canGlideBetween() for why a bend is or is not enough. */
+                const bool canGlide =
+                    canGlideBetween(g, type, root, r, g->octave);
 
                 if (! canGlide) {
                     /* Retrigger cleanly (spec 6.2 step 5). Shared pitches are
@@ -949,14 +965,10 @@ private:
                     /* Work out where each voice must land, pairing by index. A
                      * voice with no counterpart (the chords differ in size) stays
                      * where it is and is resolved by the snap at the end. */
+                    /* Same builder startGroup uses, so the ramp heads exactly
+                     * where the snap will land. */
                     uint8_t want[kMaxGroupNotes];
-                    int n = buildChord(root, type, g->octave * 12, want,
-                                       kMaxChordTones);
-                    /* Match what startGroup will build, or the targets would
-                     * describe a chord the snap never produces. */
-                    if (! fSingleNotes)
-                        n = applyVoicing(want, n, fRingVoicing[r],
-                                         kMaxGroupNotes);
+                    const int n = buildCellChord(root, type, r, g->octave, want);
 
                     for (int i = 0; i < g->count; ++i)
                         g->target[i] = (i < n) ? want[i] : g->note[i];
@@ -1202,9 +1214,7 @@ private:
         if (from != nullptr && from->midiNote != midiNote &&
             fGlideMode != kGlideOff) {
 
-            const bool shapeKept = sameShape(from->type, type);
-            const bool canGlide  = (fGlideMode == kGlideMpe) ||
-                                   (fGlideMode == kGlideOn && shapeKept);
+            const bool canGlide = canGlideBetween(from, type, root, ring, oct);
 
             /* Octave changes are exactly what the vertical slider produces when
              * dragged, and a glide across them is the instrumental gesture the
@@ -1230,11 +1240,7 @@ private:
 
                 if (fGlideMode == kGlideMpe) {
                     uint8_t want[kMaxGroupNotes];
-                    int n = buildChord(root, type, oct * 12, want,
-                                       kMaxChordTones);
-                    if (! fSingleNotes)
-                        n = applyVoicing(want, n, fRingVoicing[ring],
-                                         kMaxGroupNotes);
+                    const int n = buildCellChord(root, type, ring, oct, want);
                     for (int i = 0; i < from->count; ++i)
                         from->target[i] = (i < n) ? want[i] : from->note[i];
 
@@ -1323,6 +1329,107 @@ private:
     }
 
     /*
+     * Is voice leading in force right now?
+     *
+     * Leading and single-bend glide cannot both apply. Leading works by
+     * re-inverting a chord to sit near the last one, and a re-inversion moves
+     * voices by DIFFERENT intervals - which is exactly what one pitch bend
+     * cannot express. Left to fight, leading wins every time and non-MPE glide
+     * silently degrades into a retrigger on every move.
+     *
+     * So the modes divide the work honestly:
+     *
+     *   glide off   leading applies. Retriggers are already the behaviour, and
+     *               smooth voicing is pure gain.
+     *   glide on    leading is suspended, so chords stay in root position and a
+     *               uniform bend genuinely reaches them. Smooth pitch movement
+     *               is what the user asked for by turning glide on.
+     *   glide MPE   leading applies. Each voice owns a channel and bends
+     *               independently, so any voicing is reachable - both features
+     *               work at once.
+     *
+     * The rule underneath: never let the bend lie about where the notes land.
+     */
+    bool leadingAppliesNow() const
+    {
+        return fGlideMode != kGlideOn;
+    }
+
+    /*
+     * The one definition of what notes a cell produces.
+     *
+     * Build, lead, voice - in that order, every time. Four places need this
+     * answer (starting a group, the two MPE glide-target calculations, and the
+     * glide eligibility test) and if any of them assembled the chord slightly
+     * differently the glide would ramp toward pitches the snap never lands on.
+     * So they all call here instead.
+     */
+    int buildCellChord(int root, ChordType type, Ring ring, int octave,
+                       uint8_t* out) const
+    {
+        int n = buildChord(root, type, octave * 12, out, kMaxChordTones);
+
+        if (fVoiceLeading && ! fSingleNotes && leadingAppliesNow())
+            applyVoiceLeading(out, n, fLastChord, fLastChordCount,
+                              octave * 12 + 12);
+
+        /* Voicings rearrange chord tones; with a single note there is nothing
+         * to rearrange, and a doubling mode would quietly make it two notes. */
+        if (! fSingleNotes)
+            n = applyVoicing(out, n, fRingVoicing[ring], kMaxGroupNotes);
+
+        return n;
+    }
+
+    /*
+     * Can a move from one chord to another be carried by a glide?
+     *
+     *   off  never.
+     *   on   a SINGLE bend moves every voice by the same interval, so it can
+     *        only express a move that is itself uniform: the same interval
+     *        pattern AND the same inversion. Voice leading deliberately
+     *        re-inverts chords to keep them close, so with it on a bend is
+     *        valid only where the leading happened to leave the inversion
+     *        alone. Otherwise the chord would arrive at pitches the bend cannot
+     *        reach, which is worse than a clean retrigger.
+     *   mpe  every voice has its own channel and bends independently, so any
+     *        chord can reach any other regardless of inversion.
+     */
+    bool canGlideBetween(const VoiceGroup* from, ChordType toType,
+                         int toRoot, Ring toRing, int toOctave) const
+    {
+        if (fGlideMode == kGlideOff || from == nullptr)
+            return false;
+        if (fGlideMode == kGlideMpe)
+            return true;
+        if (! sameShape(from->type, toType))
+            return false;
+
+        /*
+         * Belt and braces. leadingAppliesNow() suspends voice leading in this
+         * mode, so the target should always be reachable by a uniform bend -
+         * but rather than trust that, build the chord the way startGroup will
+         * and check. If the two ever diverge a retrigger is the safe answer:
+         * a bend that cannot reach its target leaves the chord audibly wrong,
+         * where a retrigger is merely less smooth.
+         */
+        uint8_t want[kMaxGroupNotes];
+        const int n = buildCellChord(toRoot, toType, toRing, toOctave, want);
+
+        if (n != from->count)
+            return false;
+
+        const int delta = static_cast<int>(want[0]) -
+                          static_cast<int>(from->note[0]);
+        for (int i = 1; i < n; ++i) {
+            if (static_cast<int>(want[i]) -
+                static_cast<int>(from->note[i]) != delta)
+                return false;
+        }
+        return true;
+    }
+
+    /*
      * A ring's quality is fixed; the per-ring extension builds on it.
      *
      * Single-note mode bypasses chord generation entirely and sounds only the
@@ -1362,6 +1469,15 @@ private:
     bool      fLatchEnabled   = false;
     /* Bypass chord generation and sound the root alone. */
     bool      fSingleNotes    = false;
+    /* Settle each chord near the previous one instead of always stacking
+     * upward from its own root. See applyVoiceLeading(). */
+    bool      fVoiceLeading   = true;
+
+    /* The chord most recently started, as the reference the next one leads
+     * from. Kept after it stops, so a gap between chords still leads smoothly
+     * rather than resetting to root position. */
+    uint8_t   fLastChord[kMaxGroupNotes] = {0};
+    int       fLastChordCount = 0;
     GlideMode fGlideMode      = kGlideOn;
     int       fGlideTimeMs    = 120;
     int       fBendRange      = 12;

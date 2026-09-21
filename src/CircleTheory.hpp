@@ -412,6 +412,120 @@ inline int applyVoicing(uint8_t* notes, int count, Voicing voicing,
     return count;
 }
 
+/*
+ * ---- voice leading ------------------------------------------------------
+ *
+ * Built naively, every chord stacks upward from its own root in a fixed
+ * octave, so C is C3 E3 G3 but Am is A3 C4 E4 - nearly an octave higher. The
+ * pitches are right and the progression is still diatonic, but it does not
+ * SOUND diatonic: the harmony leaps around instead of moving, and the notes C
+ * and E that both chords share are sounded at different octaves rather than
+ * held in place.
+ *
+ * Voice leading fixes that by choosing the octave arrangement closest to the
+ * previous chord. Common tones stay where they are and the remaining voices
+ * move by the shortest distance, which is what a keyboard player does without
+ * thinking and what makes a progression hang together.
+ *
+ * The notes are the same notes; only their octaves change. Harmony is
+ * untouched.
+ */
+
+/*
+ * Shift each voice to whichever octave sits nearest the previous chord.
+ *
+ * Works per voice against the previous chord's nearest pitch, rather than
+ * transposing the chord as a block, so a chord can genuinely re-invert: given
+ * C3 E3 G3 the chord A-C-E becomes A2 C3 E3, holding C3 and E3 exactly.
+ *
+ * refNotes/refCount describe the chord being moved away from. With no previous
+ * chord (refCount 0) the notes are returned untouched.
+ */
+inline void applyVoiceLeading(uint8_t* notes, int count,
+                              const uint8_t* refNotes, int refCount,
+                              int centreMidi)
+{
+    if (count <= 0)
+        return;
+
+    /*
+     * Choose the inversion as a WHOLE rather than moving each voice to its own
+     * nearest neighbour. Voices considered separately do not cooperate - they
+     * can all chase the same reference pitch and drift the chord upward, which
+     * is precisely the leap this is meant to remove. Evaluating complete
+     * candidates and scoring them is both more correct and easier to reason
+     * about.
+     *
+     * Candidates are every rotation of the chord (each inversion) across a
+     * range of octaves; the winner is the one whose voices are collectively
+     * closest to the previous chord.
+     */
+    uint8_t best[16];
+    int     bestScore = -1;
+
+    const int base = (refCount > 0) ? refNotes[0] : centreMidi;
+
+    for (int rot = 0; rot < count; ++rot) {
+        for (int oct = -2; oct <= 2; ++oct) {
+            uint8_t cand[16];
+
+            /* Build this rotation, ascending from the rotated starting voice. */
+            int prev = -1;
+            bool ok = true;
+            for (int i = 0; i < count; ++i) {
+                const int pc = notes[(rot + i) % count] % 12;
+                int p = ((base + oct * 12) / 12) * 12 + pc;
+
+                /* Keep the chord ascending and compact: lift each voice to sit
+                 * just above the one below it. */
+                while (prev >= 0 && p <= prev)
+                    p += 12;
+
+                if (p < 0 || p > 127) { ok = false; break; }
+                cand[i] = static_cast<uint8_t>(p);
+                prev = p;
+            }
+            if (! ok)
+                continue;
+
+            /* Score: total distance from each voice to the nearest note of the
+             * previous chord. Lower is smoother; a common tone scores zero,
+             * which is what makes shared notes stay put. */
+            int score = 0;
+            if (refCount > 0) {
+                for (int i = 0; i < count; ++i) {
+                    int nearest = 127;
+                    for (int r = 0; r < refCount; ++r) {
+                        const int d = (refNotes[r] > cand[i])
+                            ? refNotes[r] - cand[i] : cand[i] - refNotes[r];
+                        if (d < nearest) nearest = d;
+                    }
+                    score += nearest;
+                }
+            } else {
+                /* No previous chord: settle nearest the centre instead. */
+                for (int i = 0; i < count; ++i) {
+                    const int d = (cand[i] > centreMidi)
+                        ? cand[i] - centreMidi : centreMidi - cand[i];
+                    score += d;
+                }
+            }
+
+            if (bestScore < 0 || score < bestScore) {
+                bestScore = score;
+                for (int i = 0; i < count; ++i)
+                    best[i] = cand[i];
+            }
+        }
+    }
+
+    if (bestScore < 0)
+        return;   /* nothing representable; leave the chord alone */
+
+    for (int i = 0; i < count; ++i)
+        notes[i] = best[i];
+}
+
 /* Two chords can share a single pitch bend only if their interval patterns are
  * identical - that is what spec 6.1's simplification actually requires. Same
  * ring is not sufficient once extensions are in play. */
