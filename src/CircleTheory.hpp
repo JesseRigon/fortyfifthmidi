@@ -545,51 +545,172 @@ inline bool sameShape(ChordType a, ChordType b)
 inline int cellsForRing(Ring ring) { return kRingSegments[ring]; }
 
 /*
+ * ---- scale degrees -----------------------------------------------------
+ *
+ * The one definition of where a scale degree lives on the wheel. Three things
+ * need this answer - the keyboard map, Slide Mode's strips, and the wheel's own
+ * highlighting - and if they disagreed the same chord would be in different
+ * places depending on how it was played.
+ *
+ * Offsets are in each ring's own cell units, measured from the key's cell,
+ * exactly as degreeInKey() decodes them:
+ *
+ *   key ring (12 cells)    IV = -1, I = 0, V = +1
+ *   minor ring (24 cells)  ii = -1, iii = 0, vi = +1   (key occupies cell 2k)
+ *   dim ring (12 cells)    vii = 0
+ */
+enum Degree {
+    kDegreeI = 0,
+    kDegreeII,     /* ii  - minor */
+    kDegreeIII,    /* iii - minor */
+    kDegreeIV,
+    kDegreeV,
+    kDegreeVI,     /* vi  - minor */
+    kDegreeVII,    /* vii - diminished */
+    kDegreeCount
+};
+
+struct DegreeCell {
+    Ring        ring;
+    int         offset;     /* cells clockwise from the key's own cell */
+    const char* numeral;    /* as degreeInKey() spells it */
+};
+
+static constexpr DegreeCell kDegreeCell[kDegreeCount] = {
+    /* I   */ { kRingKey,    0, "I"    },
+    /* ii  */ { kRingMinor, -1, "ii"   },
+    /* iii */ { kRingMinor,  0, "iii"  },
+    /* IV  */ { kRingKey,   -1, "IV"   },
+    /* V   */ { kRingKey,    1, "V"    },
+    /* vi  */ { kRingMinor,  1, "vi"   },
+    /* vii */ { kRingDim,    0, "vii°" },
+};
+
+/* Resolve a degree to a cell in the given key. */
+inline void cellForDegree(Degree degree, int keyIndex,
+                          int& outPosition, Ring& outRing)
+{
+    const DegreeCell& d = kDegreeCell[degree];
+    outRing = d.ring;
+
+    /* The minor ring runs at double resolution, so the key's own cell is 2k
+     * there and offsets are in half-width cells. */
+    const int base = (d.ring == kRingMinor) ? keyIndex * 2 : keyIndex;
+    const int n    = kRingSegments[d.ring];
+
+    outPosition = ((base + d.offset) % n + n) % n;
+}
+
+/*
+ * ---- scales ------------------------------------------------------------
+ *
+ * Which degrees a scale offers, and so how many slides Slide Mode shows. The
+ * last entry of each list repeats the tonic an octave up, which is what makes
+ * a strip span a full scale rather than stopping one short.
+ */
+enum Scale {
+    kScaleDiatonic = 0,   /* 7 degrees + octave = 8 slides */
+    kScaleMajorPent,      /* drops IV and vii   = 6 slides */
+    kScaleMinorPent,      /* relative minor     = 6 slides */
+    kScaleCount
+};
+
+static constexpr const char* kScaleName[kScaleCount] = {
+    "Diatonic", "Major pentatonic", "Minor pentatonic"
+};
+
+/*
+ * A slide: a degree, and how many octaves above the tonic it sits. The octave
+ * field is what lets the last slide repeat the tonic up top.
+ */
+struct SlideDef {
+    Degree degree;
+    int    octaveShift;
+};
+
+static constexpr SlideDef kDiatonicSlides[8] = {
+    { kDegreeI,   0 }, { kDegreeII,  0 }, { kDegreeIII, 0 }, { kDegreeIV, 0 },
+    { kDegreeV,   0 }, { kDegreeVI,  0 }, { kDegreeVII, 0 }, { kDegreeI,  1 },
+};
+
+/* Major pentatonic drops IV and vii - the two degrees carrying the semitone
+ * tension - leaving five consonant chords plus the octave. */
+static constexpr SlideDef kMajorPentSlides[6] = {
+    { kDegreeI,   0 }, { kDegreeII,  0 }, { kDegreeIII, 0 },
+    { kDegreeV,   0 }, { kDegreeVI,  0 }, { kDegreeI,   1 },
+};
+
+/*
+ * Minor pentatonic, read from the relative minor: i bIII iv v bVII.
+ *
+ * In degree terms against the parent major these are vi, I, ii, iii, V - the
+ * same seven-chord vocabulary, started six degrees round. So it needs no
+ * chords from outside the key, and the wheel's wedge still covers it.
+ */
+static constexpr SlideDef kMinorPentSlides[6] = {
+    { kDegreeVI,  0 },   /* i    */
+    { kDegreeI,   1 },   /* bIII */
+    { kDegreeII,  1 },   /* iv   */
+    { kDegreeIII, 1 },   /* v    */
+    { kDegreeV,   1 },   /* bVII */
+    { kDegreeVI,  1 },   /* i    */
+};
+
+inline int slideCountForScale(Scale scale)
+{
+    switch (scale) {
+        case kScaleMajorPent: return 6;
+        case kScaleMinorPent: return 6;
+        default:              return 8;
+    }
+}
+
+inline const SlideDef* slidesForScale(Scale scale)
+{
+    switch (scale) {
+        case kScaleMajorPent: return kMajorPentSlides;
+        case kScaleMinorPent: return kMinorPentSlides;
+        default:              return kDiatonicSlides;
+    }
+}
+
+/*
  * ---- keyboard mapping --------------------------------------------------
  *
  * An incoming MIDI note triggers a cell, so a controller keyboard can play the
  * wheel. The mapping is by DEGREE, not by absolute chord: the same physical key
- * plays I in whatever key is selected, so the keyboard transposes with the wheel
+ * plays I in whatever key is selected, so the keyboard transposes with the app
  * rather than fighting it.
  *
- * The layout is chosen for the hand, not for pitch order. G is the tonic because
- * it falls under the right thumb, with IV and V to either side, and the minors
- * sit on the black keys just above their related majors:
+ * The white keys carry the scale in order:
  *
- *        D#     F#  G#  A#            vii  ii  iii  vi
- *      E   F   G   A   B              III  IV  I    V   II
+ *      C   D   E   F   G   A   B
+ *      I   ii  iii IV  V   vi  vii°
  *
- * C, C# and D are deliberately unmapped and stay silent - they are left free for
- * later assignment rather than being given arbitrary meanings now.
+ * In the key of C those are the literal chords; in G, playing C sounds G major.
+ * This is the order every chord chart uses, it matches Slide Mode's strips
+ * exactly so the two input methods agree, and it leaves all five black keys
+ * free for later assignment.
  */
 struct KeyMapEntry {
-    int  semitone;    /* pitch class within the octave, 0 = C */
-    Ring ring;
-    int  offset;      /* cells clockwise from the selected key's own cell */
-    bool mapped;
+    int    semitone;   /* pitch class within the octave, 0 = C */
+    Degree degree;
+    bool   mapped;
 };
 
-/*
- * Offsets are expressed in each ring's own cell units, measured from the key's
- * position - exactly the relationship degreeInKey() decodes:
- *
- *   key ring (12 cells)    IV = -1, I = 0, V = +1, II = +2, III = +4
- *   minor ring (24 cells)  ii = -1, iii = 0, vi = +1   (key occupies cell 2k)
- *   dim ring (12 cells)    vii = 0
- */
 static constexpr KeyMapEntry kKeyMap[12] = {
-    /* C  */ { 0,  kRingKey,   0, false },
-    /* C# */ { 1,  kRingKey,   0, false },
-    /* D  */ { 2,  kRingKey,   0, false },
-    /* D# */ { 3,  kRingDim,   0, true  },   /* vii */
-    /* E  */ { 4,  kRingKey,   4, true  },   /* III */
-    /* F  */ { 5,  kRingKey,  -1, true  },   /* IV  */
-    /* F# */ { 6,  kRingMinor,-1, true  },   /* ii  */
-    /* G  */ { 7,  kRingKey,   0, true  },   /* I   */
-    /* G# */ { 8,  kRingMinor, 0, true  },   /* iii */
-    /* A  */ { 9,  kRingKey,   1, true  },   /* V   */
-    /* A# */ { 10, kRingMinor, 1, true  },   /* vi  */
-    /* B  */ { 11, kRingKey,   2, true  },   /* II  */
+    /* C  */ { 0,  kDegreeI,   true  },
+    /* C# */ { 1,  kDegreeI,   false },
+    /* D  */ { 2,  kDegreeII,  true  },
+    /* D# */ { 3,  kDegreeI,   false },
+    /* E  */ { 4,  kDegreeIII, true  },
+    /* F  */ { 5,  kDegreeIV,  true  },
+    /* F# */ { 6,  kDegreeI,   false },
+    /* G  */ { 7,  kDegreeV,   true  },
+    /* G# */ { 8,  kDegreeI,   false },
+    /* A  */ { 9,  kDegreeVI,  true  },
+    /* A# */ { 10, kDegreeI,   false },
+    /* B  */ { 11, kDegreeVII, true  },
 };
 
 /*
@@ -607,14 +728,8 @@ inline bool cellForMidiNote(int midiNote, int keyIndex,
     if (! e.mapped)
         return false;
 
-    outRing = e.ring;
-
-    /* The minor ring runs at double resolution, so the key's own cell is 2k
-     * there and offsets are in half-width cells. */
-    const int base = (e.ring == kRingMinor) ? keyIndex * 2 : keyIndex;
-    const int n    = kRingSegments[e.ring];
-
-    outPosition = ((base + e.offset) % n + n) % n;
+    /* Shared with Slide Mode, so a key and a strip cannot disagree. */
+    cellForDegree(e.degree, keyIndex, outPosition, outRing);
     return true;
 }
 

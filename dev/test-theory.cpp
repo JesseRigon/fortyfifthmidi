@@ -167,15 +167,13 @@ int main()
      */
     std::printf("\n=== keyboard mapping: degree agrees in all 12 keys ===\n");
     struct { int note; const char* degree; const char* name; } kMap[] = {
-        { 4,  "III",  "E  -> III"  },
-        { 5,  "IV",   "F  -> IV"   },
-        { 7,  "I",    "G  -> I"    },
-        { 9,  "V",    "A  -> V"    },
-        { 11, "II",   "B  -> II"   },
-        { 3,  "vii°", "D# -> vii°" },
-        { 6,  "ii",   "F# -> ii"   },
-        { 8,  "iii",  "G# -> iii"  },
-        { 10, "vi",   "A# -> vi"   },
+        { 0,  "I",    "C -> I"    },
+        { 2,  "ii",   "D -> ii"   },
+        { 4,  "iii",  "E -> iii"  },
+        { 5,  "IV",   "F -> IV"   },
+        { 7,  "V",    "G -> V"    },
+        { 9,  "vi",   "A -> vi"   },
+        { 11, "vii°", "B -> vii°" },
     };
 
     for (const auto& m : kMap) {
@@ -201,14 +199,96 @@ int main()
         }
     }
 
-    std::printf("\n=== unmapped keys stay silent ===\n");
-    for (int pc = 0; pc <= 2; ++pc) {
-        int  pos;
-        Ring ring;
-        if (! cellForMidiNote(pc, 0, pos, ring)) {
-            std::printf("  ok    %-30s ignored\n", kPitch[pc]);
+    /* The black keys are deliberately free, so they stay silent. */
+    std::printf("\n=== black keys stay silent ===\n");
+    {
+        static const int kBlack[5] = { 1, 3, 6, 8, 10 };
+        for (int i = 0; i < 5; ++i) {
+            const int pc = kBlack[i];
+            int  pos;
+            Ring ring;
+            if (! cellForMidiNote(pc, 0, pos, ring)) {
+                std::printf("  ok    %-30s ignored\n", kPitch[pc]);
+            } else {
+                std::printf("  FAIL  %-30s should be unmapped\n", kPitch[pc]);
+                ++failures;
+            }
+        }
+    }
+
+    /*
+     * Slide Mode's strips must resolve to the same cells the keyboard does -
+     * they share kDegreeCell precisely so a strip and a key cannot disagree.
+     * Checked through degreeInKey(), which is what the wheel highlights with,
+     * so all three agree or the test fails.
+     */
+    std::printf("\n=== slides resolve to the right degrees, all keys ===\n");
+    {
+        struct { Scale scale; int count; const char* name; } kScales[] = {
+            { kScaleDiatonic,  8, "diatonic"          },
+            { kScaleMajorPent, 6, "major pentatonic"  },
+            { kScaleMinorPent, 6, "minor pentatonic"  },
+        };
+
+        for (const auto& s : kScales) {
+            bool ok = (slideCountForScale(s.scale) == s.count);
+
+            const SlideDef* defs = slidesForScale(s.scale);
+            for (int key = 0; key < 12 && ok; ++key) {
+                for (int i = 0; i < s.count && ok; ++i) {
+                    int  pos;
+                    Ring ring;
+                    cellForDegree(defs[i].degree, key, pos, ring);
+
+                    const char* got = degreeInKey(pos, ring, key);
+                    const char* want = kDegreeCell[defs[i].degree].numeral;
+                    ok = (got != nullptr && std::strcmp(got, want) == 0);
+                }
+            }
+
+            if (ok) {
+                std::printf("  ok    %-30s %d slides\n", s.name, s.count);
+            } else {
+                std::printf("  FAIL  %-30s degrees disagree\n", s.name);
+                ++failures;
+            }
+        }
+    }
+
+    /* The last slide repeats the tonic an octave up - that is what makes the
+     * strip span a full scale rather than stopping a step short. */
+    std::printf("\n=== last slide is the octave ===\n");
+    {
+        const SlideDef* d = slidesForScale(kScaleDiatonic);
+        const SlideDef& first = d[0];
+        const SlideDef& last  = d[7];
+        if (first.degree == last.degree && last.octaveShift == 1) {
+            std::printf("  ok    %-30s I then I+8ve\n", "diatonic");
         } else {
-            std::printf("  FAIL  %-30s should be unmapped\n", kPitch[pc]);
+            std::printf("  FAIL  %-30s not an octave repeat\n", "diatonic");
+            ++failures;
+        }
+    }
+
+    /*
+     * Minor pentatonic must need no chords from outside the key: i bIII iv v
+     * bVII are vi I ii iii V read from the relative minor, so every slide is
+     * diatonic and the wheel's wedge still covers it.
+     */
+    std::printf("\n=== minor pentatonic stays inside the key ===\n");
+    {
+        const SlideDef* d = slidesForScale(kScaleMinorPent);
+        bool allDiatonic = true;
+        for (int i = 0; i < 6 && allDiatonic; ++i) {
+            int  pos;
+            Ring ring;
+            cellForDegree(d[i].degree, 0, pos, ring);
+            allDiatonic = (roleInKey(pos, ring, 0) == kCellDiatonic);
+        }
+        if (allDiatonic) {
+            std::printf("  ok    %-30s no borrowed chords\n", "all 6 slides");
+        } else {
+            std::printf("  FAIL  %-30s leaves the key\n", "all 6 slides");
             ++failures;
         }
     }
