@@ -16,7 +16,8 @@
  */
 #include <cstdio>
 
-static const float kDropY   = 36.0f;
+static const float kTabH    = 28.0f;   /* tab bar above the control rows */
+static const float kDropY   = kTabH + 36.0f;
 static const float kDropH   = 22.0f;
 static const float kHeaderH = 22.0f;
 static const float kSliderW = 46.0f;
@@ -93,9 +94,64 @@ static void report(const char* title)
     ok("wheel is still usably large", r > 120.0f, d);
 }
 
+/* Slide bank geometry, mirroring FortyFifthUI::slideRect(). */
+static B slideArea()
+{
+    const float top = chromeTop();
+    return { chromeLeft(), top,
+             W - chromeLeft() - 10.0f, H - top - chromeBottom() - 8.0f };
+}
+
+static B slideRect(int index, int n)
+{
+    const B a = slideArea();
+    const float w = a.w / n;
+    return { a.x + index * w, a.y, w, a.h };
+}
+
+static void reportSlides(const char* title, int n, int sections)
+{
+    std::printf("\n=== slide bank: %s (%d strips, %d sections) ===\n",
+                title, n, sections);
+    char d[160];
+
+    const B first = slideRect(0, n);
+    const B last  = slideRect(n - 1, n);
+
+    std::snprintf(d, sizeof d, "%.1fpx wide", first.w);
+    ok("strips are wide enough to hit", first.w >= 40.0f, d);
+
+    const float rowH = first.h / sections;
+    std::snprintf(d, sizeof d, "%.1fpx tall", rowH);
+    ok("sections are tall enough to hit", rowH >= 40.0f, d);
+
+    /*
+     * The strips must TOUCH. A gap would end a drag as the finger crossed it,
+     * which is precisely what breaks glide between chords.
+     */
+    bool touching = true;
+    for (int i = 1; i < n; ++i) {
+        const B prev = slideRect(i - 1, n);
+        const B cur  = slideRect(i, n);
+        const float gap = cur.x - (prev.x + prev.w);
+        if (gap > 0.01f || gap < -0.01f) touching = false;
+    }
+    ok("strips share borders (glide can cross)", touching, "no gaps");
+
+    std::snprintf(d, sizeof d, "bank left %.0f vs slider right %.0f",
+                  first.x, 8.0f + kSliderW);
+    ok("bank clears the octave slider", first.x >= 8.0f + kSliderW, d);
+
+    std::snprintf(d, sizeof d, "bank right %.0f vs window %.0f",
+                  last.x + last.w, W);
+    ok("bank fits the window", last.x + last.w <= W, d);
+}
+
 int main()
 {
     report("default size");
+    reportSlides("diatonic, octave sections", 8, 5);
+    reportSlides("pentatonic, variation sections", 6, 4);
 
     monitorOpen = true;
     report("monitor expanded");

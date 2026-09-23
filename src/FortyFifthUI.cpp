@@ -32,6 +32,10 @@ class FortyFifthUI : public UI
     /* Always-visible header bar for the collapsible monitor. */
     static constexpr float  kHeaderH  = 22.0f;
 
+    /* A hit-testable rectangle. Declared here because almost everything below
+     * - tabs, buttons, menus, slider, slide strips - is expressed in them. */
+    struct Button { float x, y, w, h; };
+
 public:
     FortyFifthUI()
         : UI(DISTRHO_UI_DEFAULT_WIDTH, DISTRHO_UI_DEFAULT_HEIGHT)
@@ -51,16 +55,38 @@ public:
 protected:
     void onNanoDisplay() override
     {
-        const float w  = getWidth();
-        const float h  = getHeight();
-        const float cx = wheelCentreX();
-        const float cy = wheelCentreY();
-        const float outer = wheelRadius();
+        const float w = getWidth();
+        const float h = getHeight();
 
         beginPath();
         rect(0, 0, w, h);
         fillColor(Color(0.09f, 0.10f, 0.13f));
         fill();
+
+        drawTabBar();
+
+        /* The two screens are different control surfaces over the same engine,
+         * so only the central area swaps - the slider, the control row and the
+         * monitor are shared. */
+        if (fScreen == kScreenCircle)
+            drawWheel();
+        else
+            drawSlides();
+
+        drawOctaveSlider();
+        drawControls();
+
+        drawMonitor();
+
+        /* Last, so an open list overlays everything beneath it. */
+        drawOpenMenu();
+    }
+
+    void drawWheel()
+    {
+        const float cx = wheelCentreX();
+        const float cy = wheelCentreY();
+        const float outer = wheelRadius();
 
         /* Outermost first so inner rings overlay their borders cleanly. */
         for (int ring = kRingCount - 1; ring >= 0; --ring) {
@@ -73,13 +99,49 @@ protected:
         }
 
         drawCenterReadout(cx, cy, ringInnerRadius(kRingKey, outer));
-        drawOctaveSlider();
-        drawControls();
+    }
 
-        drawMonitor();
+    /* ---- tab bar -----------------------------------------------------------
+     *
+     * Two screens over one engine. The tab bar sits above everything so the
+     * shared chrome below it never moves when the screen changes.
+     */
 
-        /* Last, so the open list overlays the wheel and the log. */
-        drawOpenMenu();
+    enum Screen { kScreenCircle = 0, kScreenSlide };
+
+    static constexpr float kTabH = 28.0f;
+
+    Button tabButton(int index) const
+    {
+        const float w = 112.0f;
+        return { 10.0f + index * (w + 4.0f), 4.0f, w, kTabH - 8.0f };
+    }
+
+    void drawTabBar()
+    {
+        static const char* const kNames[2] = { "Circle Mode", "Slide Mode" };
+
+        for (int i = 0; i < 2; ++i) {
+            const Button b  = tabButton(i);
+            const bool   on = (static_cast<int>(fScreen) == i);
+
+            beginPath();
+            roundedRect(b.x, b.y, b.w, b.h, 4.0f);
+            fillColor(on ? Color(0.24f, 0.40f, 0.56f)
+                         : Color(0.14f, 0.15f, 0.20f));
+            fill();
+            strokeColor(on ? Color(0.45f, 0.66f, 0.85f)
+                           : Color(0.26f, 0.28f, 0.34f));
+            strokeWidth(1.0f);
+            stroke();
+
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(12.0f);
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            fillColor(on ? Color(0.96f, 0.98f, 1.00f)
+                         : Color(0.62f, 0.66f, 0.72f));
+            text(b.x + b.w * 0.5f, b.y + b.h * 0.5f, kNames[i], nullptr);
+        }
     }
 
     /* Angular span of one cell on one ring. */
@@ -238,6 +300,9 @@ protected:
             if (handleControlClick(ev.pos.getX(), ev.pos.getY()))
                 return true;
 
+            if (fScreen == kScreenSlide)
+                return slidePress(ev.pos.getX(), ev.pos.getY());
+
             Ring ring;
             const int pos = hitTest(ev.pos.getX(), ev.pos.getY(), ring);
             if (pos < 0)
@@ -292,13 +357,44 @@ protected:
             /* Latched selections stay lit because they are still sounding;
              * momentary ones must go dark, or the highlight lies about what is
              * audible. */
-            if (! fLatchEnabled)
+            if (! fLatchEnabled) {
                 fActivePosition = -1;
+                fActiveSlide    = -1;
+            }
 
             repaint();
             return true;
         }
         return false;
+    }
+
+    /*
+     * Scrolling a strip reaches the variations that do not fit.
+     *
+     * Four rows are shown at a time so they stay big enough to hit, but the
+     * engine has seven extensions; scrolling is what makes the other three
+     * reachable without thinning every row.
+     */
+    bool onScroll(const ScrollEvent& ev) override
+    {
+        if (fScreen != kScreenSlide || fSectionMode != kSectionVariation)
+            return false;
+
+        int section;
+        if (hitSlide(ev.pos.getX(), ev.pos.getY(), section) < 0)
+            return false;
+
+        const int maxScroll = static_cast<int>(kExtCount) - kVariationRows;
+        int next = fVariationScroll - static_cast<int>(ev.delta.getY());
+        if (next < 0)         next = 0;
+        if (next > maxScroll) next = maxScroll;
+
+        if (next == fVariationScroll)
+            return true;
+
+        fVariationScroll = next;
+        repaint();
+        return true;
     }
 
     /* 'o' flips the minor ring between aligned and interlocked, so the layout
@@ -321,12 +417,15 @@ protected:
         /* Dragging the octave slider transposes whatever is sounding. The DSP
          * rebuilds held groups at the new octave, so the chord travels. */
         if (fSliderDrag) {
-            setOctave(octaveAtY(ev.pos.getY()));
+            sliderTo(ev.pos.getY());
             return true;
         }
 
         if (! fDragging)
             return false;
+
+        if (fScreen == kScreenSlide)
+            return slideMotion(ev.pos.getX(), ev.pos.getY());
 
         Ring ring;
         const int pos = hitTest(ev.pos.getX(), ev.pos.getY(), ring);
@@ -481,24 +580,35 @@ protected:
      * boundary obvious.
      */
 
-    struct Button { float x, y, w, h; };
+    /* (Button is declared near the top of the class, since the tab bar and the
+     * wheel geometry both need it before this point.) */
 
-    /* Row 1: mode toggles. */
-    Button latchButton() const { return { 10.0f,  8.0f,  78.0f, 22.0f }; }
-    Button glideButton() const { return { 94.0f,  8.0f,  92.0f, 22.0f }; }
-    Button keyLockButton() const { return { 192.0f, 8.0f, 96.0f, 22.0f }; }
+    /* Row 1: mode toggles. Below the tab bar, which owns the top strip. */
+    static constexpr float kRow1Y = kTabH + 8.0f;
+
+    Button latchButton() const { return { 10.0f,  kRow1Y,  78.0f, 22.0f }; }
+    Button glideButton() const { return { 94.0f,  kRow1Y,  92.0f, 22.0f }; }
+    Button keyLockButton() const { return { 192.0f, kRow1Y, 96.0f, 22.0f }; }
     /* Bypass chord generation: the wheel becomes a note selector. */
-    Button singleNoteButton() const { return { 294.0f, 8.0f, 104.0f, 22.0f }; }
+    Button singleNoteButton() const { return { 294.0f, kRow1Y, 104.0f, 22.0f }; }
     /* Settle each chord near the last instead of stacking from its own root. */
-    Button voiceLeadButton() const { return { 404.0f, 8.0f, 126.0f, 22.0f }; }
+    Button voiceLeadButton() const { return { 404.0f, kRow1Y, 126.0f, 22.0f }; }
 
     /*
      * Row 2: one dropdown pair per ring. Extensions and voicings are per-ring,
      * never per cell - that uniformity is what keeps every chord in a ring the
      * same shape, which is the precondition for single-bend glide.
      */
-    static constexpr float kDropY = 36.0f;
+    static constexpr float kDropY = kTabH + 36.0f;
     static constexpr float kDropH = 22.0f;
+
+    /*
+     * Slide Mode's own second row, replacing the per-ring dropdowns that only
+     * make sense next to the wheel. Same y, so the screens stay aligned.
+     */
+    Button sectionModeButton() const { return { 10.0f,  kDropY, 150.0f, kDropH }; }
+    Button scaleButton()       const { return { 166.0f, kDropY, 150.0f, kDropH }; }
+    Button slideKeyButton()    const { return { 322.0f, kDropY, 104.0f, kDropH }; }
 
     Button extButton(int ring) const
     {
@@ -543,6 +653,14 @@ protected:
 
     void drawOctaveSlider()
     {
+        /* In octave-sections mode the slider is the variation control, so it
+         * must show variations - a column of octave numbers would be lying
+         * about what it does. */
+        if (fScreen == kScreenSlide && fSectionMode == kSectionOctave) {
+            drawVariationSlider();
+            return;
+        }
+
         const Button s = octaveSlider();
 
         beginPath();
@@ -585,6 +703,88 @@ protected:
         text(s.x + s.w * 0.5f, s.y + s.h + 1.0f, "OCT", nullptr);
     }
 
+    /*
+     * The slider takes whatever the sections are not doing.
+     *
+     * On the wheel, and whenever the strips are varying the chord, it is the
+     * octave. When the strips are doing octaves it selects the variation
+     * instead - so both dimensions stay reachable without leaving the screen,
+     * which is the whole point of the swap.
+     */
+    void sliderTo(double py)
+    {
+        if (fScreen == kScreenSlide && fSectionMode == kSectionOctave) {
+            const Button s = slideAreaSlider();
+            float t = static_cast<float>(py - s.y) / s.h;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+
+            int v = static_cast<int>(t * (kExtCount - 1) + 0.5f);
+            if (v < 0) v = 0;
+            if (v > static_cast<int>(kExtCount) - 1)
+                v = static_cast<int>(kExtCount) - 1;
+
+            if (v != fSliderVariation) {
+                fSliderVariation = v;
+                repaint();
+            }
+            return;
+        }
+
+        setOctave(octaveAtY(py));
+    }
+
+    /* The slider's own rect, named apart from octaveSlider() because in
+     * variation mode it is not an octave control at all. */
+    Button slideAreaSlider() const { return octaveSlider(); }
+
+    /* The slider rendered as a variation picker, for when the sections have
+     * taken over the octaves. */
+    void drawVariationSlider()
+    {
+        const Button s = octaveSlider();
+
+        beginPath();
+        roundedRect(s.x, s.y, s.w, s.h, 6.0f);
+        fillColor(Color(0.12f, 0.13f, 0.17f));
+        fill();
+        strokeColor(Color(0.26f, 0.28f, 0.34f));
+        strokeWidth(1.0f);
+        stroke();
+
+        const int   rows = static_cast<int>(kExtCount);
+        const float rowH = s.h / rows;
+
+        /* Short names: the column is narrow, and the full ones ("None
+         * (triad)") would not fit. */
+        static const char* const kShort[kExtCount] = {
+            "—", "6", "7", "9", "a9", "s2", "s4"
+        };
+
+        for (int i = 0; i < rows; ++i) {
+            const float y  = s.y + i * rowH;
+            const bool  on = (i == fSliderVariation);
+
+            if (on) {
+                beginPath();
+                roundedRect(s.x + 3.0f, y + 2.0f, s.w - 6.0f, rowH - 4.0f, 4.0f);
+                fillColor(Color(0.30f, 0.62f, 0.45f));
+                fill();
+            }
+
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(13.0f);
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            fillColor(on ? Color(0.96f, 0.98f, 0.96f)
+                         : Color(0.55f, 0.59f, 0.66f));
+            text(s.x + s.w * 0.5f, y + rowH * 0.5f, kShort[i], nullptr);
+        }
+
+        fontSize(9.5f);
+        fillColor(Color(0.45f, 0.48f, 0.55f));
+        text(s.x + s.w * 0.5f, s.y + s.h + 1.0f, "VAR", nullptr);
+    }
+
     /* Push a new octave to the DSP. Dragging sends every step, so a sounding
      * chord glides through the octaves as the finger moves. */
     void setOctave(int oct)
@@ -601,6 +801,344 @@ protected:
         repaint();
     }
 
+
+    /* ---- slide mode --------------------------------------------------------
+     *
+     * Vertical chord strips, one per scale degree, in the order a chord chart
+     * reads. Each strip is divided into sections, and a toggle decides what a
+     * section means:
+     *
+     *   octave mode     every section is the same chord at a different octave,
+     *                   and the LEFT SLIDER selects the chord variation.
+     *   variation mode  the top section is the plain chord and the ones below
+     *                   are its extensions, with the slider selecting octave.
+     *
+     * The slider always takes whatever the sections are not doing, so both
+     * dimensions stay reachable without leaving the screen.
+     */
+
+    enum SectionMode { kSectionOctave = 0, kSectionVariation };
+
+    /* Five octave rows: +2 +1 0 -1 -2 around the slider's octave. */
+    static constexpr int kOctaveRows = 5;
+
+    /* Four variations visible at a time; the strip scrolls to reach the rest,
+     * so every extension is available without thinning the rows. */
+    static constexpr int kVariationRows = 4;
+
+    int sectionCount() const
+    {
+        return (fSectionMode == kSectionOctave) ? kOctaveRows : kVariationRows;
+    }
+
+    /* The area the strips occupy - the same space the wheel would use. */
+    Button slideArea() const
+    {
+        const float top = chromeTop();
+        return { chromeLeft(), top,
+                 getWidth() - chromeLeft() - 10.0f,
+                 getHeight() - top - chromeBottom() - 8.0f };
+    }
+
+    /*
+     * Strips ABUT rather than sit apart: a gap between them would break a
+     * glide drag, since the finger would leave every strip on the way across
+     * and the gesture would end. Shared borders keep the drag continuous, so
+     * sliding across the strips plays a run the way dragging the wheel does.
+     *
+     * The octave slider on the left stays visually separate - it is a
+     * different control, not another chord, and a drag must not wander into
+     * it by accident.
+     */
+    Button slideRect(int index) const
+    {
+        const Button a = slideArea();
+        const int    n = slideCountForScale(fScale);
+        const float  w = a.w / n;
+        return { a.x + index * w, a.y, w, a.h };
+    }
+
+    Button sectionRect(int slide, int section) const
+    {
+        const Button s = slideRect(slide);
+        const int    n = sectionCount();
+        const float  h = s.h / n;
+        return { s.x, s.y + section * h, s.w, h };
+    }
+
+    /*
+     * What a section plays.
+     *
+     * Returns the extension and the octave offset, which between them are the
+     * whole of what a section varies - the chord itself comes from the slide's
+     * degree. In octave mode the scroll offset picks the variation for the
+     * whole screen; in variation mode it picks which four of the seven
+     * extensions are on show.
+     */
+    void sectionSettings(int section, Extension& outExt, int& outOctave) const
+    {
+        if (fSectionMode == kSectionOctave) {
+            /* Top row is the highest octave, as on a keyboard. */
+            outOctave = 2 - section;
+            outExt    = static_cast<Extension>(
+                ((fSliderVariation % kExtCount) + kExtCount) % kExtCount);
+        } else {
+            outOctave = 0;
+            const int idx = section + fVariationScroll;
+            outExt = static_cast<Extension>(
+                ((idx % kExtCount) + kExtCount) % kExtCount);
+        }
+    }
+
+    /* Chord label for a section, e.g. "Cmaj7". */
+    void sectionLabel(int slide, int section, char* out, size_t outSize) const
+    {
+        const SlideDef* defs = slidesForScale(fScale);
+        int  pos;
+        Ring ring;
+        cellForDegree(defs[slide].degree, fSelectedKey, pos, ring);
+
+        Extension ext;
+        int       oct;
+        sectionSettings(section, ext, oct);
+
+        const ChordType base = fSingleNotes
+            ? kChordSingleNote
+            : extendChord(defaultChordForRing(ring), ext);
+
+        /* The cell's own label already carries the minor 'm' and the dim sign,
+         * so append only what the extension adds beyond the triad. */
+        const char* root = labelForPosition(pos, ring);
+
+        if (fSingleNotes || ext == kExtNone) {
+            std::snprintf(out, outSize, "%s", root);
+            return;
+        }
+
+        /* Strip the triad's own suffix off the root label so it is not
+         * doubled: the extension's suffix already implies the quality. */
+        char stem[16];
+        std::snprintf(stem, sizeof(stem), "%s", root);
+        const size_t len = std::strlen(stem);
+        if (len > 1 && (stem[len - 1] == 'm'))
+            stem[len - 1] = '\0';
+
+        std::snprintf(out, outSize, "%s%s", stem, kChordShape[base].suffix);
+    }
+
+    void drawSlides()
+    {
+        const int n = slideCountForScale(fScale);
+        const SlideDef* defs = slidesForScale(fScale);
+
+        /* One rounded panel behind the whole bank, so the strips read as a
+         * continuous surface with dividers rather than as separate buttons. */
+        const Button area = slideArea();
+        beginPath();
+        roundedRect(area.x, area.y, area.w, area.h, 5.0f);
+        fillColor(Color(0.12f, 0.13f, 0.17f));
+        fill();
+
+        for (int i = 0; i < n; ++i) {
+            const Button s = slideRect(i);
+
+            for (int sec = 0; sec < sectionCount(); ++sec) {
+                const Button r = sectionRect(i, sec);
+                const bool active = (fActiveSlide == i && fActiveSection == sec);
+
+                /* Filled edge to edge - cells touch, so a drag never leaves
+                 * the bank between them. */
+                beginPath();
+                rect(r.x, r.y, r.w, r.h);
+
+                if (active) {
+                    fillColor(Color(0.98f, 0.72f, 0.24f));
+                } else if (fSectionMode == kSectionVariation && sec == 0) {
+                    /* The plain chord is the anchor of the strip; give it
+                     * more weight than its variations. */
+                    fillColor(Color(0.28f, 0.31f, 0.40f));
+                } else {
+                    fillColor(Color(0.18f, 0.20f, 0.26f));
+                }
+                fill();
+
+                /* Hairline dividers: enough to read the grid, not enough to
+                 * break the surface into islands. */
+                beginPath();
+                moveTo(r.x + r.w, r.y);
+                lineTo(r.x + r.w, r.y + r.h);
+                moveTo(r.x, r.y + r.h);
+                lineTo(r.x + r.w, r.y + r.h);
+                strokeColor(Color(0.09f, 0.10f, 0.13f));
+                strokeWidth(1.0f);
+                stroke();
+
+                char label[32];
+                sectionLabel(i, sec, label, sizeof(label));
+
+                fontFace(NANOVG_DEJAVU_SANS_TTF);
+                fontSize(s.w > 62.0f ? 14.0f : 11.0f);
+                textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+                fillColor(active ? Color(0.08f, 0.09f, 0.12f)
+                                 : Color(0.92f, 0.94f, 0.98f));
+                text(r.x + r.w * 0.5f, r.y + r.h * 0.5f - 5.0f, label, nullptr);
+
+                /* Second line: what this section varies. In octave mode that
+                 * is the octave; in variation mode, the extension's name. */
+                Extension ext;
+                int       oct;
+                sectionSettings(sec, ext, oct);
+
+                char sub[24];
+                if (fSectionMode == kSectionOctave)
+                    std::snprintf(sub, sizeof(sub), "%+d", oct);
+                else
+                    std::snprintf(sub, sizeof(sub), "%s",
+                                  ext == kExtNone ? "triad" : kExtensionName[ext]);
+
+                fontSize(9.0f);
+                fillColor(active ? Color(0.20f, 0.18f, 0.10f)
+                                 : Color(0.55f, 0.60f, 0.68f));
+                text(r.x + r.w * 0.5f, r.y + r.h * 0.5f + 8.0f, sub, nullptr);
+            }
+
+            /* Degree numeral under the strip, so the progression can be read
+             * off the screen the way it can off the wheel. */
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(11.0f);
+            textAlign(ALIGN_CENTER | ALIGN_TOP);
+            fillColor(Color(0.55f, 0.78f, 0.98f));
+            text(s.x + s.w * 0.5f, s.y + s.h + 2.0f,
+                 kDegreeCell[defs[i].degree].numeral, nullptr);
+        }
+    }
+
+    /*
+     * A slide press is a wheel press.
+     *
+     * The DSP has no idea which screen is showing: a strip resolves to a cell
+     * and sends the same "gesture" message the wheel does, so latch, glide,
+     * the pedal, voice leading and the monitor all work here without a second
+     * code path.
+     *
+     * What the section chooses - extension and octave - is pushed first, as
+     * ordinary settings, so the gesture is built from them (spec section 5:
+     * settings are read at the instant of the gesture and baked into MIDI).
+     */
+    bool slidePress(double px, double py)
+    {
+        int section;
+        const int slide = hitSlide(px, py, section);
+        if (slide < 0)
+            return false;
+
+        applySection(slide, section);
+
+        const SlideDef* defs = slidesForScale(fScale);
+        int  pos;
+        Ring ring;
+        cellForDegree(defs[slide].degree, fSelectedKey, pos, ring);
+
+        const bool same = (fLatchEnabled &&
+                           slide == fActiveSlide && section == fActiveSection);
+
+        sendGesture("press", pos, ring);
+
+        if (same) {
+            fActiveSlide = -1;
+        } else {
+            fActiveSlide   = slide;
+            fActiveSection = section;
+        }
+
+        fDragging       = true;
+        fActivePosition = pos;
+        fActiveRing     = ring;
+        repaint();
+        return true;
+    }
+
+    /* Crossing into another strip mid-drag is the glide gesture, exactly as on
+     * the wheel - which is why the strips share borders rather than sitting
+     * apart. */
+    bool slideMotion(double px, double py)
+    {
+        int section;
+        const int slide = hitSlide(px, py, section);
+        if (slide < 0)
+            return false;
+        if (slide == fActiveSlide && section == fActiveSection)
+            return false;
+
+        applySection(slide, section);
+
+        const SlideDef* defs = slidesForScale(fScale);
+        int  pos;
+        Ring ring;
+        cellForDegree(defs[slide].degree, fSelectedKey, pos, ring);
+
+        fActiveSlide    = slide;
+        fActiveSection  = section;
+        fActivePosition = pos;
+        fActiveRing     = ring;
+
+        sendGesture("move", pos, ring);
+        repaint();
+        return true;
+    }
+
+    /*
+     * Push the settings a section implies, before the gesture that reads them.
+     *
+     * The extension is per-ring in the engine, so the ring this slide lands on
+     * is the one to set - which is also what keeps a strip's variation from
+     * silently changing chords on another ring.
+     */
+    void applySection(int slide, int section)
+    {
+        const SlideDef* defs = slidesForScale(fScale);
+        int  pos;
+        Ring ring;
+        cellForDegree(defs[slide].degree, fSelectedKey, pos, ring);
+
+        Extension ext;
+        int       octShift;
+        sectionSettings(section, ext, octShift);
+
+        char buf[16];
+        char key[8];
+
+        if (static_cast<int>(fRingExt[ring]) != static_cast<int>(ext)) {
+            fRingExt[ring] = ext;
+            std::snprintf(key, sizeof(key), "ext%d", static_cast<int>(ring));
+            std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(ext));
+            setState(key, buf);
+        }
+
+        /* The slide's own octave shift (the last strip is the tonic an octave
+         * up) plus whatever the section asks for. */
+        const int oct = fOctave + defs[slide].octaveShift + octShift;
+        if (oct != fPushedOctave) {
+            fPushedOctave = oct;
+            std::snprintf(buf, sizeof(buf), "%d", oct);
+            setState("octave", buf);
+        }
+    }
+
+    /* Which slide and section a point falls in; slide -1 when outside. */
+    int hitSlide(double px, double py, int& outSection) const
+    {
+        const int n = slideCountForScale(fScale);
+        for (int i = 0; i < n; ++i) {
+            for (int sec = 0; sec < sectionCount(); ++sec) {
+                if (hit(sectionRect(i, sec), px, py)) {
+                    outSection = sec;
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
 
     static bool hit(const Button& b, double px, double py)
     {
@@ -671,6 +1209,39 @@ protected:
                                     : "Lead: root pos",
                    fVoiceLeading && ! leadSuppressed);
 
+        /*
+         * Row 2 differs by screen: the wheel wants per-ring extensions and
+         * voicings, while the strips carry their variations in the sections
+         * themselves and need the scale and key instead.
+         */
+        if (fScreen == kScreenSlide) {
+            char buf[48];
+
+            std::snprintf(buf, sizeof(buf), "Sections: %s",
+                          fSectionMode == kSectionOctave ? "octave"
+                                                         : "variation");
+            drawDropdown(sectionModeButton(), buf, false);
+
+            std::snprintf(buf, sizeof(buf), "%s", kScaleName[fScale]);
+            drawDropdown(scaleButton(), buf,
+                         fOpenMenu == kMenuScale);
+
+            std::snprintf(buf, sizeof(buf), "Key: %s",
+                          kMajorLabel[fSelectedKey]);
+            drawDropdown(slideKeyButton(), buf, fOpenMenu == kMenuKey);
+
+            /* Say what the slider is doing, since it swaps with the sections. */
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(9.5f);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(Color(0.50f, 0.55f, 0.63f));
+            text(434.0f, kDropY + kDropH * 0.5f,
+                 fSectionMode == kSectionOctave ? "slider: variation"
+                                                : "slider: octave",
+                 nullptr);
+            return;
+        }
+
         /* Per-ring dropdowns, labelled by ring so the mapping is unambiguous. */
         static const char* const kRingTag[kRingCount] = { "Maj", "Min", "Dim" };
 
@@ -695,13 +1266,10 @@ protected:
         if (fOpenMenu == kMenuNone)
             return;
 
-        const bool   isExt  = (fOpenMenu == kMenuExt);
-        const int    rows   = isExt ? static_cast<int>(kExtCount)
-                                    : static_cast<int>(kVoicingCount);
-        const Button anchor = isExt ? extButton(fOpenMenuRing)
-                                    : voiceButton(fOpenMenuRing);
-        const int    cur    = isExt ? static_cast<int>(fRingExt[fOpenMenuRing])
-                                    : static_cast<int>(fRingVoice[fOpenMenuRing]);
+        int    rows;
+        Button anchor;
+        int    cur;
+        menuShape(rows, anchor, cur);
 
         const Button first = menuRow(anchor, 0);
         const Button last  = menuRow(anchor, rows - 1);
@@ -730,8 +1298,45 @@ protected:
             textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
             fillColor(i == cur ? Color(0.96f, 0.98f, 1.00f)
                                : Color(0.78f, 0.82f, 0.88f));
-            text(row.x + 7.0f, row.y + row.h * 0.5f,
-                 isExt ? kExtensionName[i] : kVoicingName[i], nullptr);
+            text(row.x + 7.0f, row.y + row.h * 0.5f, menuRowLabel(i), nullptr);
+        }
+    }
+
+    /* Rows, anchor and current selection for whichever menu is open - one
+     * place, so drawing and hit-testing cannot disagree about the shape. */
+    void menuShape(int& rows, Button& anchor, int& cur) const
+    {
+        switch (fOpenMenu) {
+            case kMenuVoicing:
+                rows   = static_cast<int>(kVoicingCount);
+                anchor = voiceButton(fOpenMenuRing);
+                cur    = static_cast<int>(fRingVoice[fOpenMenuRing]);
+                break;
+            case kMenuScale:
+                rows   = static_cast<int>(kScaleCount);
+                anchor = scaleButton();
+                cur    = static_cast<int>(fScale);
+                break;
+            case kMenuKey:
+                rows   = 12;
+                anchor = slideKeyButton();
+                cur    = fSelectedKey;
+                break;
+            default:   /* kMenuExt */
+                rows   = static_cast<int>(kExtCount);
+                anchor = extButton(fOpenMenuRing);
+                cur    = static_cast<int>(fRingExt[fOpenMenuRing]);
+                break;
+        }
+    }
+
+    const char* menuRowLabel(int i) const
+    {
+        switch (fOpenMenu) {
+            case kMenuVoicing: return kVoicingName[i];
+            case kMenuScale:   return kScaleName[i];
+            case kMenuKey:     return kMajorLabel[i];
+            default:           return kExtensionName[i];
         }
     }
 
@@ -743,26 +1348,44 @@ protected:
         /* An open menu swallows clicks first, so a row cannot fall through to
          * the wheel underneath it. */
         if (fOpenMenu != kMenuNone) {
-            const bool   isExt  = (fOpenMenu == kMenuExt);
-            const int    rows   = isExt ? static_cast<int>(kExtCount)
-                                        : static_cast<int>(kVoicingCount);
-            const Button anchor = isExt ? extButton(fOpenMenuRing)
-                                        : voiceButton(fOpenMenuRing);
+            int    rows;
+            Button anchor;
+            int    cur;
+            menuShape(rows, anchor, cur);
 
             for (int i = 0; i < rows; ++i) {
                 if (hit(menuRow(anchor, i), px, py)) {
                     std::snprintf(buf, sizeof(buf), "%d", i);
-                    if (isExt) {
-                        fRingExt[fOpenMenuRing] = static_cast<Extension>(i);
-                        char key[8];
-                        std::snprintf(key, sizeof(key), "ext%d", fOpenMenuRing);
-                        setState(key, buf);
-                    } else {
-                        fRingVoice[fOpenMenuRing] = static_cast<Voicing>(i);
-                        char key[8];
-                        std::snprintf(key, sizeof(key), "voice%d", fOpenMenuRing);
-                        setState(key, buf);
+
+                    switch (fOpenMenu) {
+                        case kMenuVoicing: {
+                            fRingVoice[fOpenMenuRing] = static_cast<Voicing>(i);
+                            char key[8];
+                            std::snprintf(key, sizeof(key), "voice%d",
+                                          fOpenMenuRing);
+                            setState(key, buf);
+                            break;
+                        }
+                        case kMenuScale:
+                            fScale = static_cast<Scale>(i);
+                            /* Fewer slides may leave the highlight past the
+                             * end of the bank. */
+                            fActiveSlide = -1;
+                            break;
+                        case kMenuKey:
+                            fSelectedKey = i;
+                            setState("selectedKey", buf);
+                            break;
+                        default: {   /* kMenuExt */
+                            fRingExt[fOpenMenuRing] = static_cast<Extension>(i);
+                            char key[8];
+                            std::snprintf(key, sizeof(key), "ext%d",
+                                          fOpenMenuRing);
+                            setState(key, buf);
+                            break;
+                        }
                     }
+
                     fOpenMenu = kMenuNone;
                     repaint();
                     return true;
@@ -773,11 +1396,44 @@ protected:
             return true;   /* click-away closes without selecting */
         }
 
+        /* Tabs first: they sit above every other control. */
+        for (int i = 0; i < 2; ++i) {
+            if (hit(tabButton(i), px, py)) {
+                fScreen = static_cast<Screen>(i);
+                /* A highlight from the other screen would be a lie here. */
+                fActivePosition = -1;
+                fActiveSlide    = -1;
+                fOpenMenu       = kMenuNone;
+                repaint();
+                return true;
+            }
+        }
+
+        if (fScreen == kScreenSlide) {
+            if (hit(sectionModeButton(), px, py)) {
+                fSectionMode = (fSectionMode == kSectionOctave)
+                    ? kSectionVariation : kSectionOctave;
+                fActiveSlide = -1;
+                repaint();
+                return true;
+            }
+            if (hit(scaleButton(), px, py)) {
+                fOpenMenu = kMenuScale;
+                repaint();
+                return true;
+            }
+            if (hit(slideKeyButton(), px, py)) {
+                fOpenMenu = kMenuKey;
+                repaint();
+                return true;
+            }
+        }
+
         /* Octave slider: takes the press and keeps receiving motion, so it can
          * be dragged through the octaves while notes sound. */
         if (hit(octaveSlider(), px, py)) {
             fSliderDrag = true;
-            setOctave(octaveAtY(py));
+            sliderTo(py);
             repaint();
             return true;
         }
@@ -843,18 +1499,22 @@ protected:
             return true;
         }
 
-        for (int r = 0; r < kRingCount; ++r) {
-            if (hit(extButton(r), px, py)) {
-                fOpenMenu = kMenuExt;
-                fOpenMenuRing = r;
-                repaint();
-                return true;
-            }
-            if (hit(voiceButton(r), px, py)) {
-                fOpenMenu = kMenuVoicing;
-                fOpenMenuRing = r;
-                repaint();
-                return true;
+        /* Only on the wheel screen: these buttons are not drawn in Slide Mode,
+         * and an invisible hit box would swallow clicks meant for the strips. */
+        if (fScreen == kScreenCircle) {
+            for (int r = 0; r < kRingCount; ++r) {
+                if (hit(extButton(r), px, py)) {
+                    fOpenMenu = kMenuExt;
+                    fOpenMenuRing = r;
+                    repaint();
+                    return true;
+                }
+                if (hit(voiceButton(r), px, py)) {
+                    fOpenMenu = kMenuVoicing;
+                    fOpenMenuRing = r;
+                    repaint();
+                    return true;
+                }
             }
         }
 
@@ -1266,7 +1926,7 @@ private:
     };
 
     /* Which dropdown is open, if any. */
-    enum OpenMenu { kMenuNone = 0, kMenuExt, kMenuVoicing };
+    enum OpenMenu { kMenuNone = 0, kMenuExt, kMenuVoicing, kMenuScale, kMenuKey };
     OpenMenu fOpenMenu     = kMenuNone;
     int      fOpenMenuRing = 0;
 
@@ -1288,6 +1948,27 @@ private:
     /* A drag that started on the octave slider, kept separate from the wheel's
      * drag so the two gestures cannot interfere. */
     bool fSliderDrag = false;
+
+    /* ---- slide mode state -------------------------------------------------- */
+
+    Screen      fScreen      = kScreenCircle;
+    Scale       fScale       = kScaleDiatonic;
+    SectionMode fSectionMode = kSectionOctave;
+
+    int fActiveSlide   = -1;
+    int fActiveSection = 0;
+
+    /* First visible variation row, so all seven extensions are reachable
+     * while only four are on screen. */
+    int fVariationScroll = 0;
+
+    /* The variation the left slider selects, when the sections are doing
+     * octaves instead. */
+    int fSliderVariation = 0;
+
+    /* Last octave pushed to the DSP, so a drag across strips does not resend
+     * an unchanged value on every cell. */
+    int fPushedOctave = 4;
 
     DISTRHO_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FortyFifthUI)
 };
