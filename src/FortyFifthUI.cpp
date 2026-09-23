@@ -183,9 +183,12 @@ protected:
 
         /* Each ring gets its own hue so the three are distinguishable at a
          * glance; the diminished ring is dimmest, matching its lighter use. */
-        /* A cell belonging to the selected key's wedge is lifted, so the seven
-         * diatonic chords read as one shape - the whole point of the wheel. */
-        const CellRole role    = roleInKey(index, ring, fSelectedKey);
+        /* A cell belonging to the highlighted key's wedge is lifted, so the
+         * seven diatonic chords read as one shape - the whole point of the
+         * wheel. This is the ONLY thing key lock governs: it pins the wedge so
+         * the reference stays put while you play outside it. What the keyboard
+         * maps to is a separate question, answered by fSelectedKey. */
+        const CellRole role    = roleInKey(index, ring, highlightKey());
         const bool     inWedge = (role != kCellOutside);
 
         if (active) {
@@ -248,7 +251,7 @@ protected:
         /* Roman numeral under the chord name, so the progression can be read
          * off the wheel directly. */
         if (inWedge) {
-            const char* deg = degreeInKey(index, ring, fSelectedKey);
+            const char* deg = degreeInKey(index, ring, highlightKey());
             fontSize(size * 0.68f);
             if (active)
                 fillColor(Color(0.15f, 0.16f, 0.20f));
@@ -294,6 +297,43 @@ protected:
         setState("gesture", value);
     }
 
+    /* Which key's wedge is drawn as the diatonic set. Locked, it stays where
+     * it was pinned; otherwise it follows the selection. */
+    int highlightKey() const
+    {
+        return fKeyLocked ? fLockedKey : fSelectedKey;
+    }
+
+    /*
+     * Choose the key, and tell the DSP.
+     *
+     * Key lock and the keyboard's key are two different questions, and
+     * conflating them was wrong. Lock governs only which wedge stays
+     * HIGHLIGHTED - a reading aid, so the diatonic set can stay put while you
+     * play a chord outside it. The keyboard's mapping is a different matter:
+     * whatever cell is selected and in focus is the key you are playing in, so
+     * pressing C should sound that key's I whether or not the highlight is
+     * pinned. Gating this on the lock meant a locked wheel left the keyboard
+     * stuck in whatever key was last unlocked.
+     *
+     * fSelectedKey therefore always tracks the selection; only the wedge
+     * drawing consults fKeyLocked.
+     */
+    void selectKey(int keyIndex)
+    {
+        const int k = ((keyIndex % 12) + 12) % 12;
+        if (k == fSelectedKey)
+            return;
+
+        fSelectedKey = k;
+
+        /* The DSP resolves an incoming MIDI note to a cell by degree, so it
+         * cannot map anything without knowing the key. */
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", fSelectedKey);
+        setState("selectedKey", buf);
+    }
+
     bool onMouse(const MouseEvent& ev) override
     {
         if (ev.press) {
@@ -308,18 +348,11 @@ protected:
             if (pos < 0)
                 return false;
 
-            /* Clicking the key ring re-centres the highlighted wedge, so the
-             * diatonic set follows the key you are playing in - unless the key
-             * is locked, in which case the chord still sounds but the reference
-             * wedge stays put. */
-            if (ring == kRingKey && ! fKeyLocked) {
-                fSelectedKey = pos;
-                /* The DSP needs the key too now: an incoming MIDI note selects
-                 * a cell by degree, so it cannot be resolved without it. */
-                char kb[16];
-                std::snprintf(kb, sizeof(kb), "%d", fSelectedKey);
-                setState("selectedKey", kb);
-            }
+            /* Clicking the key ring picks the key. Key lock governs only the
+             * highlighted wedge - see selectKey() for why the keyboard follows
+             * the selection regardless. */
+            if (ring == kRingKey)
+                selectKey(pos);
 
             /* In latch mode a press on the lit selection turns it off, matching
              * the DSP's toggle. */
@@ -588,11 +621,11 @@ protected:
 
     Button latchButton() const { return { 10.0f,  kRow1Y,  78.0f, 22.0f }; }
     Button glideButton() const { return { 94.0f,  kRow1Y,  92.0f, 22.0f }; }
-    Button keyLockButton() const { return { 192.0f, kRow1Y, 96.0f, 22.0f }; }
+    Button keyLockButton() const { return { 192.0f, kRow1Y, 108.0f, 22.0f }; }
     /* Bypass chord generation: the wheel becomes a note selector. */
-    Button singleNoteButton() const { return { 294.0f, kRow1Y, 104.0f, 22.0f }; }
+    Button singleNoteButton() const { return { 306.0f, kRow1Y, 104.0f, 22.0f }; }
     /* Settle each chord near the last instead of stacking from its own root. */
-    Button voiceLeadButton() const { return { 404.0f, kRow1Y, 126.0f, 22.0f }; }
+    Button voiceLeadButton() const { return { 416.0f, kRow1Y, 126.0f, 22.0f }; }
 
     /*
      * Row 2: one dropdown pair per ring. Extensions and voicings are per-ring,
@@ -1190,8 +1223,11 @@ protected:
                    fLatchEnabled);
         drawButton(glideButton(), kGlideModeName[fGlideMode],
                    fGlideMode != kGlideOff);
+        /* "Wedge", not "Key": the key itself always follows the selection now,
+         * and only the highlight is pinned. Saying "Key: locked" would suggest
+         * the keyboard was frozen too. */
         drawButton(keyLockButton(),
-                   fKeyLocked ? "Key: locked" : "Key: follows",
+                   fKeyLocked ? "Wedge: pinned" : "Wedge: follows",
                    fKeyLocked);
         drawButton(singleNoteButton(),
                    fSingleNotes ? "Single notes" : "Chords",
@@ -1373,8 +1409,7 @@ protected:
                             fActiveSlide = -1;
                             break;
                         case kMenuKey:
-                            fSelectedKey = i;
-                            setState("selectedKey", buf);
+                            selectKey(i);
                             break;
                         default: {   /* kMenuExt */
                             fRingExt[fOpenMenuRing] = static_cast<Extension>(i);
@@ -1475,9 +1510,13 @@ protected:
             return true;
         }
 
-        /* Key lock is purely a UI concern for the highlight - but the DSP does
-         * need the key itself, for resolving incoming MIDI notes. */
+        /* Key lock pins the highlighted wedge, and nothing else. Engaging it
+         * captures whatever key is selected now, so the wedge freezes where the
+         * user is looking rather than at some earlier key. The keyboard keeps
+         * following the selection either way. */
         if (hit(keyLockButton(), px, py)) {
+            if (! fKeyLocked)
+                fLockedKey = fSelectedKey;
             fKeyLocked = ! fKeyLocked;
             repaint();
             return true;
@@ -1930,9 +1969,10 @@ private:
     OpenMenu fOpenMenu     = kMenuNone;
     int      fOpenMenuRing = 0;
 
-    /* When locked, clicking the key ring plays the chord but leaves the
-     * highlighted wedge where it is. */
+    /* When locked, the highlighted wedge stays where it was pinned - the
+     * chord still sounds and the keyboard still follows the selection. */
     bool fKeyLocked = false;
+    int  fLockedKey = 0;
 
     /* Bypass chord generation and sound the root alone. */
     bool fSingleNotes = false;
