@@ -1364,11 +1364,39 @@ protected:
         char buf[16];
         char key[8];
 
-        if (static_cast<int>(fRingExt[ring]) != static_cast<int>(ext)) {
-            fRingExt[ring] = ext;
+        /*
+         * Slide Mode keeps its OWN extensions and voicings.
+         *
+         * Writing the wheel's ext0/1/2 here was wrong: it silently rewrote
+         * Circle Mode's per-ring settings, so the wheel's dropdowns went on
+         * reading "None (triad)" while the DSP built sevenths - and a chord
+         * started with one voice count and released with another, stranding
+         * notes. The two screens are different instruments over one engine;
+         * their settings must not leak into each other.
+         *
+         * The DSP still has one set of per-ring values, so whichever screen is
+         * playing pushes its own before the gesture that reads them. That is
+         * enough because only one screen can be played at a time, and it is
+         * what keeps the DSP from needing to know screens exist at all.
+         */
+        if (fSlideRingExt[ring] != ext ||
+            fPushedExtRing != static_cast<int>(ring) || fPushedExt != ext) {
+            fSlideRingExt[ring] = ext;
+            fPushedExtRing = static_cast<int>(ring);
+            fPushedExt     = ext;
             std::snprintf(key, sizeof(key), "ext%d", static_cast<int>(ring));
             std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(ext));
             setState(key, buf);
+        }
+
+        /* Voicing likewise: Slide Mode has no voicing control, so it must
+         * assert Regular rather than inherit whatever the wheel was set to.
+         * Otherwise a wheel inversion would quietly re-voice the strips and
+         * put the wrong note in the bass. */
+        if (fPushedVoiceRing != static_cast<int>(ring)) {
+            fPushedVoiceRing = static_cast<int>(ring);
+            std::snprintf(key, sizeof(key), "voice%d", static_cast<int>(ring));
+            setState(key, "0");
         }
 
         /* The slide's own octave shift (the last strip is the tonic an octave
@@ -1379,6 +1407,47 @@ protected:
             std::snprintf(buf, sizeof(buf), "%d", oct);
             setState("octave", buf);
         }
+    }
+
+    /*
+     * Re-assert this screen's settings when it becomes the one being played.
+     *
+     * The DSP holds a single set of per-ring values, so the screen in front of
+     * the user has to own them. Without this, switching tabs leaves the other
+     * screen's extensions and voicings in force while this screen's controls
+     * claim otherwise - which is exactly how the wheel came to build sevenths
+     * while its dropdowns read "triad".
+     */
+    void assertScreenSettings()
+    {
+        char key[8];
+        char buf[16];
+
+        for (int r = 0; r < kRingCount; ++r) {
+            const int ext = (fScreen == kScreenSlide)
+                ? 0                                    /* strips re-push per press */
+                : static_cast<int>(fRingExt[r]);
+            const int voi = (fScreen == kScreenSlide)
+                ? 0                                    /* strips are always Regular */
+                : static_cast<int>(fRingVoice[r]);
+
+            std::snprintf(key, sizeof(key), "ext%d", r);
+            std::snprintf(buf, sizeof(buf), "%d", ext);
+            setState(key, buf);
+
+            std::snprintf(key, sizeof(key), "voice%d", r);
+            std::snprintf(buf, sizeof(buf), "%d", voi);
+            setState(key, buf);
+        }
+
+        /* Force the next slide press to re-push, since the values above just
+         * changed underneath it. */
+        fPushedExtRing   = -1;
+        fPushedVoiceRing = -1;
+        fPushedOctave    = -999;
+
+        std::snprintf(buf, sizeof(buf), "%d", fOctave);
+        setState("octave", buf);
     }
 
     /* Which slide and section a point falls in; slide -1 when outside. */
@@ -1684,11 +1753,21 @@ protected:
         /* Tabs first: they sit above every other control. */
         for (int i = 0; i < 2; ++i) {
             if (hit(tabButton(i), px, py)) {
+                if (static_cast<int>(fScreen) == i) { repaint(); return true; }
+
+                /* Anything still sounding was built with the OTHER screen's
+                 * settings; leaving it running while those change is how a
+                 * chord ends up released with the wrong voice count. */
+                setState("panic", "1");
+
                 fScreen = static_cast<Screen>(i);
                 /* A highlight from the other screen would be a lie here. */
                 fActivePosition = -1;
                 fActiveSlide    = -1;
                 fOpenMenu       = kMenuNone;
+                fLastChord.clear();
+
+                assertScreenSettings();
                 repaint();
                 return true;
             }
@@ -1855,12 +1934,26 @@ protected:
 
         switch (status) {
             case 0x90:
-                /* Collect the note into the chord being assembled, so the log
-                 * can show what actually sounded together rather than only a
-                 * run of separate note-ons. */
-                noteOnForChord(b);
-                std::snprintf(line, sizeof(line), "NoteOn   %-4s(%3d) vel %d",
-                              noteName(b), b, c);
+                /*
+                 * A note-on with velocity 0 IS a note-off - the running-status
+                 * convention every MIDI device uses. Counting it as a note-on
+                 * left the pitch marked sounding forever, so the chord view
+                 * reported voices that had already stopped: the phantom
+                 * "(2 notes)" after a chord was released. The notes were never
+                 * stuck; the monitor's bookkeeping was.
+                 *
+                 * The DSP's own input handler has always decoded it this way;
+                 * only the monitor disagreed.
+                 */
+                if (c == 0) {
+                    noteOffForChord(b);
+                    std::snprintf(line, sizeof(line), "NoteOff  %-4s(%3d) (vel 0)",
+                                  noteName(b), b);
+                } else {
+                    noteOnForChord(b);
+                    std::snprintf(line, sizeof(line), "NoteOn   %-4s(%3d) vel %d",
+                                  noteName(b), b, c);
+                }
                 break;
             case 0x80:
                 noteOffForChord(b);
@@ -2380,6 +2473,17 @@ private:
     /* Last octave pushed to the DSP, so a drag across strips does not resend
      * an unchanged value on every cell. */
     int fPushedOctave = 4;
+
+    /* Slide Mode's own extensions, kept apart from the wheel's fRingExt so
+     * neither screen can rewrite the other's settings behind its back. */
+    Extension fSlideRingExt[kRingCount] = { kExtNone, kExtNone, kExtNone };
+
+    /* What was last pushed for the ring currently being played, so a drag does
+     * not resend unchanged values - and so a tab switch can force a resend by
+     * clearing them. */
+    int fPushedExtRing   = -1;
+    int fPushedVoiceRing = -1;
+    Extension fPushedExt = kExtNone;
 
     /* ---- keyboard setup state ---------------------------------------------- */
 
