@@ -148,6 +148,21 @@ protected:
         kStateKeyMap,
         kStatePedalAction,
         kStateBassNote,
+        /*
+         * The sequencer.
+         *
+         * These MUST be declared here, not merely handled in setState(). DPF
+         * routes only the keys initState() declares; anything else is dropped
+         * before it reaches the plugin. That is why PLAY appeared to do
+         * nothing in a host - the button sent "progRunning" and the DSP never
+         * heard it, so fProgRunning stayed false and runSequencer() returned
+         * immediately, every block, forever.
+         */
+        kStateProgression,
+        kStateProgRunning,
+        kStateProgLegato,
+        kStateUiScreen,
+        kStateStorageMode,
         kStateCount
     };
 
@@ -278,6 +293,37 @@ protected:
                 state.label = "Bass Note";
                 state.defaultValue = "0";
                 break;
+            case kStateProgression:
+                /* The whole grid as one string - see parseProgression(). */
+                state.key = "progression";
+                state.label = "Progression";
+                state.defaultValue = "";
+                break;
+            case kStateProgRunning:
+                /* Not saved as running: a project that reopened already
+                 * playing would surprise, and the transport is the user's to
+                 * start. */
+                state.key = "progRunning";
+                state.label = "Sequencer Running";
+                state.defaultValue = "0";
+                break;
+            case kStateProgLegato:
+                state.key = "progLegato";
+                state.label = "Sequencer Legato";
+                state.defaultValue = "1";
+                break;
+            case kStateUiScreen:
+                /* The DSP gates incoming MIDI on this: the keyboard is inert
+                 * while the sequencer screen is showing. */
+                state.key = "uiScreen";
+                state.label = "Editor Screen";
+                state.defaultValue = "1";
+                break;
+            case kStateStorageMode:
+                state.key = "storageMode";
+                state.label = "Storage Location";
+                state.defaultValue = "0";
+                break;
         }
     }
 
@@ -390,6 +436,17 @@ protected:
 
         fPendingProg = parsed;
         fProgDirty.store(true, std::memory_order_release);
+
+        /*
+         * The saved copy, for getState().
+         *
+         * fProg belongs to the audio thread and is only updated between
+         * beats, so reading it here could hand the host a grid one block out
+         * of date - or, if the transport never runs, the grid the plugin
+         * started with rather than the one the user built. This copy is
+         * written on the same (UI) thread that getState() is called from.
+         */
+        fSavedProg = parsed;
     }
 
     void setState(const char* key, const char* value) override
@@ -471,6 +528,10 @@ protected:
             fProgLegato = (v != 0);
         else if (std::strcmp(key, "uiScreen") == 0)
             fUiScreen.store(v, std::memory_order_release);
+        else if (std::strcmp(key, "storageMode") == 0)
+            fStorageMode = static_cast<StorageMode>(
+                ((v % kStorageModeCount) + kStorageModeCount)
+                % kStorageModeCount);
         else if (std::strcmp(key, "progRunning") == 0) {
             const bool want = (v != 0);
             if (want != fProgRunning.load(std::memory_order_acquire)) {
@@ -536,6 +597,42 @@ protected:
 
     String getState(const char* key) const override
     {
+        /*
+         * The grid, re-encoded exactly as the UI sends it, so a saved project
+         * restores the progression it had. Structured, so it is handled before
+         * the integer path below.
+         */
+        if (std::strcmp(key, "progression") == 0) {
+            char out[kMaxProgSections * (kMaxProgSteps * 10 + 8) + 16] = {0};
+            int  len = 0;
+
+            for (int s = 0; s < fSavedProg.count; ++s) {
+                const ProgSection& sec = fSavedProg.section[s];
+
+                len += std::snprintf(out + len, sizeof(out) - len, "%s%d|",
+                                     s ? ";" : "", sec.length);
+
+                for (int i = 0; i < sec.length && i < kMaxProgSteps; ++i) {
+                    const ProgCell& c = sec.cell[i];
+                    if (c.filled)
+                        len += std::snprintf(out + len, sizeof(out) - len,
+                                             "%s%d.%d.%d", i ? "," : "",
+                                             static_cast<int>(c.degree),
+                                             static_cast<int>(c.ext),
+                                             static_cast<int>(c.octave));
+                    else
+                        len += std::snprintf(out + len, sizeof(out) - len,
+                                             "%s-", i ? "," : "");
+
+                    if (len >= static_cast<int>(sizeof(out)) - 16)
+                        break;
+                }
+                if (len >= static_cast<int>(sizeof(out)) - 16)
+                    break;
+            }
+            return String(out);
+        }
+
         /* Structured, not numeric - handled before the integer path below. */
         if (std::strcmp(key, "keyMap") == 0) {
             char out[128] = {0};
@@ -572,6 +669,13 @@ protected:
             v = static_cast<int>(fPedalAction);
         else if (std::strcmp(key, "voiceLeading") == 0) v = fVoiceLeading ? 1 : 0;
         else if (std::strcmp(key, "bassNote") == 0)     v = static_cast<int>(fBassNote);
+        else if (std::strcmp(key, "progLegato") == 0)   v = fProgLegato ? 1 : 0;
+        else if (std::strcmp(key, "progRunning") == 0)
+            v = fProgRunning.load(std::memory_order_acquire) ? 1 : 0;
+        else if (std::strcmp(key, "uiScreen") == 0)
+            v = fUiScreen.load(std::memory_order_acquire);
+        else if (std::strcmp(key, "storageMode") == 0)
+            v = static_cast<int>(fStorageMode);
 
         std::snprintf(buf, sizeof(buf), "%d", v);
         return String(buf);
@@ -1124,7 +1228,7 @@ private:
 
         const Ring      r    = static_cast<Ring>(ring);
         const int       root = rootForPosition(position, r);
-        const ChordType type = chordTypeForRing(r);
+        const ChordType type = chordTypeForRing(r, position);
 
         const int source = (ring << 8) | position;
 
@@ -1596,7 +1700,7 @@ private:
             stopGroup(frame, existing);
 
         const int       root = rootForPosition(position, ring);
-        const ChordType type = chordTypeForRing(ring);
+        const ChordType type = chordTypeForRing(ring, position);
         const int       oct  = octaveForMidiNote(midiNote);
         const int    source  = (static_cast<int>(ring) << 8) | position;
 
@@ -1926,7 +2030,7 @@ private:
                       position, ring);
 
         const int       root = rootForPosition(position, ring);
-        const ChordType type = chordTypeFor(ring, cell.ext);
+        const ChordType type = chordTypeFor(ring, cell.ext, cell.degree);
 
         /* The previous chord goes first: two chords sounding at once would be
          * a harmony the grid never asked for. */
@@ -2005,21 +2109,33 @@ private:
      * pointer, keyboard and glide all ask this question, so the override
      * cannot be missed by one of them.
      */
-    ChordType chordTypeForRing(Ring ring) const
+    /*
+     * The position is needed, not just the ring: V takes a DOMINANT seventh
+     * while I and IV take major ones, and all three are major triads on the
+     * same ring. Without it, G in the key of C came out as Gmaj7 and sounded
+     * an F# that is not in the key.
+     */
+    ChordType chordTypeForRing(Ring ring, int position) const
     {
         if (fSingleNotes)
             return kChordSingleNote;
-        return extendChord(defaultChordForRing(ring), fRingExtension[ring]);
+
+        const int key = fSelectedKey.load(std::memory_order_acquire);
+        return extendChord(defaultChordForRing(ring), fRingExtension[ring],
+                           cellIsDominant(position, ring, key),
+                           semitoneForCell(position, ring, key));
     }
 
     /* As above, but with the extension given rather than taken from the ring.
      * The sequencer carries an extension per CELL - a ii-V-I wants sevenths on
      * the ii and V and a plain I - so it cannot use the ring-wide setting. */
-    ChordType chordTypeFor(Ring ring, Extension ext) const
+    ChordType chordTypeFor(Ring ring, Extension ext, Degree degree) const
     {
         if (fSingleNotes)
             return kChordSingleNote;
-        return extendChord(defaultChordForRing(ring), ext);
+        return extendChord(defaultChordForRing(ring), ext,
+                           degreeIsDominant(degree),
+                           semitoneForDegree(degree));
     }
 
 
@@ -2061,6 +2177,10 @@ private:
      */
     Progression       fProg;
     Progression       fPendingProg;
+
+    /* The grid as last set, for getState(). Written and read on the UI thread,
+     * so saving a project never races the audio thread's copy. */
+    Progression       fSavedProg;
     std::atomic<bool> fProgDirty    { false };
     std::atomic<bool> fProgRunning  { false };
     std::atomic<bool> fProgStopping { false };
@@ -2068,6 +2188,10 @@ private:
     /* Legato: a chord rings until the next one replaces it, rather than
      * stopping at the end of its beat. */
     bool fProgLegato = true;
+
+    /* Where saved progressions and preferences will live. Held so the choice
+     * survives a session; nothing reads it until there is a store to open. */
+    StorageMode fStorageMode = kStorageUser;
 
     /* The beat last triggered, so a beat fires once however many times run()
      * is called inside it. -1 means nothing has played yet. */

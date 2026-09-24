@@ -273,6 +273,52 @@ int main()
            ! v.moveCell(0, 0, 5, 0, false), "declined");
     }
 
+    /*
+     * Every state key setState() handles must also be DECLARED in
+     * initState(), or DPF drops it before the plugin sees it.
+     *
+     * This was a real, silent bug: PLAY sent "progRunning", initState() had
+     * never declared it, the host discarded the message, and the sequencer sat
+     * there doing nothing with no error anywhere. The same was true of the
+     * grid itself, so a saved project lost its progression too.
+     *
+     * Checked by scanning the source rather than by running the plugin,
+     * because reproducing it needs a host.
+     */
+    std::printf("\n=== every handled state key is declared ===\n");
+    {
+        std::FILE* f = std::fopen("src/FortyFifthPlugin.cpp", "rb");
+        if (f == nullptr) {
+            std::printf("  FAIL  %-36s cannot open source\n", "state keys");
+            ++failures;
+        } else {
+            static char src[512 * 1024];
+            const size_t n = std::fread(src, 1, sizeof src - 1, f);
+            src[n] = '\0';
+            std::fclose(f);
+
+            /* The keys the sequencer and the editor depend on. A key here must
+             * appear as a state.key assignment, which is what initState()
+             * does. */
+            static const char* const kNeeded[] = {
+                "progression", "progRunning", "progLegato",
+                "uiScreen", "storageMode",
+                "keyMap", "pedalAction", "bassNote", "voiceLeading",
+            };
+
+            for (const char* k : kNeeded) {
+                char decl[64];
+                std::snprintf(decl, sizeof decl, "state.key = \"%s\"", k);
+
+                char what[64];
+                std::snprintf(what, sizeof what, "%s is declared", k);
+
+                ok(what, std::strstr(src, decl) != nullptr,
+                   std::strstr(src, decl) ? "in initState" : "MISSING");
+            }
+        }
+    }
+
     std::printf("\n=== every preset is well formed ===\n");
     {
         bool allGood = true;

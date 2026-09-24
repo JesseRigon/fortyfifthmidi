@@ -254,12 +254,20 @@ static constexpr const char* kExtensionName[kExtCount] = {
 };
 
 /*
- * Apply an extension to a ring's native triad quality. The seventh added depends
- * on the triad: major triads take a major 7th, minor and diminished triads a
- * minor 7th (a fully-diminished 7th would need its own selection), which is what
- * keeps the result inside the parent key.
+ * Apply an extension to a triad.
+ *
+ * dominant says this chord functions as a V - the degree whose seventh is a
+ * FLAT seventh rather than a major one. The triad quality alone cannot decide
+ * this: in C major both C (I) and G (V) are major triads, but I takes a major
+ * 7th (B) and V takes a minor 7th (F). Treating every major triad the same
+ * produced Gmaj7 in the key of C, which sounds an F# the key does not contain.
+ *
+ * Everything else follows the triad: minor and diminished take a minor 7th (a
+ * fully-diminished 7th would need its own selection).
  */
-inline ChordType extendChord(ChordType base, Extension ext)
+inline ChordType extendChord(ChordType base, Extension ext,
+                             bool dominant = false,
+                             int  scaleDegree = -1)
 {
     if (ext == kExtNone)
         return base;
@@ -268,33 +276,77 @@ inline ChordType extendChord(ChordType base, Extension ext)
     const bool isDim   = (base == kChordDim);
     const bool isMajor = (base == kChordMajor);
 
+    /*
+     * Some extensions add an interval that is only sometimes in the key, and
+     * the triad quality cannot tell which. scaleDegree is the degree's
+     * position as a semitone offset from the tonic (0, 2, 4, 5, 7, 9, 11), or
+     * -1 when the caller does not know - in which case the chord is built
+     * without the key check, as it always was.
+     *
+     * The test to apply is simply: is tonic + degree + interval in the major
+     * scale? Written out per case rather than as a loop, because each case
+     * has a different fallback.
+     */
+    static const auto inKey = [](int degree, int interval) -> bool {
+        if (degree < 0)
+            return true;              /* caller does not know; allow it */
+
+        static const int kScale[7] = { 0, 2, 4, 5, 7, 9, 11 };
+        const int rel = ((degree + interval) % 12 + 12) % 12;
+
+        for (int i = 0; i < 7; ++i)
+            if (kScale[i] == rel)
+                return true;
+        return false;
+    };
+
     switch (ext) {
         case kExt6:
-            if (isMinor) return kChordMinor6;
-            if (isMajor) return kChordMajor6;
+            /*
+             * A "minor 6th" chord has a MAJOR sixth interval (+9). That is
+             * diatonic on ii but sharp on iii and vi, where it sounded a C#
+             * and an F# in the key of C. Those degrees fall back to the plain
+             * triad rather than to a minor-sixth interval, which would be the
+             * same note as the flat seventh and not a sixth chord at all.
+             */
+            if (isMinor) return inKey(scaleDegree, 9) ? kChordMinor6 : base;
+            if (isMajor) return inKey(scaleDegree, 9) ? kChordMajor6 : base;
             return base;                       /* no standard dim 6 */
         case kExt7:
             if (isMinor) return kChordMinor7;
             if (isDim)   return kChordMinor7b5; /* half-diminished */
-            if (isMajor) return kChordMajor7;
+            if (isMajor) return dominant ? kChordDominant7 : kChordMajor7;
             return base;
         case kExt9:
-            if (isMinor) return kChordMinor9;
-            if (isMajor) return kChordMajor9;
+            /* The ninth is a major second above the root (+14). On iii that
+             * is sharp, so the chord stays a seventh instead. */
+            if (isMinor) return inKey(scaleDegree, 14) ? kChordMinor9
+                                                       : kChordMinor7;
+            if (isMajor) return inKey(scaleDegree, 14)
+                       ? (dominant ? kChordDominant9 : kChordMajor9)
+                       : (dominant ? kChordDominant7 : kChordMajor7);
             return base;
         case kExtAdd9:
-            if (isMajor) return kChordAdd9;
+            if (isMajor) return inKey(scaleDegree, 14) ? kChordAdd9 : base;
             return base;                       /* add9 on minor not in the table */
         case kExtSus2:
+            /* Sus chords replace the third, so what matters is whether the
+             * replacement is in the key: +2 for sus2, +5 for sus4. On iii the
+             * second is sharp; on IV the fourth is the tritone. Either way the
+             * triad is the honest answer. */
             if (isDim) return base;
-            return kChordSus2;                 /* sus removes the third entirely */
+            return inKey(scaleDegree, 2) ? kChordSus2 : base;
         case kExtSus4:
             if (isDim) return base;
-            return kChordSus4;
+            return inKey(scaleDegree, 5) ? kChordSus4 : base;
         default:
             return base;
     }
 }
+
+/* Semitones above the tonic for each scale degree, for the key check in
+ * extendChord(). kDegreeCount entries, in Degree order. */
+static constexpr int kDegreeSemitone[7] = { 0, 2, 4, 5, 7, 9, 11 };
 
 /*
  * Voicing modifiers - how the chord tones are arranged once the notes are
@@ -616,6 +668,28 @@ inline bool sameShape(ChordType a, ChordType b)
 inline int cellsForRing(Ring ring) { return kRingSegments[ring]; }
 
 /*
+ * Does this cell function as a dominant in the selected key?
+ *
+ * Only the key ring can: V is one step clockwise of the key. The secondary
+ * dominants the wheel also marks - II (V-of-V) and III (V-of-vi) - are
+ * dominants by definition too; they are borrowed chords whose whole purpose is
+ * to resolve like a V, and a major 7th on them would defeat that.
+ *
+ * I and IV are NOT dominant. In C that is C and F, which take major 7ths.
+ */
+inline bool cellIsDominant(int position, Ring ring, int keyIndex)
+{
+    if (ring != kRingKey)
+        return false;
+
+    const int rel = ((position - keyIndex) % 12 + 12) % 12;
+    return rel == 1      /* V            */
+        || rel == 2      /* II, V-of-V   */
+        || rel == 4;     /* III, V-of-vi */
+}
+
+
+/*
  * ---- scale degrees -----------------------------------------------------
  *
  * The one definition of where a scale degree lives on the wheel. Three things
@@ -656,6 +730,38 @@ static constexpr DegreeCell kDegreeCell[kDegreeCount] = {
     /* vi  */ { kRingMinor,  1, "vi"   },
     /* vii */ { kRingDim,    0, "vii°" },
 };
+
+/* Whether a degree functions as a dominant, for the sequencer and the
+ * keyboard, which hold a degree rather than a cell. Only V does: its seventh
+ * is the flat seventh, which is what makes it resolve. See extendChord(). */
+inline bool degreeIsDominant(Degree d) { return d == kDegreeV; }
+
+/* A degree's distance above the tonic, for extendChord()'s key check. */
+inline int semitoneForDegree(Degree d)
+{
+    return (d >= 0 && d < kDegreeCount) ? kDegreeSemitone[d] : -1;
+}
+
+/*
+ * The same, for a cell the user clicked rather than a degree.
+ *
+ * Returns -1 when the cell is not diatonic to the key at all - the borrowed
+ * II and III on the key ring, and every cell outside the key's own set. There
+ * is no scale position to check against, so extendChord() builds the chord
+ * without the key test, which is right: a borrowed chord is outside the key by
+ * intent and should keep its full quality.
+ */
+inline int semitoneForCell(int position, Ring ring, int keyIndex)
+{
+    const int root  = rootForPosition(position, ring);
+    const int tonic = rootForPosition(keyIndex, kRingKey);
+    const int rel   = ((root - tonic) % 12 + 12) % 12;
+
+    for (int i = 0; i < 7; ++i)
+        if (kDegreeSemitone[i] == rel)
+            return rel;
+    return -1;
+}
 
 /* Resolve a degree to a cell in the given key. */
 inline void cellForDegree(Degree degree, int keyIndex,
@@ -1119,6 +1225,29 @@ struct ActiveCells {
         outStep    = v & 0xFF;
         return true;
     }
+};
+
+/*
+ * Where saved progressions and preferences are kept.
+ *
+ * The user folder always works and needs no setup, so it is the default.
+ * Portable puts the data beside the plugin, which suits an install the user
+ * owns - a USB stick carried between studios, or a VST folder that is not
+ * under Program Files. Custom is for anything else, such as a synced folder.
+ *
+ * Portable is offered rather than assumed because plugin directories are
+ * frequently read-only, and a plugin that cannot write where it promised is
+ * worse than one that asked.
+ */
+enum StorageMode {
+    kStorageUser = 0,
+    kStoragePortable,
+    kStorageCustom,
+    kStorageModeCount
+};
+
+static constexpr const char* kStorageModeName[kStorageModeCount] = {
+    "User folder", "Beside the plugin", "Custom folder"
 };
 
 /*

@@ -34,7 +34,7 @@ static const int kLogLines = 14;
 static float chromeTop()    { return kDropY + kDropH + 10.0f; }
 static float chromeLeft()   { return kSliderW + 16.0f; }
 /* Two stacked panels, each with its own header and collapsed state. */
-static const float kRollH = 54.0f;
+static const float kRollH = 86.0f;
 static bool rollOpen = true;
 
 static float chromeBottom()

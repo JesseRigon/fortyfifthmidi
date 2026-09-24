@@ -160,8 +160,7 @@ protected:
     static constexpr float kTabH = 28.0f;
 
     /* Setup is an icon, so it needs less room than the word tabs. */
-    /* Wide enough for a drawn keyboard and a gear side by side. */
-    static constexpr float kSetupTabW = 52.0f;
+    static constexpr float kSetupTabW = 34.0f;
     static constexpr float kTabW      = 104.0f;
 
     Button tabButton(int index) const
@@ -195,17 +194,9 @@ protected:
             strokeWidth(1.0f);
             stroke();
 
-            if (i == kScreenKeys) {
-                /* A keyboard AND a gear: the screen is keyboard settings, and
-                 * either symbol alone says only half of that. The keyboard is
-                 * drawn rather than typed - no font here has a piano glyph,
-                 * and a missing codepoint renders as a hollow box. */
-                drawKeyboardIcon(b, on);
-                continue;
-            }
-
             fontFace(NANOVG_DEJAVU_SANS_TTF);
-            fontSize(11.5f);
+            /* The gear needs more size than the word tabs to read at all. */
+            fontSize(i == kScreenKeys ? 15.0f : 11.5f);
             textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
             fillColor(on ? Color(0.96f, 0.98f, 1.00f)
                          : Color(0.62f, 0.66f, 0.72f));
@@ -213,44 +204,6 @@ protected:
         }
     }
 
-    /* Five white keys with three blacks, then a gear, inside the Setup tab. */
-    void drawKeyboardIcon(const Button& b, bool on)
-    {
-        const float kw = 3.0f;                  /* white key width */
-        const float kh = 11.0f;
-        const float x0 = b.x + 6.0f;
-        const float y0 = b.y + (b.h - kh) * 0.5f;
-
-        const Color white = on ? Color(0.92f, 0.95f, 1.00f)
-                               : Color(0.60f, 0.64f, 0.70f);
-        const Color black = on ? Color(0.16f, 0.22f, 0.32f)
-                               : Color(0.13f, 0.14f, 0.18f);
-
-        for (int k = 0; k < 5; ++k) {
-            beginPath();
-            rect(x0 + k * kw, y0, kw - 0.6f, kh);
-            fillColor(white);
-            fill();
-        }
-
-        /* Blacks sit between the first two and the last three whites, which is
-         * what makes five keys read as a keyboard rather than a barcode. */
-        static const int kBlackAfter[3] = { 0, 2, 3 };
-        for (int j = 0; j < 3; ++j) {
-            beginPath();
-            rect(x0 + (kBlackAfter[j] + 1) * kw - kw * 0.30f, y0,
-                 kw * 0.60f, kh * 0.62f);
-            fillColor(black);
-            fill();
-        }
-
-        fontFace(NANOVG_DEJAVU_SANS_TTF);
-        fontSize(13.0f);
-        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        fillColor(on ? Color(0.96f, 0.98f, 1.00f)
-                     : Color(0.62f, 0.66f, 0.72f));
-        text(x0 + 5 * kw + 4.0f, b.y + b.h * 0.5f, "⚙", nullptr);
-    }
 
     /* Angular span of one cell on one ring. */
     void segmentAngles(int index, Ring ring, float& start, float& end) const
@@ -758,7 +711,7 @@ protected:
     float chromeLeft() const { return kSliderW + 16.0f; }
 
     /* Height of the piano-roll body when open. */
-    static constexpr float kRollH = 54.0f;
+    static constexpr float kRollH = 86.0f;
 
     /*
      * Two independent panels stacked at the bottom, each with its own header
@@ -1221,9 +1174,14 @@ protected:
         int       oct;
         sectionSettings(section, ext, oct);
 
+        /* V takes a dominant seventh, not a major one - see extendChord().
+         * The label has to agree with the notes, or the strip would promise
+         * Gmaj7 and sound G7. */
         const ChordType base = fSingleNotes
             ? kChordSingleNote
-            : extendChord(defaultChordForRing(ring), ext);
+            : extendChord(defaultChordForRing(ring), ext,
+                          degreeIsDominant(defs[slide].degree),
+                          semitoneForDegree(defs[slide].degree));
 
         /* The cell's own label already carries the minor 'm' and the dim sign,
          * so append only what the extension adds beyond the triad. */
@@ -1310,8 +1268,26 @@ protected:
              * than claiming both columns are.
              */
             const bool firstOfDegree = (firstSlideForDegree(defs[i].degree) == i);
+
+            /*
+             * "From the keyboard" must mean the POINTER IS NOT PLAYING AT ALL,
+             * not merely that it is not on this strip.
+             *
+             * Dragging from one column to the next leaves both chords sounding
+             * for as long as the DSP holds them, so the column just left still
+             * has its cell lit while fPointerSlide has already moved on. The
+             * old test read that as a keyboard note and lit the whole of the
+             * abandoned column - the reported stack, seen while gliding across
+             * columns in either section mode.
+             *
+             * While a pointer gesture is live, every lit strip belongs to the
+             * pointer and is drawn by the `pressed` test below, one section at
+             * a time. Only with no gesture in flight can a lit cell have come
+             * from a played note.
+             */
+            const bool pointerPlaying = (fDragging || fPointerSlide >= 0);
             const bool fromKeyboard =
-                cellLit && (fPointerSlide != i) && firstOfDegree;
+                cellLit && ! pointerPlaying && firstOfDegree;
 
             for (int sec = 0; sec < sectionCount(); ++sec) {
                 const Button r = sectionRect(i, sec);
@@ -1512,6 +1488,106 @@ protected:
         }
 
         drawPedalRow(a.y + a.h + 24.0f);
+        drawStorageRow(a.y + a.h + 82.0f);
+    }
+
+    /*
+     * Where saved progressions and preferences live.
+     *
+     * Three choices, because one default does not fit every install:
+     *
+     *   - the OS user-data directory, which always works and needs no setup;
+     *   - beside the plugin, for a portable install on a writable path -
+     *     carrying a USB stick between studios, or a plugin folder the user
+     *     owns rather than one under Program Files;
+     *   - a path the user names, for anything else, such as a synced folder.
+     *
+     * Only the choice is made here. Nothing is written until there is
+     * something to save; a plugin that creates files merely by being scanned
+     * is a plugin that annoys people.
+     */
+    void drawStorageRow(float labelY)
+    {
+        const Button a = keyboardArea();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(11.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.62f, 0.66f, 0.72f));
+        text(a.x, labelY, "Saved progressions and settings:", nullptr);
+
+        drawDropdown(storageButton(), kStorageModeName[fStorageMode],
+                     fOpenMenu == kMenuStorage);
+
+        /* The resolved path, so the choice is not abstract. Truncated from the
+         * LEFT when it is too long: the end of a path is the part that
+         * identifies it. */
+        char shown[96];
+        storagePathDisplay(shown, sizeof shown);
+
+        /* Alignment re-stated: drawDropdown() leaves it RIGHT-aligned from
+         * drawing its caret, and inheriting that put this text's right edge at
+         * the anchor - so a path ran off the left of the window instead of
+         * starting at it. */
+        fontSize(9.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.45f, 0.49f, 0.57f));
+        text(storageButton().x, labelY + 46.0f, shown, nullptr);
+
+        if (fStorageMode == kStorageCustom) {
+            fontSize(9.0f);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(Color(0.62f, 0.55f, 0.35f));
+            text(storageButton().x, labelY + 62.0f,
+                 "Set the folder in the host's plugin state, or leave it and "
+                 "the user folder is used.", nullptr);
+        }
+    }
+
+    Button storageButton() const
+    {
+        const Button a = keyboardArea();
+        return { a.x, a.y + a.h + 92.0f, 210.0f, 24.0f };
+    }
+
+    /* The path the current mode resolves to, for display. */
+    void storagePathDisplay(char* out, size_t cap) const
+    {
+        switch (fStorageMode) {
+            case kStoragePortable:
+                std::snprintf(out, cap, "%s", "<plugin folder>/FortyFifthMidi");
+                break;
+            case kStorageCustom: {
+                if (fStoragePath[0] == '\0') {
+                    std::snprintf(out, cap, "%s", "(not set)");
+                    break;
+                }
+
+                /* Truncate from the LEFT: the end of a path is the part that
+                 * identifies it, so a long one shows ".../Music/FortyFifth"
+                 * rather than the drive letter and nothing useful. */
+                const size_t len = std::strlen(fStoragePath);
+                if (len < cap) {
+                    std::snprintf(out, cap, "%s", fStoragePath);
+                } else {
+                    std::snprintf(out, cap, "...%s",
+                                  fStoragePath + (len - (cap - 5)));
+                }
+                break;
+            }
+            default:
+#if defined(_WIN32)
+                std::snprintf(out, cap, "%s",
+                              "%LOCALAPPDATA%\\FortyFifthMidi");
+#elif defined(__APPLE__)
+                std::snprintf(out, cap, "%s",
+                              "~/Library/Application Support/FortyFifthMidi");
+#else
+                std::snprintf(out, cap, "%s",
+                              "~/.local/share/fortyfifthmidi");
+#endif
+                break;
+        }
     }
 
     void drawOneKey(int pc, const Button& r, bool black)
@@ -3048,8 +3124,10 @@ protected:
             fontSize(9.0f);
             textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
             fillColor(Color(0.62f, 0.55f, 0.35f));
+            /* Short enough to fit beside the button at the narrowest window
+             * the layout is checked at - the longer wording clipped. */
             text(vb.x + vb.w + 8.0f, vb.y + vb.h * 0.5f,
-                 "auto needs glide off or MPE", nullptr);
+                 "auto: glide off/MPE", nullptr);
         }
 
         /*
@@ -3198,6 +3276,11 @@ protected:
                 anchor = pedalButton();
                 cur    = static_cast<int>(fPedalAction);
                 break;
+            case kMenuStorage:
+                rows   = static_cast<int>(kStorageModeCount);
+                anchor = storageButton();
+                cur    = static_cast<int>(fStorageMode);
+                break;
             case kMenuCellChord: {
                 rows   = kCellChordRows;
                 anchor = cellEditChordRect();
@@ -3238,6 +3321,7 @@ protected:
             case kMenuKey:     return kMajorLabel[i];
             case kMenuBinding: return bindingRowLabel(i);
             case kMenuPedal:   return kPedalActionName[i];
+            case kMenuStorage: return kStorageModeName[i];
             case kMenuCellChord:  return cellChordRowLabel(i);
             case kMenuCellOctave: return cellOctaveRowLabel(i);
             case kMenuCellMod:    return kExtensionName[i];
@@ -3295,6 +3379,10 @@ protected:
                         case kMenuPedal:
                             fPedalAction = static_cast<PedalAction>(i);
                             setState("pedalAction", buf);
+                            break;
+                        case kMenuStorage:
+                            fStorageMode = static_cast<StorageMode>(i);
+                            setState("storageMode", buf);
                             break;
                         case kMenuCellChord:
                         case kMenuCellOctave:
@@ -3382,6 +3470,11 @@ protected:
         if (fScreen == kScreenKeys) {
             if (hit(pedalButton(), px, py)) {
                 fOpenMenu = kMenuPedal;
+                repaint();
+                return true;
+            }
+            if (hit(storageButton(), px, py)) {
+                fOpenMenu = kMenuStorage;
                 repaint();
                 return true;
             }
@@ -4158,6 +4251,19 @@ protected:
             if (changed)
                 repaint();
 
+            /*
+             * Forget the pointer's strip once nothing it played is sounding.
+             *
+             * fPointerSlide exists to cover the gap between a release and the
+             * DSP's note-offs landing. Left set forever it would suppress
+             * keyboard highlighting for good, since "the pointer is playing"
+             * would never become false again.
+             */
+            if (! fDragging && fPointerSlide >= 0 && ! fCells->any()) {
+                fPointerSlide = -1;
+                repaint();
+            }
+
             /* The sequencer's playhead, on the same terms: polled every idle,
              * repainted only when the beat actually changes. */
             int s = -1, st = -1;
@@ -4251,6 +4357,7 @@ private:
         kMenuBinding,   /* what a keyboard key does */
         kMenuPedal,
         kMenuDuplicate, /* as next, or as last */
+        kMenuStorage,   /* where saved data lives */
         /* The three lists inside the cell editor. Separate menus rather than
          * one flat list, so each offers only its own kind of answer. */
         kMenuCellChord,
@@ -4332,6 +4439,11 @@ private:
      * octaves have lists of their own inside the editor. */
     static constexpr int kCellChordRows =
         1 + static_cast<int>(kDegreeCount);
+
+    /* Where saved progressions and preferences are kept. The path itself is
+     * only resolved when something is actually saved. */
+    StorageMode fStorageMode    = kStorageUser;
+    char        fStoragePath[256] = {0};
 
     /* How many beats the grid shows. Not the loop length - a section plays its
      * own length, which is free to be shorter. */
