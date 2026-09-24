@@ -495,6 +495,11 @@ protected:
             return true;
         }
 
+        if (fMergeDrag) {
+            fMergeDrag = false;
+            return true;
+        }
+
         /* Dropping a dragged chord, or opening the menu on a cell that was
          * pressed and released without moving. */
         if (fScreen == kScreenProgressions && progRelease())
@@ -573,6 +578,12 @@ protected:
          * rebuilds held groups at the new octave, so the chord travels. */
         if (fSliderDrag) {
             sliderTo(ev.pos.getY());
+            return true;
+        }
+
+        if (fMergeDrag) {
+            mergeTo(ev.pos.getX());
+            repaint();
             return true;
         }
 
@@ -1447,7 +1458,98 @@ protected:
         }
 
         drawPedalRow(a.y + a.h + 24.0f);
-        drawStorageRow(a.y + a.h + 82.0f);
+        drawMergeRow(a.y + a.h + 82.0f);
+        drawStorageRow(a.y + a.h + 140.0f);
+    }
+
+    /*
+     * How close two triggers must be to sound together.
+     *
+     * Two chords a few milliseconds apart are one musical event - a drag
+     * crossing a cell boundary, or two fingers landing together - and stopping
+     * the first to start the second clips a note that has barely sounded.
+     * Inside the window both are sent and the instrument resolves the overlap.
+     *
+     * Adjustable because the right value depends on the player: a fast run
+     * wants a short window so genuinely separate chords stay separate. Zero
+     * turns it off, which is exactly the old behaviour.
+     */
+    void drawMergeRow(float labelY)
+    {
+        const Button a = keyboardArea();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(11.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.62f, 0.66f, 0.72f));
+        text(a.x, labelY, "Merge chords struck within:", nullptr);
+
+        const Button bar = mergeBarRect();
+
+        beginPath();
+        roundedRect(bar.x, bar.y, bar.w, bar.h, 4.0f);
+        fillColor(Color(0.13f, 0.14f, 0.18f));
+        fill();
+        strokeColor(Color(0.28f, 0.30f, 0.36f));
+        strokeWidth(1.0f);
+        stroke();
+
+        /* The filled portion, as a fraction of the maximum. */
+        const float frac = static_cast<float>(fMergeWindowMs) /
+                           static_cast<float>(kMergeWindowMsMax);
+        if (frac > 0.0f) {
+            beginPath();
+            roundedRect(bar.x, bar.y, bar.w * frac, bar.h, 4.0f);
+            fillColor(Color(0.24f, 0.40f, 0.56f));
+            fill();
+        }
+
+        char buf[32];
+        if (fMergeWindowMs <= 0)
+            std::snprintf(buf, sizeof buf, "off");
+        else
+            std::snprintf(buf, sizeof buf, "%d ms", fMergeWindowMs);
+
+        fontSize(10.0f);
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+        fillColor(Color(0.88f, 0.92f, 0.97f));
+        text(bar.x + bar.w * 0.5f, bar.y + bar.h * 0.5f, buf, nullptr);
+
+        fontSize(9.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.45f, 0.49f, 0.57f));
+        text(bar.x + bar.w + 12.0f, bar.y + bar.h * 0.5f,
+             "0 replaces immediately; higher overlaps more", nullptr);
+    }
+
+    Button mergeBarRect() const
+    {
+        const Button a = keyboardArea();
+        return { a.x, a.y + a.h + 92.0f, 210.0f, 24.0f };
+    }
+
+    /* Set the merge window from a pointer position along the bar. Rounded to
+     * 5ms: the difference between 17 and 18 is not audible, and round numbers
+     * are easier to talk about. */
+    void mergeTo(double px)
+    {
+        const Button bar = mergeBarRect();
+
+        float frac = (static_cast<float>(px) - bar.x) / bar.w;
+        if (frac < 0.0f) frac = 0.0f;
+        if (frac > 1.0f) frac = 1.0f;
+
+        const int raw = static_cast<int>(frac * kMergeWindowMsMax + 0.5f);
+        const int ms  = (raw / 5) * 5;
+
+        if (ms == fMergeWindowMs)
+            return;
+
+        fMergeWindowMs = ms;
+
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%d", fMergeWindowMs);
+        setState("mergeWindowMs", buf);
     }
 
     /*
@@ -1506,7 +1608,7 @@ protected:
     Button storageButton() const
     {
         const Button a = keyboardArea();
-        return { a.x, a.y + a.h + 92.0f, 210.0f, 24.0f };
+        return { a.x, a.y + a.h + 150.0f, 210.0f, 24.0f };
     }
 
     /* The path the current mode resolves to, for display. */
@@ -3111,49 +3213,23 @@ protected:
                      fSingleNotes ? Color(0.20f, 0.48f, 0.52f)
                                   : Color(0.38f, 0.30f, 0.58f),
                      true);
-        /*
-         * Which chord tone is in the bass.
-         *
-         * The label reports the SETTING, not whether it happens to be acting
-         * right now. Plain glide suspends voice leading for the duration - a
-         * re-inversion cannot ride a single bend - but the setting is still
-         * auto, and it resumes the moment glide goes off or to MPE. Labelling
-         * that suspension as "FIRST" was a lie that cost real debugging time:
-         * the button read FIRST while leading was quietly producing B-E-G for
-         * an Em, and clicking it jumped to SECOND because the handler believed
-         * its own label and skipped the state it claimed to already be in.
-         *
-         * "(HELD)" marks the suspension without pretending the setting changed.
-         *
-         * Lit for a CHOSEN bass, grey for auto - the opposite of what it was.
-         * Green here means "you are holding this", which is true of first,
-         * second and third and not of auto, where the plugin is deciding.
-         */
-        drawButton(voiceLeadButton(),
-                   fVoiceLeading
-                       ? (fGlideMode == kGlideOn ? "ROOT: AUTO (HELD)"
-                                                 : "ROOT: AUTO")
-                       : kBassNoteName[fBassNote],
-                   ! fVoiceLeading);
 
         /*
-         * Say why AUTO is missing from the cycle while plain glide is on,
-         * rather than letting the user click round and round wondering where
-         * it went. The reason is real and not obvious: a single pitch bend
-         * moves every voice by the same interval, so it cannot express a
-         * re-inversion, and voice leading re-inverts by design.
+         * Which chord tone is in the bass: auto, or one the user names.
+         *
+         * All four states are always available now. They were not while plain
+         * glide existed - it suspended voice leading, so AUTO was dead for as
+         * long as it was on, and the button carried a "(HELD)" label and a
+         * warning line explaining why. Removing that mode removed the whole
+         * apparatus.
+         *
+         * Lit for a CHOSEN bass, grey for auto: green means "you are holding
+         * this", which is true of first, second and third and not of auto,
+         * where the plugin is deciding.
          */
-        if (fGlideMode == kGlideOn) {
-            const Button vb = voiceLeadButton();
-            fontFace(NANOVG_DEJAVU_SANS_TTF);
-            fontSize(9.0f);
-            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-            fillColor(Color(0.62f, 0.55f, 0.35f));
-            /* Short enough to fit beside the button at the narrowest window
-             * the layout is checked at - the longer wording clipped. */
-            text(vb.x + vb.w + 8.0f, vb.y + vb.h * 0.5f,
-                 "auto: glide off/MPE", nullptr);
-        }
+        drawButton(voiceLeadButton(),
+                   fVoiceLeading ? "ROOT: AUTO" : kBassNoteName[fBassNote],
+                   ! fVoiceLeading);
 
         /*
          * Row 2 differs by screen: the wheel wants per-ring extensions and
@@ -3510,6 +3586,14 @@ protected:
                 repaint();
                 return true;
             }
+            /* The merge bar is set by clicking along it, and keeps receiving
+             * motion so it can be dragged. */
+            if (hit(mergeBarRect(), px, py)) {
+                fMergeDrag = true;
+                mergeTo(px);
+                repaint();
+                return true;
+            }
             const int pc = hitKey(px, py);
             if (pc >= 0) {
                 fEditKey  = pc;
@@ -3606,37 +3690,16 @@ protected:
         }
 
         /* Glide cycles off -> on -> MPE -> off. */
+        /*
+         * Glide toggles off and MPE. It used to carry a third state and a
+         * block of bookkeeping: plain glide suspended voice leading, so
+         * entering it had to stash the ROOT setting and leaving it had to put
+         * that setting back. With the mode gone, so is all of that.
+         */
         if (hit(glideButton(), px, py)) {
-            const GlideMode was = fGlideMode;
             fGlideMode = static_cast<GlideMode>((fGlideMode + 1) % kGlideModeCount);
             std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(fGlideMode));
             setState("glideMode", buf);
-
-            /*
-             * Plain glide cannot carry a re-inversion, so it suspends voice
-             * leading - which makes ROOT: AUTO meaningless for as long as it
-             * is on. Rather than leave a setting showing that nothing obeys,
-             * entering that mode falls back to the last bass the user chose,
-             * and leaving it puts auto back.
-             *
-             * The remembered value is the user's own last pick, not a default,
-             * so the button returns to where they left it instead of resetting
-             * to FIRST each time glide is cycled.
-             */
-            if (fGlideMode == kGlideOn && was != kGlideOn) {
-                fLeadBeforeGlide = fVoiceLeading;
-                if (fVoiceLeading) {
-                    fVoiceLeading = false;
-                    fBassNote     = fLastManualBass;
-                    pushRootChoice();
-                }
-            } else if (was == kGlideOn && fGlideMode != kGlideOn) {
-                if (fLeadBeforeGlide && ! fVoiceLeading) {
-                    fVoiceLeading = true;
-                    pushRootChoice();
-                }
-            }
-
             repaint();
             return true;
         }
@@ -3682,42 +3745,23 @@ protected:
              * SECOND, so FIRST was unreachable by clicking.
              */
             /*
-             * Plain glide suspends voice leading, so AUTO is dead while it is
-             * on - offering it would put the button in a state that does
-             * nothing. The cycle therefore skips it and runs first -> second
-             * -> third -> first, which are all live: applyBassNote still runs
-             * under glide, only applyVoiceLeading does not.
+             * auto -> first -> second -> third -> auto, unconditionally.
              *
-             * Disabling the whole control would be wrong for the same reason:
-             * three of its four states work perfectly well under glide.
+             * AUTO used to be skipped while plain glide was on, because that
+             * mode suspended voice leading and offering a dead state would
+             * have been another lie. Nothing suspends leading now, so all four
+             * states are always live.
              */
-            const bool autoAvailable = (fGlideMode != kGlideOn);
-
             if (fVoiceLeading) {
                 fVoiceLeading = false;
                 fBassNote     = kBassFirst;
             } else if (fBassNote == kBassNoteCount - 1) {
-                if (autoAvailable) {
-                    fVoiceLeading = true;      /* wrap back to auto */
-                    fBassNote     = kBassFirst;
-                } else {
-                    fBassNote     = kBassFirst;   /* straight back to first */
-                }
+                fVoiceLeading = true;          /* wrap back to auto */
+                fBassNote     = kBassFirst;
             } else {
                 fVoiceLeading = false;
                 fBassNote     = static_cast<BassNote>(fBassNote + 1);
             }
-
-            /* Remember a hand-picked bass so that glide suspending auto comes
-             * back to it. Auto itself is not remembered here - it is not a
-             * bass, and fLeadBeforeGlide already tracks it. */
-            if (! fVoiceLeading)
-                fLastManualBass = fBassNote;
-
-            /* Choosing by hand while glide holds auto off means the user has
-             * decided; leaving glide should no longer restore auto over it. */
-            if (fGlideMode == kGlideOn)
-                fLeadBeforeGlide = fVoiceLeading;
 
             pushRootChoice();
             repaint();
@@ -4335,18 +4379,15 @@ protected:
             fSingleNotes = (v != 0);
         else if (std::strcmp(key, "voiceLeading") == 0)
             fVoiceLeading = (v != 0);
-        else if (std::strcmp(key, "bassNote") == 0) {
+        else if (std::strcmp(key, "bassNote") == 0)
             fBassNote = clampEnum<BassNote>(v, kBassNoteCount);
-            /* Restoring a hand-picked bass makes it the one glide returns to,
-             * so suspending and resuming auto lands where the session left
-             * off rather than on FIRST. */
-            if (! fVoiceLeading)
-                fLastManualBass = fBassNote;
-        }
         else if (std::strcmp(key, "pedalAction") == 0)
             fPedalAction = clampEnum<PedalAction>(v, kPedalActionCount);
         else if (std::strcmp(key, "storageMode") == 0)
             fStorageMode = clampEnum<StorageMode>(v, kStorageModeCount);
+        else if (std::strcmp(key, "mergeWindowMs") == 0)
+            fMergeWindowMs = (v < 0) ? 0
+                           : (v > kMergeWindowMsMax) ? kMergeWindowMsMax : v;
         else if (std::strcmp(key, "progLegato") == 0)
             fProgLegato = (v != 0);
         else if (std::strcmp(key, "progRunning") == 0)
@@ -4495,7 +4536,7 @@ private:
 
     /* Mirrors of DSP settings, so the UI can render them and toggle them. */
     bool      fLatchEnabled = false;
-    GlideMode fGlideMode    = kGlideOn;
+    GlideMode fGlideMode    = kGlideMpe;
 
     /* Per-ring, never per cell: uniform shape within a ring is what makes
      * single-bend glide valid. */
@@ -4597,6 +4638,11 @@ private:
      * only resolved when something is actually saved. */
     StorageMode fStorageMode    = kStorageUser;
     char        fStoragePath[256] = {0};
+
+    /* How close two triggers must be to sound together rather than one
+     * replacing the other. */
+    int  fMergeWindowMs = kMergeWindowMsDefault;
+    bool fMergeDrag     = false;
 
     /* How many beats the grid shows. Not the loop length - a section plays its
      * own length, which is free to be shorter. */
@@ -4712,13 +4758,6 @@ private:
     bool     fVoiceLeading = true;
     BassNote fBassNote     = kBassFirst;
 
-    /* The last bass the user picked by hand, so that suspending auto for the
-     * duration of plain glide returns to their choice rather than to FIRST. */
-    BassNote fLastManualBass = kBassFirst;
-
-    /* Whether auto was set before plain glide suspended it, so leaving glide
-     * can put it back without guessing. */
-    bool     fLeadBeforeGlide = true;
 
     /* Octave for pointer and touch input. Mirrors the DSP's setting; a played
      * MIDI note carries its own octave instead. */

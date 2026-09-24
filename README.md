@@ -5,6 +5,42 @@ nested wheel to fire a chord; drag between positions to glide between roots.
 
 It emits **MIDI only** — no audio. A downstream instrument makes the sound.
 
+## Read this before you install it
+
+**This is AI slop.** Nearly every line of this plugin was written by an AI at
+my direction. I am not a C++ developer and I did not review most of it
+line-by-line.
+
+**I have no musical ability.** That is the entire reason this exists. I wanted
+something that would let me write chord progressions without knowing what a
+chord progression is. If you already understand music theory you almost
+certainly want a better tool, written by someone who does.
+
+**It is a bag of bugs.** Not "might have a few rough edges" — an actual bag of
+bugs. Every session of work on it turns up things that were silently wrong:
+chords that sounded notes outside the key, a PLAY button that did nothing
+because a state key was never registered, whole columns of the UI lighting up
+for no reason, settings that reverted the moment you touched a different
+control. Those particular ones are fixed. The next ones are not, because I have
+not found them yet.
+
+**Use at your own risk.** Specifically:
+
+- It can emit MIDI you did not ask for. Do not put it in front of anything
+  expensive or loud without checking what comes out.
+- Saved state may not survive. Do not rely on it to hold a progression you care
+  about.
+- There is no upgrade path, no versioning discipline and no promise that a
+  session saved today opens tomorrow.
+- Nobody is on the other end of a bug report. I fix things when they annoy me.
+
+If that is fine with you, it is genuinely fun to play with, and the tests that
+do exist are real — see `dev/run-tests.sh`. Six suites, and every one of them
+was written because something was actually broken.
+
+The name means nothing. See [docs/lore.md](docs/lore.md) for three invented
+explanations, none of which are true.
+
 ## Quick start
 
 Open the folder in DevPod (from WSL, not from a remote repo URL):
@@ -29,12 +65,32 @@ bash dev/build.sh --install   # build and install for local Linux hosts
 | `src/FortyFifthPlugin.cpp` | MIDI generation, glide state machine |
 | `src/FortyFifthUI.cpp` | Nested-ring wheel, hit-testing, visual feedback |
 | `dev/build.sh` | Build + install helper |
+| `dev/run-tests.sh` | All six test suites; run this before believing anything |
 | `docs/spec.md` | Full development specification |
 | `docs/BUILDING.md` | Cross-compiling for Windows |
+| `docs/lore.md` | Invented backstory for the name |
+| `docs/db-plan.md` | Plan for saved progressions; not built yet |
+
+## What it does
+
+Four screens:
+
+- **⚙ Setup** — what each keyboard key does, the sustain pedal's action, the
+  merge window, and where saved data will live.
+- **Circle** — the wheel. Click a cell to sound a chord, drag to move between
+  them.
+- **Slide** — the same chords as vertical strips, laid out by scale degree, for
+  touch.
+- **Progressions** — a step sequencer. One cell per beat, one row per section,
+  sections chaining A→B→C→D. Synced to the host transport, so it only runs when
+  your DAW is rolling.
+
+Chords are stored as scale **degrees**, not as notes, so changing the key
+transposes everything without rewriting it.
 
 ## The one rule worth knowing
 
-Chord type, velocity, note length, glide on/off and glide time are **not**
+Chord type, velocity, note length, glide mode and glide time are **not**
 automatable plugin parameters. They are live state, read at the moment of a
 gesture and baked into concrete MIDI events.
 

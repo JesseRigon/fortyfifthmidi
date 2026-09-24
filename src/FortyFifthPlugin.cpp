@@ -163,6 +163,7 @@ protected:
         kStateProgLegato,
         kStateUiScreen,
         kStateStorageMode,
+        kStateMergeWindowMs,
         kStateCount
     };
 
@@ -324,6 +325,11 @@ protected:
                 state.label = "Storage Location";
                 state.defaultValue = "0";
                 break;
+            case kStateMergeWindowMs:
+                state.key = "mergeWindowMs";
+                state.label = "Merge Window (ms)";
+                state.defaultValue = "20";
+                break;
         }
     }
 
@@ -448,6 +454,9 @@ protected:
             fStorageMode = static_cast<StorageMode>(
                 ((v % kStorageModeCount) + kStorageModeCount)
                 % kStorageModeCount);
+        else if (std::strcmp(key, "mergeWindowMs") == 0)
+            fMergeWindowMs = (v < 0) ? 0
+                           : (v > kMergeWindowMsMax) ? kMergeWindowMsMax : v;
         else if (std::strcmp(key, "progRunning") == 0) {
             const bool want = (v != 0);
             if (want != fProgRunning.load(std::memory_order_acquire)) {
@@ -557,6 +566,7 @@ protected:
             v = fUiScreen.load(std::memory_order_acquire);
         else if (std::strcmp(key, "storageMode") == 0)
             v = static_cast<int>(fStorageMode);
+        else if (std::strcmp(key, "mergeWindowMs") == 0) v = fMergeWindowMs;
 
         std::snprintf(buf, sizeof(buf), "%d", v);
         return String(buf);
@@ -640,6 +650,17 @@ protected:
 
         if (fGlideActive)
             advanceGlide(frames);
+
+        /* Age every sounding group, for the merge window. Counted in frames
+         * rather than from a clock so it follows the host's own timeline, and
+         * saturating rather than wrapping - a group held for half an hour must
+         * not suddenly look newly started. */
+        for (int i = 0; i < kMaxGroups; ++i) {
+            if (! fGroup[i].active)
+                continue;
+            if (fGroup[i].age < 0xFFFFFFFFu - frames)
+                fGroup[i].age += frames;
+        }
 
         /* Fixed-length mode: the countdown, not the release, ends the note. */
         if (! fHoldToSustain && fNoteOffCountdown > 0) {
@@ -784,6 +805,10 @@ private:
          * Note-off has to find the group its own note began, which source
          * alone cannot identify once two octaves play the same cell. */
         int       midiNote  = -1;
+        /* Frames of audio since this group started, counted in run(). Used to
+         * decide whether a following trigger is close enough to merge with it
+         * rather than replace it. */
+        uint32_t  age       = 0;
         /* Key released, but the sustain pedal is holding the sound on. */
         bool      deferred  = false;
     };
@@ -879,6 +904,7 @@ private:
         g->mpe      = mpe;
         g->octave   = octave;
         g->midiNote = midiNote;
+        g->age      = 0;
 
         for (int i = 0; i < n; ++i) {
             const uint8_t note = notes[i];
@@ -1173,14 +1199,32 @@ private:
                     canGlideBetween(g, type, root, r, g->octave);
 
                 if (! canGlide) {
-                    /* Retrigger cleanly (spec 6.2 step 5). Shared pitches are
+                    /*
+                     * Retrigger cleanly (spec 6.2 step 5). Shared pitches are
                      * resent so the new chord attacks properly. Keep the
                      * group's own octave: a move must not relocate a chord the
-                     * keyboard placed in a particular octave. */
+                     * keyboard placed in a particular octave.
+                     *
+                     * Unless the previous chord only just started. Two
+                     * triggers within the merge window are one gesture - a
+                     * drag crossing a cell boundary, or two fingers landing
+                     * together - and stopping the first would clip a note a
+                     * few milliseconds old. Inside the window the new chord
+                     * JOINS the old rather than replacing it, and the
+                     * instrument sorts out the overlap.
+                     */
                     const uint8_t vel  = g->velocity;
                     const int     oct  = g->octave;
                     const int     note = g->midiNote;
-                    stopGroup(0, g);
+
+                    if (! withinMergeWindow(g)) {
+                        stopGroup(0, g);
+                    } else {
+                        /* Left sounding, so its source must stop naming this
+                         * drag or the next move would try to move it again. */
+                        g->source = kMergedSource;
+                    }
+
                     startGroup(0, source, root, type, r, vel, true, oct, note);
                     fDragSource = source;
                     break;
@@ -1726,31 +1770,19 @@ private:
     }
 
     /*
-     * Is voice leading in force right now?
+     * Is voice leading in force right now? Always, since plain glide went.
      *
-     * Leading and single-bend glide cannot both apply. Leading works by
-     * re-inverting a chord to sit near the last one, and a re-inversion moves
-     * voices by DIFFERENT intervals - which is exactly what one pitch bend
-     * cannot express. Left to fight, leading wins every time and non-MPE glide
-     * silently degrades into a retrigger on every move.
+     * It used to be suspended during single-bend glide, because leading
+     * re-inverts a chord and a re-inversion moves voices by DIFFERENT
+     * intervals - which one channel-wide pitch bend cannot express. With that
+     * mode gone the conflict is gone: glide off retriggers anyway, and MPE
+     * gives every voice its own channel, so any voicing is reachable.
      *
-     * So the modes divide the work honestly:
-     *
-     *   glide off   leading applies. Retriggers are already the behaviour, and
-     *               smooth voicing is pure gain.
-     *   glide on    leading is suspended, so chords stay in root position and a
-     *               uniform bend genuinely reaches them. Smooth pitch movement
-     *               is what the user asked for by turning glide on.
-     *   glide MPE   leading applies. Each voice owns a channel and bends
-     *               independently, so any voicing is reachable - both features
-     *               work at once.
-     *
-     * The rule underneath: never let the bend lie about where the notes land.
+     * Kept as a function rather than inlined at its call sites because it
+     * names the question, and because the answer was genuinely conditional
+     * until recently.
      */
-    bool leadingAppliesNow() const
-    {
-        return fGlideMode != kGlideOn;
-    }
+    bool leadingAppliesNow() const { return true; }
 
     /*
      * The one definition of what notes a cell produces.
@@ -1935,50 +1967,45 @@ private:
     /*
      * Can a move from one chord to another be carried by a glide?
      *
-     *   off  never.
-     *   on   a SINGLE bend moves every voice by the same interval, so it can
-     *        only express a move that is itself uniform: the same interval
-     *        pattern AND the same inversion. Voice leading deliberately
-     *        re-inverts chords to keep them close, so with it on a bend is
-     *        valid only where the leading happened to leave the inversion
-     *        alone. Otherwise the chord would arrive at pitches the bend cannot
-     *        reach, which is worse than a clean retrigger.
-     *   mpe  every voice has its own channel and bends independently, so any
-     *        chord can reach any other regardless of inversion.
+     *   off  never - a retrigger is the behaviour.
+     *   mpe  always. Every voice has its own channel and bends independently,
+     *        so any chord reaches any other regardless of shape or inversion.
+     *
+     * This used to carry a third case, and most of its length: a single
+     * channel-wide bend moves every voice by the same interval, so it could
+     * only express a move that was itself uniform, and the function had to
+     * build the target chord and verify that every voice moved by the same
+     * delta. That mode is gone, and the check with it.
      */
-    bool canGlideBetween(const VoiceGroup* from, ChordType toType,
-                         int toRoot, Ring toRing, int toOctave) const
+    bool canGlideBetween(const VoiceGroup* from, ChordType, int, Ring, int) const
     {
-        if (fGlideMode == kGlideOff || from == nullptr)
-            return false;
-        if (fGlideMode == kGlideMpe)
-            return true;
-        if (! sameShape(from->type, toType))
-            return false;
-
-        /*
-         * Belt and braces. leadingAppliesNow() suspends voice leading in this
-         * mode, so the target should always be reachable by a uniform bend -
-         * but rather than trust that, build the chord the way startGroup will
-         * and check. If the two ever diverge a retrigger is the safe answer:
-         * a bend that cannot reach its target leaves the chord audibly wrong,
-         * where a retrigger is merely less smooth.
-         */
-        uint8_t want[kMaxGroupNotes];
-        const int n = buildCellChord(toRoot, toType, toRing, toOctave, want);
-
-        if (n != from->count)
-            return false;
-
-        const int delta = static_cast<int>(want[0]) -
-                          static_cast<int>(from->note[0]);
-        for (int i = 1; i < n; ++i) {
-            if (static_cast<int>(want[i]) -
-                static_cast<int>(from->note[i]) != delta)
-                return false;
-        }
-        return true;
+        return fGlideMode == kGlideMpe && from != nullptr;
     }
+
+    /*
+     * Did this group start recently enough to treat the next trigger as part
+     * of the same gesture?
+     *
+     * Two chords a few milliseconds apart are one musical event - a drag
+     * crossing a cell boundary, two fingers landing together - and stopping
+     * the first to start the second clips a note that has barely sounded.
+     * Inside the window both are left to sound and the instrument resolves
+     * the overlap.
+     */
+    bool withinMergeWindow(const VoiceGroup* g) const
+    {
+        if (g == nullptr || fMergeWindowMs <= 0)
+            return false;
+
+        const uint32_t windowFrames = static_cast<uint32_t>(
+            fMergeWindowMs * fSampleRate / 1000.0);
+        return g->age < windowFrames;
+    }
+
+    /* A group left sounding by a merge. It no longer answers to the drag that
+     * created it - a later move must not try to move it again - but it is
+     * still a live group and is released with everything else. */
+    static constexpr int kMergedSource = -2;
 
     /*
      * A ring's quality is fixed; the per-ring extension builds on it.
@@ -2109,8 +2136,11 @@ private:
      * rather than resetting to root position. */
     uint8_t   fLastChord[kMaxGroupNotes] = {0};
     int       fLastChordCount = 0;
-    GlideMode fGlideMode      = kGlideOn;
+    GlideMode fGlideMode      = kGlideMpe;
     int       fGlideTimeMs    = 120;
+    /* How close two triggers must be to sound together rather than one
+     * replacing the other. See withinMergeWindow(). */
+    int       fMergeWindowMs  = kMergeWindowMsDefault;
     int       fBendRange      = 12;
 
     /* ---- runtime voicing state -------------------------------------------- */
@@ -2167,7 +2197,7 @@ private:
 
     /* Glide's last on-state, so a toggle restores MPE rather than demoting a
      * player to plain glide. */
-    GlideMode fGlideWasOn = kGlideOn;
+    GlideMode fGlideWasOn = kGlideMpe;
 
     /* Set when a key or pedal changed a setting, so the UI can re-read it and
      * keep its buttons honest. */

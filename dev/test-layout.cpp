@@ -177,9 +177,15 @@ static void checkRootCycle()
     enum { kFirst = 0, kSecond, kThird, kBassCount };
     static const char* kName[kBassCount] = { "FIRST", "SECOND", "THIRD" };
 
-    /* Run the cycle with glide ON, where leading is suspended - the case that
-     * was broken. Every state must be reachable and labelled for what it is. */
-    for (int glideOn = 0; glideOn <= 1; ++glideOn) {
+    /*
+     * Run it in each glide mode. Both must behave identically now: the mode
+     * that suspended voice leading is gone, so nothing makes AUTO unreachable
+     * and the cycle no longer has a conditional in it.
+     *
+     * Kept as a loop over modes rather than simplified to one pass, because
+     * the thing worth asserting is that the mode does NOT matter.
+     */
+    for (int mode = 0; mode <= 1; ++mode) {   /* 0 = off, 1 = MPE */
         bool leading = true;   /* the plugin's default */
         int  bass    = kFirst;
 
@@ -214,7 +220,7 @@ static void checkRootCycle()
         const bool wrapped = leading && bass == kFirst;
 
         char d[192];
-        std::snprintf(d, sizeof d, "%s (glide %s)", trail, glideOn ? "on" : "off");
+        std::snprintf(d, sizeof d, "%s (glide %s)", trail, mode ? "MPE" : "off");
         ok("cycle reaches all four states", allRight && wrapped, d);
     }
 }
@@ -274,6 +280,57 @@ static void checkTabs()
     ok("the tab bar fits the window", last.x + last.w <= 520.0f, d);
 }
 
+/*
+ * The merge-window bar: pointer position to milliseconds.
+ *
+ * Transcribed from FortyFifthUI::mergeTo() for the same reason as everything
+ * else here. What matters is that the ends are reachable - a bar whose
+ * left end cannot reach 0 has no "off", and whose right end cannot reach the
+ * maximum quietly caps below what the label promises.
+ */
+static void checkMergeWindow()
+{
+    std::printf("\n-- merge window --\n");
+
+    const float barX = 62.0f, barW = 210.0f;
+    const int   kMax = 200;
+
+    auto msAt = [&](float px) {
+        float frac = (px - barX) / barW;
+        if (frac < 0.0f) frac = 0.0f;
+        if (frac > 1.0f) frac = 1.0f;
+        const int raw = (int)(frac * kMax + 0.5f);
+        return (raw / 5) * 5;
+    };
+
+    char d[96];
+
+    std::snprintf(d, sizeof d, "%d ms", msAt(barX));
+    ok("the left end is off", msAt(barX) == 0, d);
+
+    std::snprintf(d, sizeof d, "%d ms", msAt(barX + barW));
+    ok("the right end reaches the maximum", msAt(barX + barW) == kMax, d);
+
+    /* Clicking outside the bar must clamp rather than run negative or past
+     * the maximum - a drag routinely leaves the control. */
+    ok("left of the bar clamps to 0", msAt(barX - 50.0f) == 0, "clamped");
+    ok("right of the bar clamps to max",
+       msAt(barX + barW + 50.0f) == kMax, "clamped");
+
+    /* Every value is a multiple of five, so the readout is speakable. */
+    bool rounded = true;
+    for (float px = barX; px <= barX + barW; px += 1.0f)
+        if (msAt(px) % 5 != 0) rounded = false;
+    ok("every step is a multiple of 5", rounded, "no 17ms");
+
+    /* The default must be reachable by dragging, or it could be set once and
+     * never restored. */
+    bool reachable = false;
+    for (float px = barX; px <= barX + barW; px += 0.5f)
+        if (msAt(px) == 20) reachable = true;
+    ok("the default is reachable", reachable, "20 ms");
+}
+
 int main()
 {
     report("default size");
@@ -301,6 +358,7 @@ int main()
 
     checkRootCycle();
     checkTabs();
+    checkMergeWindow();
 
     std::printf("\n%s (%d failure%s)\n", fails ? "FAIL" : "PASS",
                 fails, fails == 1 ? "" : "s");

@@ -302,7 +302,7 @@ int main()
              * does. */
             static const char* const kNeeded[] = {
                 "progression", "progRunning", "progLegato",
-                "uiScreen", "storageMode",
+                "uiScreen", "storageMode", "mergeWindowMs",
                 "keyMap", "pedalAction", "bassNote", "voiceLeading",
             };
 
@@ -461,6 +461,7 @@ int main()
                     "keyMap", "progression", "octave", "latch", "glideMode",
                     "selectedKey", "singleNotes", "voiceLeading", "bassNote",
                     "pedalAction", "storageMode", "progLegato", "progRunning",
+                    "mergeWindowMs",
                     "uiScreen",
                 };
 

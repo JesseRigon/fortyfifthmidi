@@ -1089,24 +1089,45 @@ inline CellRole roleInKey(int position, Ring ring, int keyIndex)
  * How a move between two selections is voiced.
  *
  *   kGlideOff   retrigger at the new chord immediately.
- *   kGlideOn    single uniform pitch bend - only possible when the chord shape
- *               is unchanged, since every voice must move by the same interval.
- *               A shape change (C major to Em, or to B dim) falls back to a
- *               clean retrigger.
- *   kGlideMpe   one MIDI channel per voice, so voices can bend independently
- *               and ANY chord can glide to any other. Requires an MPE-capable
+ *   kGlideMpe   one MIDI channel per voice, so voices bend independently and
+ *               ANY chord can glide to any other. Requires an MPE-capable
  *               instrument downstream.
+ *
+ * THE MIDDLE MODE IS GONE. A single channel-wide pitch bend moves every voice
+ * by the same interval, so it could only express a move between chords of
+ * identical shape AND inversion - and it forced everything else to accommodate
+ * that: extensions had to be uniform across a whole ring, and voice leading
+ * had to be suspended whenever it was on, because a re-inversion cannot ride
+ * one bend.
+ *
+ * Removing it lets chords be chosen per cell and lets voice leading always
+ * apply. Overlapping chords are now the instrument's job: both are sent, and
+ * two triggers falling within the merge window are treated as one so a change
+ * does not clip. See kMergeWindowMs.
  */
 enum GlideMode {
     kGlideOff = 0,
-    kGlideOn,
     kGlideMpe,
     kGlideModeCount
 };
 
 static constexpr const char* kGlideModeName[kGlideModeCount] = {
-    "GLIDE: OFF", "GLIDE: ON", "GLIDE: MPE"
+    "GLIDE: OFF", "GLIDE: MPE"
 };
+
+/*
+ * How close two triggers must be to count as one gesture, in milliseconds.
+ *
+ * Without this, two chords struck at nearly the same moment - a drag crossing
+ * a cell boundary, or two fingers on a touchscreen - produce a note-off and a
+ * note-on a few milliseconds apart, which clips audibly. Inside the window the
+ * second chord joins the first instead of replacing it.
+ *
+ * Adjustable because the right value depends on the player and the instrument:
+ * a fast run wants a short window so genuinely separate chords stay separate.
+ */
+static constexpr int kMergeWindowMsDefault = 20;
+static constexpr int kMergeWindowMsMax     = 200;
 
 /*
  * Minor-ring labels, cell by cell. Spelled theoretically rather than simplified -
