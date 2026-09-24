@@ -181,6 +181,98 @@ int main()
         ok("the same degree moves with the key", posC != posG, d);
     }
 
+    std::printf("\n=== loading a preset at a chosen beat ===\n");
+    {
+        Progression p;
+        loadPreset(p, 2, 0);            /* ii-V-I, three beats */
+
+        char d[96];
+        std::snprintf(d, sizeof d, "length %d", p.section[0].length);
+        ok("a plain load starts at the first beat",
+           p.section[0].length == 3 &&
+           p.section[0].cell[0].degree == kDegreeII, d);
+
+        /* Append the same three beats from beat four: the section grows to six
+         * and the original three are untouched. */
+        loadPresetAt(p, 2, 0, 3);
+
+        std::snprintf(d, sizeof d, "length %d", p.section[0].length);
+        ok("loading at a beat extends the section",
+           p.section[0].length == 6, d);
+
+        ok("what was already there is kept",
+           p.section[0].cell[0].degree == kDegreeII &&
+           p.section[0].cell[1].degree == kDegreeV  &&
+           p.section[0].cell[2].degree == kDegreeI, "first phrase intact");
+
+        ok("the preset lands at the chosen beat",
+           p.section[0].cell[3].degree == kDegreeII &&
+           p.section[0].cell[5].degree == kDegreeI, "second phrase at beat 4");
+
+        /* Loading into the middle of a LONGER section must not truncate it. */
+        Progression q;
+        q.count = 1;
+        q.section[0].length = 8;
+        for (int i = 0; i < 8; ++i) {
+            q.section[0].cell[i].filled = true;
+            q.section[0].cell[i].degree = kDegreeVI;
+        }
+        loadPresetAt(q, 2, 0, 1);    /* three beats, from beat two */
+
+        std::snprintf(d, sizeof d, "length %d", q.section[0].length);
+        ok("a shorter preset does not shorten the section",
+           q.section[0].length == 8, d);
+        ok("the tail past the preset survives",
+           q.section[0].cell[7].degree == kDegreeVI, "beat 8 still vi");
+    }
+
+    std::printf("\n=== dragging a chord between cells ===\n");
+    {
+        Progression p;
+        loadPreset(p, 0, 0);    /* I-V-vi-IV */
+
+        /* Move beat 1 to beat 3: beat 3 becomes I and beat 1 becomes a rest. */
+        ok("a move succeeds", p.moveCell(0, 0, 0, 2, false), "beat 1 -> 3");
+        ok("the chord arrives", p.section[0].cell[2].filled &&
+           p.section[0].cell[2].degree == kDegreeI, "beat 3 is I");
+        ok("a move leaves a rest behind",
+           ! p.section[0].cell[0].filled, "beat 1 empty");
+
+        /* A copy leaves the source alone. */
+        Progression q;
+        loadPreset(q, 0, 0);
+        ok("a copy keeps the source", q.moveCell(0, 1, 0, 3, true) &&
+           q.section[0].cell[1].filled &&
+           q.section[0].cell[3].degree == kDegreeV, "beat 2 kept, beat 4 is V");
+
+        /* Dropping past the end extends the section. */
+        Progression r;
+        loadPreset(r, 0, 0);       /* four beats */
+        ok("dropping past the end extends",
+           r.moveCell(0, 0, 0, 6, false) && r.section[0].length == 7,
+           "length 7");
+
+        /* Between sections. */
+        Progression t;
+        loadPreset(t, 0, 0);
+        t.add();
+        ok("a chord moves between sections",
+           t.moveCell(0, 0, 1, 0, false) &&
+           t.section[1].cell[0].degree == kDegreeI, "A beat 1 -> B beat 1");
+
+        /* Dropping a cell on itself is not a move. */
+        Progression u;
+        loadPreset(u, 0, 0);
+        ok("dropping on itself does nothing",
+           ! u.moveCell(0, 1, 0, 1, false), "declined");
+
+        /* Out-of-range drops are refused rather than corrupting the grid. */
+        Progression v;
+        loadPreset(v, 0, 0);
+        ok("an out-of-range section is refused",
+           ! v.moveCell(0, 0, 5, 0, false), "declined");
+    }
+
     std::printf("\n=== every preset is well formed ===\n");
     {
         bool allGood = true;

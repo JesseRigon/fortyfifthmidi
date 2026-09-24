@@ -523,6 +523,11 @@ protected:
             return true;
         }
 
+        /* Dropping a dragged chord, or opening the menu on a cell that was
+         * pressed and released without moving. */
+        if (fScreen == kScreenProgressions && progRelease())
+            return true;
+
         if (fDragging) {
             fDragging = false;
             /* Position 0 rather than fActivePosition: a latch toggle clears the
@@ -598,6 +603,11 @@ protected:
             sliderTo(ev.pos.getY());
             return true;
         }
+
+        /* Before the fDragging gate: a cell drag is not a note gesture, so it
+         * never sets fDragging and would be dropped by that test. */
+        if (fScreen == kScreenProgressions)
+            return progMotion(ev.pos.getX(), ev.pos.getY());
 
         if (! fDragging)
             return false;
@@ -1634,8 +1644,8 @@ protected:
         fillColor(Color(0.40f, 0.44f, 0.52f));
         {
             char buf[32];
-            std::snprintf(buf, sizeof buf, "into %c",
-                          sectionLetter(fMenuSection));
+            std::snprintf(buf, sizeof buf, "into %c, beat %d",
+                          sectionLetter(fEditSection), fEditStep + 1);
             text(a.x + 2.0f,
                  progPresetRect(kPresetProgressionCount).y + 6.0f, buf, nullptr);
         }
@@ -1788,13 +1798,40 @@ protected:
         }
         fill();
 
-        /* Every fourth beat gets a brighter edge: a bar line, so four-four
-         * lands where the eye expects it. */
-        strokeColor(! within         ? Color(0.16f, 0.17f, 0.21f)
-                    : (step % 4 == 0) ? Color(0.38f, 0.42f, 0.50f)
-                                      : Color(0.24f, 0.26f, 0.32f));
-        strokeWidth(1.0f);
+        /*
+         * The edge carries three things, in order of urgency: where a drag
+         * would drop, which cell a preset would load into, and the bar line.
+         *
+         * The drop target has to win - it is the only one that answers a
+         * question the user is asking right now, with the pointer down.
+         */
+        const bool isDrop = (fDragCellFrom >= 0 &&
+                             fDropSection == s && fDropStep == step);
+        const bool isEdit = (fDragCellFrom < 0 &&
+                             fEditSection == s && fEditStep == step);
+
+        if (isDrop) {
+            strokeColor(Color(0.98f, 0.72f, 0.24f));
+            strokeWidth(2.0f);
+        } else if (isEdit) {
+            strokeColor(Color(0.55f, 0.75f, 0.95f));
+            strokeWidth(1.5f);
+        } else {
+            /* Every fourth beat gets a brighter edge: a bar line, so four-four
+             * lands where the eye expects it. */
+            strokeColor(! within         ? Color(0.16f, 0.17f, 0.21f)
+                        : (step % 4 == 0) ? Color(0.38f, 0.42f, 0.50f)
+                                          : Color(0.24f, 0.26f, 0.32f));
+            strokeWidth(1.0f);
+        }
         stroke();
+
+        /* The cell a drag came from reads as empty while it is in flight, so
+         * the grid shows where the chord is going rather than showing it in
+         * two places at once. */
+        if (fDragCellFrom >= 0 &&
+            fDragCellSection == s && fDragCellStep == step)
+            return;
 
         if (! within || ! cell.filled)
             return;
@@ -1845,7 +1882,14 @@ protected:
 
         for (int i = 0; i < kPresetProgressionCount; ++i) {
             if (hit(progPresetRect(i), x, y)) {
-                loadPreset(fProg, i, fMenuSection);
+                /*
+                 * Loads at the SELECTED cell, not always at the first beat.
+                 * A menu that could only replace a section from the top is a
+                 * template picker; loading where the cursor is makes it a way
+                 * to build - two four-bar phrases into one eight-bar section,
+                 * or a turnaround appended to what is already there.
+                 */
+                loadPresetAt(fProg, i, fEditSection, fEditStep);
                 pushProgression();
                 repaint();
                 return true;
@@ -1903,7 +1947,28 @@ protected:
                  */
                 if (i >= fProg.section[s].length) {
                     fProg.section[s].length = i + 1;
+                    fEditSection = s;
+                    fEditStep    = i;
                     pushProgression();
+                    repaint();
+                    return true;
+                }
+
+                /*
+                 * A filled cell arms a drag instead of opening the menu
+                 * outright. The menu still opens on release, provided the
+                 * pointer never left the cell - so a click edits and a drag
+                 * moves, without a modifier or a second gesture to learn.
+                 */
+                if (fProg.section[s].cell[i].filled) {
+                    fDragCellSection = s;
+                    fDragCellStep    = i;
+                    fDragCellFrom    = s;
+                    fDragCellMoved   = false;
+                    fDropSection     = s;
+                    fDropStep        = i;
+                    fEditSection     = s;
+                    fEditStep        = i;
                     repaint();
                     return true;
                 }
@@ -1917,6 +1982,92 @@ protected:
         }
 
         return false;
+    }
+
+    /* Which cell the pointer is over, or false when it is over none. */
+    bool progCellAt(double px, double py, int& outSection, int& outStep) const
+    {
+        const float x = static_cast<float>(px);
+        const float y = static_cast<float>(py);
+
+        for (int s = 0; s < fProg.count; ++s)
+            for (int i = 0; i < kMaxProgSteps; ++i)
+                if (hit(progCellRect(s, i), x, y)) {
+                    outSection = s;
+                    outStep    = i;
+                    return true;
+                }
+        return false;
+    }
+
+    /*
+     * Track a cell drag.
+     *
+     * The drag only counts as a drag once the pointer leaves the cell it
+     * started in - fDragCellMoved records that. Without it a plain click would
+     * end as a zero-distance move and the chord menu would never open.
+     */
+    bool progMotion(double px, double py)
+    {
+        if (fDragCellFrom < 0)
+            return false;
+
+        int s = -1, i = -1;
+        if (! progCellAt(px, py, s, i)) {
+            /* Off the grid: keep the last target rather than clearing it, so
+             * a drag that strays past the edge and comes back still drops
+             * where the user was aiming. */
+            return true;
+        }
+
+        if (s != fDragCellSection || i != fDragCellStep)
+            fDragCellMoved = true;
+
+        if (s != fDropSection || i != fDropStep) {
+            fDropSection = s;
+            fDropStep    = i;
+            repaint();
+        }
+        return true;
+    }
+
+    /* Finish a cell drag: drop it, or open the menu if it never moved. */
+    bool progRelease()
+    {
+        if (fDragCellFrom < 0)
+            return false;
+
+        const int fromS = fDragCellSection;
+        const int fromI = fDragCellStep;
+        const int toS   = fDropSection;
+        const int toI   = fDropStep;
+        const bool moved = fDragCellMoved;
+
+        fDragCellFrom    = -1;
+        fDragCellSection = -1;
+        fDragCellStep    = -1;
+        fDropSection     = -1;
+        fDropStep        = -1;
+        fDragCellMoved   = false;
+
+        if (! moved) {
+            /* A click, not a drag: edit the cell. */
+            fEditSection = fromS;
+            fEditStep    = fromI;
+            fOpenMenu    = kMenuCell;
+            repaint();
+            return true;
+        }
+
+        if (toS >= 0 && toI >= 0 &&
+            fProg.moveCell(fromS, fromI, toS, toI, false)) {
+            fEditSection = toS;
+            fEditStep    = toI;
+            pushProgression();
+        }
+
+        repaint();
+        return true;
     }
 
     /*
@@ -2798,12 +2949,28 @@ protected:
              * leading is suspended - a button reading "FIRST" would advance to
              * SECOND, so FIRST was unreachable by clicking.
              */
+            /*
+             * Plain glide suspends voice leading, so AUTO is dead while it is
+             * on - offering it would put the button in a state that does
+             * nothing. The cycle therefore skips it and runs first -> second
+             * -> third -> first, which are all live: applyBassNote still runs
+             * under glide, only applyVoiceLeading does not.
+             *
+             * Disabling the whole control would be wrong for the same reason:
+             * three of its four states work perfectly well under glide.
+             */
+            const bool autoAvailable = (fGlideMode != kGlideOn);
+
             if (fVoiceLeading) {
                 fVoiceLeading = false;
                 fBassNote     = kBassFirst;
             } else if (fBassNote == kBassNoteCount - 1) {
-                fVoiceLeading = true;          /* wrap back to auto */
-                fBassNote     = kBassFirst;
+                if (autoAvailable) {
+                    fVoiceLeading = true;      /* wrap back to auto */
+                    fBassNote     = kBassFirst;
+                } else {
+                    fBassNote     = kBassFirst;   /* straight back to first */
+                }
             } else {
                 fVoiceLeading = false;
                 fBassNote     = static_cast<BassNote>(fBassNote + 1);
@@ -3491,9 +3658,28 @@ private:
      */
     Progression fProg;
 
-    /* Which cell the chord menu is editing. */
+    /* Which cell the chord menu is editing. Doubles as the cell a preset
+     * loads into, so a preset can be dropped in part-way through a section
+     * rather than always replacing it from the first beat. */
     int fEditSection = 0;
     int fEditStep    = 0;
+
+    /*
+     * A chord being dragged from one cell to another.
+     *
+     * fDragCellFrom is -1 when nothing is being dragged. The drag only becomes
+     * real once the pointer LEAVES the cell it started in - otherwise every
+     * click on a filled cell would be a one-cell drag and the chord menu could
+     * never open.
+     */
+    int  fDragCellSection = -1;
+    int  fDragCellStep    = -1;
+    int  fDragCellFrom    = -1;   /* section, or -1 for none */
+    bool fDragCellMoved   = false;
+
+    /* Where the pointer is hovering mid-drag, for the drop preview. */
+    int fDropSection = -1;
+    int fDropStep    = -1;
 
     /* Section the duplicate menu will copy, and the row buttons' target. */
     int fMenuSection = 0;

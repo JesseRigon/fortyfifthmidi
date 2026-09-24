@@ -1258,6 +1258,42 @@ struct Progression {
         section[count] = ProgSection();
         return count++;
     }
+
+    /*
+     * Move a chord from one cell to another, or copy it.
+     *
+     * A move leaves a rest behind; a copy does not. Dropping onto a cell
+     * REPLACES it rather than pushing the rest along, because a progression
+     * grid is positional - beat three is beat three, and shuffling everything
+     * right would move chords the user never touched.
+     *
+     * Dropping past a section's end extends it, so a chord can be dragged out
+     * to lengthen a phrase in one gesture.
+     */
+    bool moveCell(int fromSection, int fromStep,
+                  int toSection, int toStep, bool copy)
+    {
+        if (fromSection < 0 || fromSection >= count ||
+            toSection   < 0 || toSection   >= count)
+            return false;
+        if (fromStep < 0 || fromStep >= kMaxProgSteps ||
+            toStep   < 0 || toStep   >= kMaxProgSteps)
+            return false;
+        if (fromSection == toSection && fromStep == toStep)
+            return false;
+
+        const ProgCell moved = section[fromSection].cell[fromStep];
+
+        if (! copy)
+            section[fromSection].cell[fromStep] = ProgCell();
+
+        section[toSection].cell[toStep] = moved;
+
+        if (toStep >= section[toSection].length)
+            section[toSection].length = toStep + 1;
+
+        return true;
+    }
 };
 
 /*
@@ -1287,9 +1323,51 @@ static constexpr NamedProgression kPresetProgression[] = {
 static constexpr int kPresetProgressionCount =
     static_cast<int>(sizeof(kPresetProgression) / sizeof(kPresetProgression[0]));
 
-/* Load a preset into section A, replacing whatever was there. Other sections
- * are left alone, so a preset can be dropped into a section of a larger
- * arrangement without losing the rest of it. */
+/*
+ * Write a preset into a section, starting at a given step.
+ *
+ * Starting at a step rather than always at the beginning is what makes the
+ * menu useful for building rather than only for replacing: a preset can be
+ * dropped in after what is already there, so an eight-bar section can be
+ * assembled from two four-bar phrases.
+ *
+ * Cells before the start are left exactly as they were, and the section is
+ * lengthened only if the preset runs past its current end - so loading into
+ * step 0 of a longer section does not truncate the tail.
+ */
+inline void loadPresetAt(Progression& prog, int presetIndex,
+                         int section, int startStep)
+{
+    if (presetIndex < 0 || presetIndex >= kPresetProgressionCount)
+        return;
+    if (section < 0 || section >= kMaxProgSections)
+        return;
+    if (startStep < 0 || startStep >= kMaxProgSteps)
+        return;
+
+    const NamedProgression& p = kPresetProgression[presetIndex];
+    ProgSection&            s = prog.section[section];
+
+    for (int i = 0; i < p.length; ++i) {
+        const int at = startStep + i;
+        if (at >= kMaxProgSteps)
+            break;
+
+        s.cell[at].filled = true;
+        s.cell[at].degree = p.degree[i];
+        s.cell[at].ext    = kExtNone;
+    }
+
+    const int end = startStep + p.length;
+    if (end > s.length)
+        s.length = (end > kMaxProgSteps) ? kMaxProgSteps : end;
+
+    if (section >= prog.count)
+        prog.count = section + 1;
+}
+
+/* Replace a section outright with a preset. Used for the opening grid, where
+ * there is nothing to preserve. */
 inline void loadPreset(Progression& prog, int presetIndex, int section)
 {
     if (presetIndex < 0 || presetIndex >= kPresetProgressionCount)
@@ -1297,20 +1375,10 @@ inline void loadPreset(Progression& prog, int presetIndex, int section)
     if (section < 0 || section >= kMaxProgSections)
         return;
 
-    const NamedProgression& p = kPresetProgression[presetIndex];
-    ProgSection&            s = prog.section[section];
+    prog.section[section] = ProgSection();
+    prog.section[section].length = 0;
 
-    s = ProgSection();
-    s.length = p.length;
-
-    for (int i = 0; i < p.length && i < kMaxProgSteps; ++i) {
-        s.cell[i].filled = true;
-        s.cell[i].degree = p.degree[i];
-        s.cell[i].ext    = kExtNone;
-    }
-
-    if (section >= prog.count)
-        prog.count = section + 1;
+    loadPresetAt(prog, presetIndex, section, 0);
 }
 
 /*
