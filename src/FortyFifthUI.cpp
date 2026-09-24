@@ -111,6 +111,9 @@ protected:
 
         drawMonitor();
 
+        /* The cell editor sits above the grid, and an open list above that. */
+        drawCellEditor();
+
         /* Last, so an open list overlays everything beneath it. */
         drawOpenMenu();
     }
@@ -544,8 +547,13 @@ protected:
             /* The sequencer is edited, not played: a press sets a cell or
              * moves a section and never sends a gesture. The DSP triggers its
              * chords from the transport instead. */
-            if (fScreen == kScreenProgressions)
+            if (fScreen == kScreenProgressions) {
+                /* The editor is modal, so it sees the click first and keeps
+                 * it - including clicks on its dead space. */
+                if (cellEditClick(ev.pos.getX(), ev.pos.getY()))
+                    return true;
                 return progPress(ev.pos.getX(), ev.pos.getY());
+            }
 
             Ring ring;
             const int pos = hitTest(ev.pos.getX(), ev.pos.getY(), ring);
@@ -1603,6 +1611,7 @@ protected:
 
     static constexpr float kProgMenuW  = 104.0f;  /* preset list on the left */
     static constexpr float kProgLabelW = 26.0f;   /* the A/B/C/D column */
+    static constexpr float kProgExpandW = 16.0f;  /* show/hide the octave lane */
     static constexpr float kProgRowH   = 34.0f;
     static constexpr float kProgRowGap = 6.0f;
     static constexpr float kProgBtnW   = 22.0f;   /* per-row +/- buttons */
@@ -1616,18 +1625,45 @@ protected:
     }
 
     /* One section's row, label column included. */
+    /* Extra height an expanded section takes, for its octave lane. */
+    static constexpr float kProgLaneH = 14.0f;
+
+    /* Rows stack, so a row's top depends on how many expanded rows precede
+     * it - computed rather than stored, so it cannot fall out of step with
+     * fSectionExpanded. */
     Button progRowRect(int section) const
     {
         const Button g = progGridArea();
-        return { g.x, g.y + section * (kProgRowH + kProgRowGap),
-                 g.w, kProgRowH };
+
+        float y = g.y;
+        for (int i = 0; i < section; ++i) {
+            y += kProgRowH + kProgRowGap;
+            if (fSectionExpanded[i])
+                y += kProgLaneH;
+        }
+        return { g.x, y, g.w, kProgRowH };
+    }
+
+    /* The octave lane under an expanded section. */
+    Button progLaneRect(int section) const
+    {
+        const Button r = progRowRect(section);
+        return { r.x, r.y + r.h, r.w, kProgLaneH };
+    }
+
+    /* The show/hide control, left of the section letter. */
+    Button progExpandRect(int section) const
+    {
+        const Button r = progRowRect(section);
+        return { r.x, r.y + 9.0f, kProgExpandW - 3.0f, r.h - 18.0f };
     }
 
     /* Width available for the steps themselves, after the label column on the
      * left and the two row buttons on the right. */
     float progStepsWidth() const
     {
-        return progGridArea().w - kProgLabelW - (kProgBtnW * 2.0f + 8.0f);
+        return progGridArea().w - kProgExpandW - kProgLabelW
+             - (kProgBtnW * 2.0f + 8.0f);
     }
 
     /*
@@ -1643,7 +1679,7 @@ protected:
     {
         const Button r = progRowRect(section);
         const float  w = progStepsWidth() / fGridBeats;
-        return { r.x + kProgLabelW + step * w, r.y + 2.0f,
+        return { r.x + kProgExpandW + kProgLabelW + step * w, r.y + 2.0f,
                  w - 2.0f, r.h - 4.0f };
     }
 
@@ -1670,13 +1706,20 @@ protected:
         return { x, g.y - 21.0f, w, 16.0f };
     }
 
-    /* "+ SECTION", below the last row. */
+    /* "+ SECTION", below the last row - wherever that has ended up, since
+     * expanded rows are taller. */
     Button progAddRect() const
     {
         const Button g = progGridArea();
-        return { g.x + kProgLabelW,
-                 g.y + fProg.count * (kProgRowH + kProgRowGap) + 2.0f,
-                 86.0f, 20.0f };
+
+        float y = g.y;
+        for (int i = 0; i < fProg.count; ++i) {
+            y += kProgRowH + kProgRowGap;
+            if (fSectionExpanded[i])
+                y += kProgLaneH;
+        }
+
+        return { g.x + kProgExpandW + kProgLabelW, y + 2.0f, 86.0f, 20.0f };
     }
 
     /* Transport, at the bottom of the preset column. Legato is in the header
@@ -1773,12 +1816,11 @@ protected:
                               kExtShort[hc.ext], hc.octave);
 
             fillColor(Color(0.72f, 0.78f, 0.86f));
-        } else {
-            std::snprintf(head, sizeof head,
-                          "SECTIONS - ONE CELL PER BEAT");
-            fillColor(Color(0.45f, 0.49f, 0.57f));
+            text(g.x, g.y - 12.0f, head, nullptr);
         }
-        text(g.x, g.y - 12.0f, head, nullptr);
+        /* Nothing under the pointer draws nothing. The line exists to answer a
+         * question about a cell; with no cell in question a standing caption
+         * would just be furniture. */
 
         /* Grid size, at the right-hand end of the same line. */
         for (int i = 0; i < kProgLengthChoiceCount; ++i) {
@@ -1851,12 +1893,28 @@ protected:
         const ProgSection& sec = fProg.section[s];
         const bool        playing = (fPlaySection == s);
 
+        /* The show/hide control for this section's octave lane. A caret,
+         * pointing down when the lane is open - the same idiom as the
+         * dropdowns, so it reads as "there is more below". */
+        {
+            const Button e = progExpandRect(s);
+
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(9.0f);
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            fillColor(fSectionExpanded[s] ? Color(0.70f, 0.78f, 0.88f)
+                                          : Color(0.42f, 0.46f, 0.54f));
+            text(e.x + e.w * 0.5f, e.y + e.h * 0.5f,
+                 fSectionExpanded[s] ? "▼" : "▶", nullptr);
+        }
+
         /* The section letter. The row the buttons act on is marked, so a
          * duplicate or a preset load cannot go somewhere unexpected. */
         const bool target = (fMenuSection == s);
+        const float lx = r.x + kProgExpandW;
 
         beginPath();
-        roundedRect(r.x, r.y, kProgLabelW - 3.0f, r.h, 3.0f);
+        roundedRect(lx, r.y, kProgLabelW - 3.0f, r.h, 3.0f);
         fillColor(target ? Color(0.22f, 0.30f, 0.42f)
                          : Color(0.13f, 0.14f, 0.18f));
         fill();
@@ -1873,12 +1931,15 @@ protected:
                           : Color(0.80f, 0.84f, 0.90f));
         {
             char buf[4] = { sectionLetter(s), 0, 0, 0 };
-            text(r.x + (kProgLabelW - 3.0f) * 0.5f, r.y + r.h * 0.5f,
+            text(lx + (kProgLabelW - 3.0f) * 0.5f, r.y + r.h * 0.5f,
                  buf, nullptr);
         }
 
         for (int i = 0; i < fGridBeats; ++i)
             drawProgCell(s, i, i < sec.length);
+
+        if (fSectionExpanded[s])
+            drawProgLane(s);
 
         /* Duplicate, then delete. Delete is omitted on the last remaining
          * section - there is no state to return from once it is gone. */
@@ -1888,6 +1949,60 @@ protected:
         drawSmallButton(progDupRect(s), "+");
         if (fProg.count > 1)
             drawSmallButton(progDelRect(s), "x");
+    }
+
+    /*
+     * The octave lane under an expanded section.
+     *
+     * One column per beat, aligned with the cells above it, showing each
+     * chord's octave offset. Reading a bass line's shape across a section is
+     * what this is for - cell by cell through the editor would make a
+     * descending line impossible to see.
+     *
+     * The base octave draws a tick rather than "0": a row of zeroes is noise,
+     * and what matters is which cells DEPART from the base.
+     */
+    void drawProgLane(int s)
+    {
+        const Button       lane = progLaneRect(s);
+        const ProgSection& sec  = fProg.section[s];
+
+        beginPath();
+        rect(lane.x + kProgExpandW + kProgLabelW,
+             lane.y, progStepsWidth(), lane.h - 2.0f);
+        fillColor(Color(0.10f, 0.11f, 0.14f));
+        fill();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(8.0f);
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+
+        for (int i = 0; i < fGridBeats && i < sec.length; ++i) {
+            const ProgCell& c = sec.cell[i];
+            if (! c.filled)
+                continue;
+
+            const Button cell = progCellRect(s, i);
+            const float  cx   = cell.x + cell.w * 0.5f;
+            const float  cy   = lane.y + (lane.h - 2.0f) * 0.5f;
+
+            if (c.octave == 0) {
+                beginPath();
+                rect(cx - 2.0f, cy - 0.5f, 4.0f, 1.0f);
+                fillColor(Color(0.34f, 0.37f, 0.44f));
+                fill();
+                continue;
+            }
+
+            /* Above the base is warm, below is cool - the direction is
+             * readable without stopping to parse the sign. */
+            fillColor(c.octave > 0 ? Color(0.86f, 0.72f, 0.42f)
+                                   : Color(0.52f, 0.70f, 0.88f));
+
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "%+d", c.octave);
+            text(cx, cy, buf, nullptr);
+        }
     }
 
     void drawSmallButton(const Button& b, const char* glyph)
@@ -2099,9 +2214,16 @@ protected:
         }
 
         for (int s = 0; s < fProg.count; ++s) {
+            /* Show or hide this section's octave lane. */
+            if (hit(progExpandRect(s), x, y)) {
+                fSectionExpanded[s] = ! fSectionExpanded[s];
+                repaint();
+                return true;
+            }
+
             /* The letter selects the row the buttons and presets act on. */
             const Button r = progRowRect(s);
-            if (hit({ r.x, r.y, kProgLabelW, r.h }, x, y)) {
+            if (hit({ r.x + kProgExpandW, r.y, kProgLabelW, r.h }, x, y)) {
                 fMenuSection = s;
                 repaint();
                 return true;
@@ -2165,9 +2287,9 @@ protected:
                     return true;
                 }
 
-                fEditSection = s;
-                fEditStep    = i;
-                fOpenMenu    = kMenuCell;
+                fEditSection  = s;
+                fEditStep     = i;
+                fCellEditOpen = true;
                 repaint();
                 return true;
             }
@@ -2258,9 +2380,9 @@ protected:
 
         if (! moved) {
             /* A click, not a drag: edit the cell. */
-            fEditSection = fromS;
-            fEditStep    = fromI;
-            fOpenMenu    = kMenuCell;
+            fEditSection  = fromS;
+            fEditStep     = fromI;
+            fCellEditOpen = true;
             repaint();
             return true;
         }
@@ -2276,76 +2398,276 @@ protected:
         return true;
     }
 
-    /*
-     * Decode a cell-menu row.
+    /* ---- the cell editor ---------------------------------------------------
      *
-     * Rest, then the degrees, then the extensions. An extension applies to
-     * whatever degree the cell already holds, so a chord is built in two
-     * clicks - pick the numeral, then pick its type - without a second menu
-     * for a setting most cells will leave alone.
+     * A modal panel with three dropdowns - chord, octave, mod - plus Clear and
+     * Done. It replaced a single twenty-row list that could not say what it
+     * was doing: picking "Sus 4" kept the numeral and picking "iii" kept the
+     * extension, and nothing in a flat list conveys that. Three labelled
+     * dropdowns convey it by construction.
      */
-    void applyCellRow(int row)
+
+    static constexpr float kCellEditW   = 190.0f;
+    static constexpr float kCellEditH   = 150.0f;
+    static constexpr float kCellEditRow = 26.0f;
+
+    /*
+     * Anchored under the cell, and nudged back inside the window.
+     *
+     * Following the cell keeps the panel next to what it edits, which at 64
+     * beats is the only way to tell which of sixty-four columns is being
+     * changed.
+     */
+    Button cellEditRect() const
+    {
+        const Button c = progCellRect(fEditSection, fEditStep);
+
+        float x = c.x + c.w * 0.5f - kCellEditW * 0.5f;
+        float y = c.y + c.h + 4.0f;
+
+        const float rightLimit = getWidth() - 6.0f;
+        if (x + kCellEditW > rightLimit) x = rightLimit - kCellEditW;
+        if (x < 6.0f)                    x = 6.0f;
+
+        /* No room below: flip above the cell rather than off the bottom. */
+        if (y + kCellEditH > getHeight() - chromeBottom())
+            y = c.y - kCellEditH - 4.0f;
+        if (y < chromeTop()) y = chromeTop();
+
+        return { x, y, kCellEditW, kCellEditH };
+    }
+
+    /* The three dropdowns and two buttons, as rows down the panel. */
+    Button cellEditChordRect() const
+    {
+        const Button p = cellEditRect();
+        return { p.x + 58.0f, p.y + 30.0f, p.w - 68.0f, 20.0f };
+    }
+
+    Button cellEditOctaveRect() const
+    {
+        const Button p = cellEditRect();
+        return { p.x + 58.0f, p.y + 30.0f + kCellEditRow, p.w - 68.0f, 20.0f };
+    }
+
+    Button cellEditModRect() const
+    {
+        const Button p = cellEditRect();
+        return { p.x + 58.0f, p.y + 30.0f + kCellEditRow * 2.0f,
+                 p.w - 68.0f, 20.0f };
+    }
+
+    Button cellEditClearRect() const
+    {
+        const Button p = cellEditRect();
+        return { p.x + 10.0f, p.y + p.h - 28.0f, 78.0f, 20.0f };
+    }
+
+    Button cellEditDoneRect() const
+    {
+        const Button p = cellEditRect();
+        return { p.x + p.w - 88.0f, p.y + p.h - 28.0f, 78.0f, 20.0f };
+    }
+
+    void drawCellEditor()
+    {
+        if (! fCellEditOpen)
+            return;
+        if (fEditSection < 0 || fEditSection >= fProg.count)
+            return;
+
+        const Button    p    = cellEditRect();
+        const ProgCell& cell = fProg.section[fEditSection].cell[fEditStep];
+
+        /* A shadow, so the panel reads as sitting above the grid rather than
+         * as another band of it. */
+        beginPath();
+        roundedRect(p.x + 2.0f, p.y + 3.0f, p.w, p.h, 6.0f);
+        fillColor(Color(0.0f, 0.0f, 0.0f, 0.35f));
+        fill();
+
+        beginPath();
+        roundedRect(p.x, p.y, p.w, p.h, 6.0f);
+        fillColor(Color(0.11f, 0.12f, 0.16f, 0.99f));
+        fill();
+        strokeColor(Color(0.42f, 0.50f, 0.62f));
+        strokeWidth(1.0f);
+        stroke();
+
+        /* Which cell this is. Without it the panel could be editing any of
+         * sixty-four columns. */
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(10.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.72f, 0.78f, 0.86f));
+        {
+            char t[32];
+            std::snprintf(t, sizeof t, "SECTION %c  BEAT %d",
+                          sectionLetter(fEditSection), fEditStep + 1);
+            text(p.x + 10.0f, p.y + 15.0f, t, nullptr);
+        }
+
+        static const char* const kRowLabel[3] = { "CHORD", "OCTAVE", "MOD" };
+        const Button rows[3] = { cellEditChordRect(),
+                                 cellEditOctaveRect(),
+                                 cellEditModRect() };
+
+        for (int i = 0; i < 3; ++i) {
+            fontSize(9.5f);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(Color(0.52f, 0.57f, 0.65f));
+            text(p.x + 10.0f, rows[i].y + rows[i].h * 0.5f,
+                 kRowLabel[i], nullptr);
+        }
+
+        char buf[32];
+
+        /* Chord: the numeral, or Rest. */
+        std::snprintf(buf, sizeof buf, "%s",
+                      cell.filled ? kDegreeCell[cell.degree].numeral : "Rest");
+        drawDropdown(cellEditChordRect(), buf, fOpenMenu == kMenuCellChord);
+
+        /* Octave: signed, and "base" at zero rather than a bare 0. */
+        if (cell.octave == 0)
+            std::snprintf(buf, sizeof buf, "Base");
+        else
+            std::snprintf(buf, sizeof buf, "%+d", cell.octave);
+        drawDropdown(cellEditOctaveRect(), buf, fOpenMenu == kMenuCellOctave);
+
+        std::snprintf(buf, sizeof buf, "%s", kExtensionName[cell.ext]);
+        drawDropdown(cellEditModRect(), buf, fOpenMenu == kMenuCellMod);
+
+        drawSmallLabelButton(cellEditClearRect(), "CLEAR", false);
+        drawSmallLabelButton(cellEditDoneRect(),  "DONE",  true);
+    }
+
+    void drawSmallLabelButton(const Button& b, const char* label, bool accent)
+    {
+        beginPath();
+        roundedRect(b.x, b.y, b.w, b.h, 4.0f);
+        fillColor(accent ? Color(0.24f, 0.40f, 0.56f)
+                         : Color(0.16f, 0.17f, 0.22f));
+        fill();
+        strokeColor(accent ? Color(0.45f, 0.66f, 0.85f)
+                           : Color(0.30f, 0.32f, 0.38f));
+        strokeWidth(1.0f);
+        stroke();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(10.0f);
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+        fillColor(accent ? Color(0.96f, 0.98f, 1.00f)
+                         : Color(0.70f, 0.75f, 0.82f));
+        text(b.x + b.w * 0.5f, b.y + b.h * 0.5f, label, nullptr);
+    }
+
+    /*
+     * Clicks inside the editor.
+     *
+     * Returns true for anything landing on the panel, including its dead
+     * space - a modal that let clicks through to the grid beneath it would let
+     * the user edit a different cell while this one is open.
+     */
+    bool cellEditClick(double px, double py)
+    {
+        if (! fCellEditOpen)
+            return false;
+
+        const float x = static_cast<float>(px);
+        const float y = static_cast<float>(py);
+
+        if (hit(cellEditChordRect(), x, y)) {
+            fOpenMenu = kMenuCellChord;
+            repaint();
+            return true;
+        }
+        if (hit(cellEditOctaveRect(), x, y)) {
+            fOpenMenu = kMenuCellOctave;
+            repaint();
+            return true;
+        }
+        if (hit(cellEditModRect(), x, y)) {
+            fOpenMenu = kMenuCellMod;
+            repaint();
+            return true;
+        }
+
+        if (hit(cellEditClearRect(), x, y)) {
+            ProgCell& cell = fProg.section[fEditSection].cell[fEditStep];
+            cell = ProgCell();
+            pushProgression();
+            fCellEditOpen = false;
+            repaint();
+            return true;
+        }
+
+        if (hit(cellEditDoneRect(), x, y)) {
+            fCellEditOpen = false;
+            repaint();
+            return true;
+        }
+
+        if (hit(cellEditRect(), x, y))
+            return true;   /* swallowed by the panel */
+
+        /* Clicking away closes it, and that click does nothing else - the
+         * first click dismisses, a second acts. Otherwise dismissing the panel
+         * would edit whatever happened to be underneath. */
+        fCellEditOpen = false;
+        repaint();
+        return true;
+    }
+
+    /* Apply a choice from one of the editor's three lists. */
+    void applyCellChoice(int row)
     {
         ProgCell& cell = fProg.section[fEditSection].cell[fEditStep];
 
-        if (row == 0) {
-            cell.filled = false;
-            cell.ext    = kExtNone;
-            return;
-        }
-        --row;
+        switch (fOpenMenu) {
+            case kMenuCellChord:
+                if (row == 0) {
+                    /* Rest. The octave and mod are kept, so turning a beat off
+                     * and on again does not lose how it was voiced. */
+                    cell.filled = false;
+                } else {
+                    cell.filled = true;
+                    cell.degree = static_cast<Degree>(row - 1);
+                }
+                break;
 
-        if (row < static_cast<int>(kDegreeCount)) {
-            cell.filled = true;
-            cell.degree = static_cast<Degree>(row);
-            return;
-        }
-        row -= static_cast<int>(kDegreeCount);
+            case kMenuCellOctave:
+                /* Setting a property of a rest implies wanting a chord there;
+                 * silently doing nothing would look broken. */
+                cell.filled = true;
+                cell.octave = static_cast<int8_t>(kProgOctaveMin + row);
+                break;
 
-        if (row < static_cast<int>(kExtCount)) {
-            /* Choosing a type for an empty cell implies wanting a chord there;
-             * silently doing nothing would look broken. */
-            cell.filled = true;
-            cell.ext    = static_cast<Extension>(row);
-            return;
+            default:   /* kMenuCellMod */
+                cell.filled = true;
+                cell.ext    = static_cast<Extension>(row);
+                break;
         }
-        row -= static_cast<int>(kExtCount);
 
-        /* The octave offset, relative to the plugin's own octave. */
-        cell.filled = true;
-        cell.octave = static_cast<int8_t>(kProgOctaveMin + row);
+        pushProgression();
     }
 
-    /* Which row of the cell menu is current, for the highlight. */
-    int cellRowFor(const ProgCell& cell) const
+    static const char* cellChordRowLabel(int row)
     {
-        if (! cell.filled)
-            return 0;
-        return 1 + static_cast<int>(cell.degree);
+        return (row == 0) ? "Rest" : kDegreeCell[row - 1].numeral;
     }
 
-    static const char* cellRowLabel(int row)
+    static const char* cellOctaveRowLabel(int row)
     {
-        if (row == 0)
-            return "Rest";
-        --row;
-
-        if (row < static_cast<int>(kDegreeCount))
-            return kDegreeCell[row].numeral;
-        row -= static_cast<int>(kDegreeCount);
-
-        if (row < static_cast<int>(kExtCount))
-            return kExtensionName[row];
-        row -= static_cast<int>(kExtCount);
-
-        /* Static, because menuRowLabel returns a bare pointer. One slot per
-         * offset rather than a shared buffer: the menu asks for every label
-         * while drawing, so a single buffer would show the last one in every
-         * octave row. */
+        /* Static, because menuRowLabel returns a bare pointer, and one slot
+         * per offset because the menu asks for every label while drawing - a
+         * shared buffer would show the last one in every row. */
         static char oct[kCellOctaveRows][12];
         const int   off = kProgOctaveMin + row;
-        std::snprintf(oct[row], sizeof oct[row],
-                      off == 0 ? "Octave %d (base)" : "Octave %+d", off);
+
+        if (off == 0)
+            std::snprintf(oct[row], sizeof oct[row], "Base");
+        else
+            std::snprintf(oct[row], sizeof oct[row], "%+d", off);
         return oct[row];
     }
 
@@ -2777,14 +3099,6 @@ protected:
             std::snprintf(buf, sizeof(buf), "KEY: %s",
                           kMajorLabel[fSelectedKey]);
             drawDropdown(slideKeyButton(), buf, fOpenMenu == kMenuKey);
-
-            fontFace(NANOVG_DEJAVU_SANS_TTF);
-            fontSize(9.5f);
-            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-            fillColor(Color(0.50f, 0.55f, 0.63f));
-            text(slideKeyButton().x + slideKeyButton().w + 12.0f,
-                 kDropY + kDropH * 0.5f,
-                 "cells carry their own chord type", nullptr);
             return;
         }
 
@@ -2884,13 +3198,24 @@ protected:
                 anchor = pedalButton();
                 cur    = static_cast<int>(fPedalAction);
                 break;
-            case kMenuCell:
-                rows   = kCellRows;
-                /* Hangs off the cell being edited, so the list points at the
-                 * beat it will change. */
-                anchor = progCellRect(fEditSection, fEditStep);
-                cur    = cellRowFor(
-                             fProg.section[fEditSection].cell[fEditStep]);
+            case kMenuCellChord: {
+                rows   = kCellChordRows;
+                anchor = cellEditChordRect();
+                const ProgCell& c = fProg.section[fEditSection].cell[fEditStep];
+                cur    = c.filled ? 1 + static_cast<int>(c.degree) : 0;
+                break;
+            }
+            case kMenuCellOctave:
+                rows   = kCellOctaveRows;
+                anchor = cellEditOctaveRect();
+                cur    = fProg.section[fEditSection].cell[fEditStep].octave
+                       - kProgOctaveMin;
+                break;
+            case kMenuCellMod:
+                rows   = static_cast<int>(kExtCount);
+                anchor = cellEditModRect();
+                cur    = static_cast<int>(
+                             fProg.section[fEditSection].cell[fEditStep].ext);
                 break;
             case kMenuDuplicate:
                 rows   = 2;
@@ -2913,7 +3238,9 @@ protected:
             case kMenuKey:     return kMajorLabel[i];
             case kMenuBinding: return bindingRowLabel(i);
             case kMenuPedal:   return kPedalActionName[i];
-            case kMenuCell:    return cellRowLabel(i);
+            case kMenuCellChord:  return cellChordRowLabel(i);
+            case kMenuCellOctave: return cellOctaveRowLabel(i);
+            case kMenuCellMod:    return kExtensionName[i];
             case kMenuDuplicate: return i == 0 ? "Duplicate as next"
                                                : "Duplicate as last";
             default:           return kExtensionName[i];
@@ -2969,9 +3296,10 @@ protected:
                             fPedalAction = static_cast<PedalAction>(i);
                             setState("pedalAction", buf);
                             break;
-                        case kMenuCell:
-                            applyCellRow(i);
-                            pushProgression();
+                        case kMenuCellChord:
+                        case kMenuCellOctave:
+                        case kMenuCellMod:
+                            applyCellChoice(i);
                             break;
                         case kMenuDuplicate: {
                             /* Row 0 is "as next", row 1 "as last". */
@@ -3922,9 +4250,25 @@ private:
         kMenuNone = 0, kMenuExt, kMenuVoicing, kMenuScale, kMenuKey,
         kMenuBinding,   /* what a keyboard key does */
         kMenuPedal,
-        kMenuCell,      /* what chord a sequencer cell plays */
-        kMenuDuplicate  /* as next, or as last */
+        kMenuDuplicate, /* as next, or as last */
+        /* The three lists inside the cell editor. Separate menus rather than
+         * one flat list, so each offers only its own kind of answer. */
+        kMenuCellChord,
+        kMenuCellOctave,
+        kMenuCellMod
     };
+
+    /*
+     * The cell editor.
+     *
+     * A modal panel rather than a dropdown. One flat list of twenty rows -
+     * rest, seven degrees, seven extensions, five octaves - asked the user to
+     * know that picking "Sus 4" kept the numeral and picking "iii" kept the
+     * extension, which is not something a list can say. Three labelled
+     * dropdowns say it by construction: each one shows the cell's current
+     * value and changes only that.
+     */
+    bool fCellEditOpen = false;
 
     /*
      * ---- progression state -------------------------------------------------
@@ -3980,24 +4324,28 @@ private:
      * waiting for the DSP to answer. */
     bool fProgRunning = false;
 
-    /*
-     * The cell menu is one flat list: a rest, then the seven degrees, then the
-     * extensions - which apply to the degree already in the cell, so the chord
-     * and its type are set in two passes rather than needing a second menu -
-     * and finally the octave offsets, for the same reason.
-     */
+    /* Octave offsets on offer: -2..+2, plus the chord list's leading Rest. */
     static constexpr int kCellOctaveRows =
-        kProgOctaveMax - kProgOctaveMin + 1;    /* -2..+2 */
+        kProgOctaveMax - kProgOctaveMin + 1;
 
-    static constexpr int kCellRows =
-        1 +                                /* rest */
-        static_cast<int>(kDegreeCount) +   /* I..vii */
-        static_cast<int>(kExtCount) +      /* triad..sus4 */
-        kCellOctaveRows;                   /* oct -2..+2 */
+    /* The chord list is a rest and then the seven degrees. Extensions and
+     * octaves have lists of their own inside the editor. */
+    static constexpr int kCellChordRows =
+        1 + static_cast<int>(kDegreeCount);
 
     /* How many beats the grid shows. Not the loop length - a section plays its
      * own length, which is free to be shorter. */
     int fGridBeats = 16;
+
+    /*
+     * Which sections are expanded.
+     *
+     * A collapsed row is one band of cells; an expanded one adds a lane under
+     * it showing each cell's octave. That detail is worth seeing across a whole
+     * section when you are shaping a bass line, and worth hiding the rest of
+     * the time - especially with eight sections on screen at 64 beats.
+     */
+    bool fSectionExpanded[kMaxProgSections] = { false };
 
     /* The cell the pointer is resting on, for the detail readout. At 32 and 64
      * beats a cell is too narrow for a numeral, so the grid shows dots and the
