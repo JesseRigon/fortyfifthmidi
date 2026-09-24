@@ -1625,17 +1625,16 @@ protected:
                    fSingleNotes ? "Single notes" : "Chords",
                    fSingleNotes);
         /*
-         * Say when leading is switched on but not actually in force. Plain
-         * glide suspends it, because a single bend cannot express a
-         * re-inversion - so claiming "smooth" there would be a lie the user
-         * could hear but not explain.
+         * Which chord tone is in the bass. Voice leading overrides it - it
+         * picks the inversion by nearness to the previous chord, which is the
+         * whole point of it - so say so rather than showing a setting that is
+         * not being obeyed.
          */
-        const bool leadSuppressed = fVoiceLeading && fGlideMode == kGlideOn;
+        const bool leadInForce = fVoiceLeading && fGlideMode != kGlideOn;
         drawButton(voiceLeadButton(),
-                   leadSuppressed   ? "Lead: off (glide)"
-                   : fVoiceLeading  ? "Lead: smooth"
-                                    : "Lead: root pos",
-                   fVoiceLeading && ! leadSuppressed);
+                   leadInForce ? "Root: auto (lead)"
+                               : kBassNoteName[fBassNote],
+                   leadInForce);
 
         /*
          * Row 2 differs by screen: the wheel wants per-ring extensions and
@@ -1993,9 +1992,31 @@ protected:
         }
 
         if (hit(voiceLeadButton(), px, py)) {
-            fVoiceLeading = ! fVoiceLeading;
+            /*
+             * Cycles auto -> first -> second -> third -> auto.
+             *
+             * "auto" is voice leading choosing the inversion itself. Taking
+             * manual control has to switch it off, or the chosen bass would be
+             * silently ignored - which is exactly how the old toggle appeared
+             * to do nothing while glide had leading suppressed anyway.
+             */
+            const bool leadInForce = fVoiceLeading && fGlideMode != kGlideOn;
+
+            if (leadInForce) {
+                fVoiceLeading = false;
+                fBassNote     = kBassFirst;
+            } else if (fBassNote == kBassNoteCount - 1) {
+                fVoiceLeading = true;          /* wrap back to auto */
+                fBassNote     = kBassFirst;
+            } else {
+                fVoiceLeading = false;
+                fBassNote     = static_cast<BassNote>(fBassNote + 1);
+            }
+
             std::snprintf(buf, sizeof(buf), "%d", fVoiceLeading ? 1 : 0);
             setState("voiceLeading", buf);
+            std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(fBassNote));
+            setState("bassNote", buf);
             repaint();
             return true;
         }
@@ -2731,7 +2752,8 @@ private:
 
     /* On by default: without it a progression leaps about, because every chord
      * stacks upward from its own root. */
-    bool fVoiceLeading = true;
+    bool     fVoiceLeading = true;
+    BassNote fBassNote     = kBassFirst;
 
     /* Octave for pointer and touch input. Mirrors the DSP's setting; a played
      * MIDI note carries its own octave instead. */

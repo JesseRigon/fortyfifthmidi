@@ -468,6 +468,72 @@ int main()
         }
     }
 
+    /*
+     * Bass note. Two properties matter: the requested tone really is lowest,
+     * and the chord is still ascending afterwards. The second caught a real
+     * bug - applyVoicing shifted octaves without re-sorting, so "1st
+     * inversion" on A-C-E gave A3 C3 E3: neither ascending nor inverted, with
+     * whatever happened to be lowest in the bass rather than the named note.
+     */
+    std::printf("\n=== bass note puts the right tone lowest ===\n");
+    {
+        struct { int root; ChordType type; BassNote bass; int wantPc;
+                 const char* what; } kBass[] = {
+            { 0, kChordMajor,  kBassFirst,  0, "C major, first  -> C" },
+            { 0, kChordMajor,  kBassSecond, 4, "C major, second -> E" },
+            { 0, kChordMajor,  kBassThird,  7, "C major, third  -> G" },
+            { 9, kChordMinor,  kBassFirst,  9, "A minor, first  -> A" },
+            { 9, kChordMinor,  kBassSecond, 0, "A minor, second -> C" },
+            { 9, kChordMinor,  kBassThird,  4, "A minor, third  -> E" },
+            { 0, kChordMajor7, kBassThird,  7, "Cmaj7,   third  -> G" },
+        };
+
+        for (const auto& b : kBass) {
+            uint8_t n[8];
+            const int c = buildChord(b.root, b.type, 4 * 12, n, kMaxChordTones);
+            applyBassNote(n, c, b.bass);
+
+            bool ascending = true;
+            for (int i = 1; i < c; ++i)
+                if (n[i] <= n[i - 1]) ascending = false;
+
+            const bool right = (n[0] % 12 == b.wantPc);
+
+            if (right && ascending) {
+                std::printf("  ok    %-30s %s\n", b.what, kPitch[n[0] % 12]);
+            } else {
+                std::printf("  FAIL  %-30s bass %s%s\n", b.what,
+                            kPitch[n[0] % 12],
+                            ascending ? "" : ", not ascending");
+                ++failures;
+            }
+        }
+    }
+
+    /* Every voicing must leave the chord ascending, or notes[0] is not the
+     * bass and anything reading it - the glide's voice pairing included - is
+     * looking at the wrong note. */
+    std::printf("\n=== every voicing leaves the chord ascending ===\n");
+    {
+        bool allAscending = true;
+        for (int v = 0; v < kVoicingCount; ++v) {
+            uint8_t n[8];
+            int c = buildChord(9, kChordMinor, 3 * 12, n, kMaxChordTones);
+            c = applyVoicing(n, c, static_cast<Voicing>(v), 8);
+            for (int i = 1; i < c; ++i)
+                if (n[i] < n[i - 1]) allAscending = false;
+        }
+        if (allAscending) {
+            std::printf("  ok    %-30s all %d voicings\n",
+                        "sorted after octave shifts",
+                        static_cast<int>(kVoicingCount));
+        } else {
+            std::printf("  FAIL  %-30s a voicing is out of order\n",
+                        "sorted after octave shifts");
+            ++failures;
+        }
+    }
+
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "PASS" : "FAIL",
                 failures, failures == 1 ? "" : "s");

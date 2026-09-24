@@ -339,6 +339,18 @@ static constexpr const char* kVoicingName[kVoicingCount] = {
  * note numbers; returns the new voice count (only the doubling modes change it).
  * Anything that would leave the MIDI range is left where it was.
  */
+/* Small insertion sort - chords are at most six notes, so this is the right
+ * shape and keeps the file free of <algorithm>. */
+inline void sortAscending(uint8_t* notes, int count)
+{
+    for (int i = 1; i < count; ++i) {
+        const uint8_t v = notes[i];
+        int j = i - 1;
+        while (j >= 0 && notes[j] > v) { notes[j + 1] = notes[j]; --j; }
+        notes[j + 1] = v;
+    }
+}
+
 inline int applyVoicing(uint8_t* notes, int count, Voicing voicing,
                         size_t capacity)
 {
@@ -402,6 +414,7 @@ inline int applyVoicing(uint8_t* notes, int count, Voicing voicing,
         case kVoicingPowerRoot:
             if (static_cast<size_t>(count) < capacity) {
                 notes[count] = down(notes[0]);
+                sortAscending(notes, count + 1);
                 return count + 1;
             }
             break;
@@ -409,6 +422,19 @@ inline int applyVoicing(uint8_t* notes, int count, Voicing voicing,
         default:
             break;
     }
+
+    /*
+     * Sort, because every case above moves notes by an octave without
+     * regard to where that leaves them in the list.
+     *
+     * Without this, "1st inversion" on A-C-E produced A3 C3 E3: the A was
+     * raised but stayed at index 0, so the chord was neither ascending nor
+     * actually inverted - the note in the bass was whatever happened to be
+     * lowest, not the one the voicing named. Anything downstream that treats
+     * notes[0] as the bass, including the glide's per-voice pairing, was
+     * reading the wrong voice.
+     */
+    sortAscending(notes, count);
     return count;
 }
 
@@ -524,6 +550,51 @@ inline void applyVoiceLeading(uint8_t* notes, int count,
 
     for (int i = 0; i < count; ++i)
         notes[i] = best[i];
+}
+
+/*
+ * ---- bass note ----------------------------------------------------------
+ *
+ * Which chord tone sits at the bottom. This is the classical inversion
+ * choice, stated as "which note is the bass" rather than as an ordinal,
+ * because that is what a player actually hears and chooses.
+ *
+ *   First   the root      C E G   - root position
+ *   Second  the third     E G C   - first inversion
+ *   Third   the fifth     G C E   - second inversion
+ */
+enum BassNote {
+    kBassFirst = 0,
+    kBassSecond,
+    kBassThird,
+    kBassNoteCount
+};
+
+static constexpr const char* kBassNoteName[kBassNoteCount] = {
+    "Root: first", "Root: second", "Root: third"
+};
+
+/*
+ * Rotate a chord so the requested tone is lowest, keeping it ascending.
+ *
+ * Rotating rather than transposing is what makes this an inversion: the notes
+ * below the new bass move UP an octave, so the chord keeps its pitch classes
+ * and stays in roughly the same register instead of dropping.
+ */
+inline void applyBassNote(uint8_t* notes, int count, BassNote bass)
+{
+    const int want = static_cast<int>(bass);
+    if (count <= 1 || want <= 0 || want >= count)
+        return;
+
+    /* Lift everything below the chosen tone by an octave; it then sits
+     * lowest and the rest stack above it. */
+    for (int i = 0; i < want; ++i) {
+        if (notes[i] <= 115)
+            notes[i] = static_cast<uint8_t>(notes[i] + 12);
+    }
+
+    sortAscending(notes, count);
 }
 
 /* Two chords can share a single pitch bend only if their interval patterns are

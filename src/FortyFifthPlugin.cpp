@@ -147,6 +147,7 @@ protected:
         kStateVoiceLeading,
         kStateKeyMap,
         kStatePedalAction,
+        kStateBassNote,
         kStateCount
     };
 
@@ -271,6 +272,12 @@ protected:
                 state.label = "Sustain Pedal";
                 state.defaultValue = "0";
                 break;
+            case kStateBassNote:
+                /* Which chord tone is lowest: first (root), second, third. */
+                state.key = "bassNote";
+                state.label = "Bass Note";
+                state.defaultValue = "0";
+                break;
         }
     }
 
@@ -380,6 +387,9 @@ protected:
         else if (std::strcmp(key, "pedalAction") == 0)
             fPedalAction = static_cast<PedalAction>(
                 ((v % kPedalActionCount) + kPedalActionCount) % kPedalActionCount);
+        else if (std::strcmp(key, "bassNote") == 0)
+            fBassNote = static_cast<BassNote>(
+                ((v % kBassNoteCount) + kBassNoteCount) % kBassNoteCount);
         else if (std::strcmp(key, "voiceLeading") == 0) {
             fVoiceLeading = (v != 0);
             /* Turning it off must not leave the next chord leading from a
@@ -469,6 +479,7 @@ protected:
         else if (std::strcmp(key, "pedalAction") == 0)
             v = static_cast<int>(fPedalAction);
         else if (std::strcmp(key, "voiceLeading") == 0) v = fVoiceLeading ? 1 : 0;
+        else if (std::strcmp(key, "bassNote") == 0)     v = static_cast<int>(fBassNote);
 
         std::snprintf(buf, sizeof(buf), "%d", v);
         return String(buf);
@@ -1668,7 +1679,26 @@ private:
         if (! fSingleNotes)
             n = applyVoicing(out, n, fRingVoicing[ring], kMaxGroupNotes);
 
+        /*
+         * The bass note has the final say, after voicing, because it is the
+         * one thing the user picked explicitly about which note is lowest.
+         * Applying it earlier would let a voicing silently override it.
+         *
+         * Not applied under voice leading: leading chooses the inversion
+         * itself, by nearness to the previous chord, and forcing a bass on top
+         * of that would undo the very thing it was asked to do.
+         */
+        if (! fSingleNotes && ! usingVoiceLeading())
+            applyBassNote(out, n, fBassNote);
+
         return n;
+    }
+
+    /* Voice leading is on AND in force - it is suppressed during plain glide,
+     * where a re-inversion would defeat the single bend. */
+    bool usingVoiceLeading() const
+    {
+        return fVoiceLeading && leadingAppliesNow();
     }
 
     /*
@@ -1762,6 +1792,8 @@ private:
     /* Settle each chord near the previous one instead of always stacking
      * upward from its own root. See applyVoiceLeading(). */
     bool      fVoiceLeading   = true;
+    /* Which chord tone sits lowest, when voice leading is not choosing. */
+    BassNote  fBassNote       = kBassFirst;
 
     /* The chord most recently started, as the reference the next one leads
      * from. Kept after it stops, so a gap between chords still leads smoothly
