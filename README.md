@@ -61,9 +61,13 @@ Windows, see [docs/BUILDING.md](docs/BUILDING.md).
 
 ## Licensing
 
-Plugin code is ISC. DPF is ISC; the bundled CLAP and VST3 SDK headers are MIT.
+Plugin code is MIT. DPF is ISC. Of the formats built here, CLAP is MIT and
+VST3 is ISC — DPF uses its own "travesty" API definitions rather than
+Steinberg's SDK, so there is no Steinberg licensing obligation.
+
 The whole stack is permissive — a closed-source commercial release is fine, and
-the only obligation is preserving copyright notices.
+the only obligation is preserving copyright notices. See [LICENSE](LICENSE) for
+the full breakdown of which terms cover what.
 
 The circle of fifths is music theory and is not copyrightable, nor is a
 concentric major/minor ring layout. All visual design here is original; do not

@@ -1,6 +1,29 @@
+FortyFifthMidi — licensing
+==========================
+
+This project is MIT licensed. It builds against the DISTRHO Plugin Framework
+(DPF), which is not part of this repository and carries its own terms, so a
+BUILT plugin combines both. The summary below says which applies to what.
+
+Short version: everything here is permissive. No copyleft, no commercial
+restriction, in any configuration this project builds. Attribution is the
+only obligation.
+
+
+1. This project's own code — MIT
+--------------------------------
+
+Everything tracked in this repository:
+
+    src/            the plugin itself
+    dev/            build scripts and tests
+    docs/           specification and notes
+    .devcontainer/  development environment
+    Makefile
+
 MIT License
 
-Copyright (c) 2026 Jesse
+Copyright (c) 2026 Jesse Rigon
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +42,73 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+2. DPF — ISC, fetched at build time
+-----------------------------------
+
+The DISTRHO Plugin Framework provides the plugin and UI scaffolding. It is
+cloned into dpf/ by the build (see .devcontainer/scripts/20-dpf.sh) and is
+deliberately NOT vendored here, so this repository contains none of its code.
+
+    Copyright (C) 2012-2026 Filipe Coelho <falktx@falktx.com>
+    ISC License — see dpf/LICENSE after cloning
+
+DPF requires attribution regardless of the format built.
+
+
+3. Plugin formats — per-format terms
+------------------------------------
+
+Each plugin API carries its own licence, which a built binary inherits. This
+project builds CLAP and VST3 (src/Makefile: TARGETS = clap vst3):
+
+    CLAP       MIT    Copyright 2014-2022 Alexandre Bique
+    VST3       ISC    DPF's own "travesty" API definitions
+
+Note on VST3: DPF does NOT use Steinberg's official VST3 SDK. Its API
+definitions come from the travesty sub-project under DPF's own licence, which
+is why building VST3 here carries no Steinberg licensing obligation.
+
+The standalone/JACK target, used only for development, additionally pulls in
+RtAudio and RtMidi (MIT, Copyright 2001-2021 Gary P. Scavone).
+
+DPF can also target LADSPA and DSSI, whose headers are LGPLv2.1+. This project
+does not build those, which is what keeps every shipped artifact free of
+copyleft.
+
+VST2 is deliberately not built: Steinberg revoked that SDK's licence, so new
+development must not target it. See docs/spec.md section 2.
+
+
+4. What the plugin reports to hosts
+-----------------------------------
+
+FortyFifthPlugin.cpp reports "MIT" through getLicense(), matching section 1.
+An earlier version reported "ISC", which was DPF's licence rather than this
+project's — the two are near-identical in effect, but the plugin should state
+its own terms, not its framework's.
+
+
+5. Music theory
+---------------
+
+The circle-of-fifths layout, chord spellings and scale-degree relationships
+are music theory and are not copyrightable. Only a particular printed
+product's artwork, palette and text are protected. Every visual element here
+— palette, geometry, typography, proportions — is original to this project
+and was not traced from any commercial chord wheel.
+
+
+6. If you redistribute a built plugin
+-------------------------------------
+
+Include attribution for:
+
+  - FortyFifthMidi        Copyright (c) 2026 Jesse Rigon      (MIT)
+  - DPF                   Copyright (C) 2012-2026 Filipe Coelho  (ISC)
+  - CLAP                  Copyright 2014-2022 Alexandre Bique    (MIT)  [CLAP builds]
+
+and, if you ship the standalone:
+
+  - RtAudio / RtMidi      Copyright 2001-2021 Gary P. Scavone    (MIT)

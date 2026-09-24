@@ -108,7 +108,9 @@ protected:
     }
     const char* getMaker()   const override { return "Jesse Rigon"; }
     const char* getHomePage() const override { return DISTRHO_PLUGIN_URI; }
-    const char* getLicense() const override { return "ISC"; }
+    /* This project's own licence, not the framework's. DPF is ISC and that is
+     * recorded in LICENSE; what a host shows should be the plugin's terms. */
+    const char* getLicense() const override { return "MIT"; }
     uint32_t    getVersion() const override { return d_version(0, 1, 0); }
     int64_t     getUniqueId() const override { return d_cconst('4', '5', 'M', 'd'); }
 
