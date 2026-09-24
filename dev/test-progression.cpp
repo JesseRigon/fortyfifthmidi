@@ -1,0 +1,204 @@
+/*
+ * The progression sequencer's data model, checked without a host.
+ *
+ *   g++ -std=c++17 -I src dev/test-progression.cpp -o /tmp/tp && /tmp/tp
+ *
+ * The thing worth testing here is locate(): it turns the host's running beat
+ * count into a section and a step, and it is the only place that knows
+ * sections chain rather than layer. Everything the sequencer plays comes from
+ * its answer, so an off-by-one there is an off-by-one in the music.
+ */
+
+#include "CircleTheory.hpp"
+
+#include <cstdio>
+#include <cstring>
+
+using namespace fortyfifth;
+
+static int failures = 0;
+
+static void ok(const char* what, bool good, const char* detail)
+{
+    if (good) {
+        std::printf("  ok    %-36s %s\n", what, detail);
+    } else {
+        std::printf("  FAIL  %-36s %s\n", what, detail);
+        ++failures;
+    }
+}
+
+/* locate() for one beat, rendered as "B2" - section letter, step. */
+static void checkBeat(const Progression& p, long long beat,
+                      int wantSection, int wantStep)
+{
+    int s = -1, st = -1;
+    const bool found = p.locate(beat, s, st);
+
+    char detail[96];
+    std::snprintf(detail, sizeof detail, "beat %lld -> %c%d",
+                  beat, found ? sectionLetter(s) : '?', found ? st : -1);
+
+    char what[64];
+    std::snprintf(what, sizeof what, "beat %lld is %c%d",
+                  beat, sectionLetter(wantSection), wantStep);
+
+    ok(what, found && s == wantSection && st == wantStep, detail);
+}
+
+int main()
+{
+    std::printf("=== chaining: sections play one after another ===\n");
+    {
+        Progression p;
+        p.count = 3;
+        p.section[0].length = 4;   /* A: beats 0-3  */
+        p.section[1].length = 2;   /* B: beats 4-5  */
+        p.section[2].length = 3;   /* C: beats 6-8  */
+
+        char d[64];
+        std::snprintf(d, sizeof d, "%d beats", p.totalBeats());
+        ok("total is the sum of the lengths", p.totalBeats() == 9, d);
+
+        checkBeat(p, 0, 0, 0);
+        checkBeat(p, 3, 0, 3);
+        checkBeat(p, 4, 1, 0);   /* carries into B */
+        checkBeat(p, 5, 1, 1);
+        checkBeat(p, 6, 2, 0);   /* and into C     */
+        checkBeat(p, 8, 2, 2);
+
+        /* Wraps back to the top rather than running off the end. */
+        checkBeat(p, 9, 0, 0);
+        checkBeat(p, 13, 1, 0);
+
+        /* A transport rolled back before zero must still land somewhere real,
+         * not index backwards out of the array. */
+        checkBeat(p, -1, 2, 2);
+        checkBeat(p, -9, 0, 0);
+    }
+
+    std::printf("\n=== an empty progression plays nothing ===\n");
+    {
+        Progression p;
+        p.count = 1;
+        p.section[0].length = 0;
+
+        int s, st;
+        ok("locate declines rather than dividing by zero",
+           ! p.locate(0, s, st), "no beats");
+    }
+
+    std::printf("\n=== duplicate: as next, and as last ===\n");
+    {
+        Progression p;
+        p.count = 3;
+        /* Mark each section so copies are identifiable. */
+        for (int i = 0; i < 3; ++i) {
+            p.section[i].length      = i + 1;
+            p.section[i].cell[0].filled = true;
+            p.section[i].cell[0].degree =
+                static_cast<Degree>(kDegreeI + i);
+        }
+
+        /* Duplicating A "as next" must land at index 1 and push B, C along. */
+        const int at = p.duplicate(0, true);
+        char d[96];
+        std::snprintf(d, sizeof d, "new section at %c, count %d",
+                      sectionLetter(at), p.count);
+        ok("as next inserts directly after", at == 1 && p.count == 4, d);
+
+        ok("the copy matches the original",
+           p.section[1].cell[0].degree == kDegreeI &&
+           p.section[1].length == 1, "A == B");
+
+        /* What was B is now C, and is unchanged. */
+        ok("later sections shift, not overwrite",
+           p.section[2].cell[0].degree == kDegreeII &&
+           p.section[3].cell[0].degree == kDegreeIII,
+           "old B, C intact at C, D");
+
+        /* Duplicating "as last" appends without disturbing anything. */
+        const int end = p.duplicate(0, false);
+        std::snprintf(d, sizeof d, "new section at %c", sectionLetter(end));
+        ok("as last appends to the end", end == 4 && p.count == 5, d);
+    }
+
+    std::printf("\n=== duplicate refuses when full ===\n");
+    {
+        Progression p;
+        p.count = kMaxProgSections;
+        ok("no silent overflow", p.duplicate(0, true) == -1, "declined");
+    }
+
+    std::printf("\n=== remove ===\n");
+    {
+        Progression p;
+        p.count = 3;
+        for (int i = 0; i < 3; ++i)
+            p.section[i].cell[0].degree = static_cast<Degree>(kDegreeI + i);
+
+        ok("removes the named section", p.remove(1) && p.count == 2, "B gone");
+        ok("the rest close up",
+           p.section[0].cell[0].degree == kDegreeI &&
+           p.section[1].cell[0].degree == kDegreeIII, "A then old C");
+
+        p.count = 1;
+        ok("the last section is never removed", ! p.remove(0), "declined");
+    }
+
+    std::printf("\n=== presets load as degrees, so they transpose ===\n");
+    {
+        Progression p;
+        loadPreset(p, 0, 0);   /* I-V-vi-IV */
+
+        char d[96];
+        std::snprintf(d, sizeof d, "length %d", p.section[0].length);
+        ok("preset sets the section length", p.section[0].length == 4, d);
+
+        const bool right =
+            p.section[0].cell[0].degree == kDegreeI  &&
+            p.section[0].cell[1].degree == kDegreeV  &&
+            p.section[0].cell[2].degree == kDegreeVI &&
+            p.section[0].cell[3].degree == kDegreeIV;
+        ok("I-V-vi-IV is stored as those degrees", right, "I V vi IV");
+
+        /* Beyond the preset's length the cells stay empty, so a shorter preset
+         * loaded over a longer section does not leave stale chords behind. */
+        ok("trailing cells are cleared", ! p.section[0].cell[4].filled,
+           "rest after the fourth beat");
+
+        /*
+         * The real payoff: the same stored degrees resolve to different cells
+         * in different keys. Resolve degree I in C and in G and check they
+         * differ - that is transposition with no rewriting.
+         */
+        int posC, posG;
+        Ring ringC, ringG;
+        cellForDegree(kDegreeI, 0, posC, ringC);   /* C */
+        cellForDegree(kDegreeI, 1, posG, ringG);   /* G, one step clockwise */
+
+        std::snprintf(d, sizeof d, "cell %d in C, %d in G", posC, posG);
+        ok("the same degree moves with the key", posC != posG, d);
+    }
+
+    std::printf("\n=== every preset is well formed ===\n");
+    {
+        bool allGood = true;
+        for (int i = 0; i < kPresetProgressionCount; ++i) {
+            const NamedProgression& n = kPresetProgression[i];
+            if (n.length <= 0 || n.length > kMaxProgSteps)
+                allGood = false;
+            for (int s = 0; s < n.length; ++s)
+                if (n.degree[s] < 0 || n.degree[s] >= kDegreeCount)
+                    allGood = false;
+        }
+        char d[64];
+        std::snprintf(d, sizeof d, "%d presets", kPresetProgressionCount);
+        ok("lengths and degrees are in range", allGood, d);
+    }
+
+    std::printf("\n%s (%d failure%s)\n",
+                failures == 0 ? "PASS" : "FAIL",
+                failures, failures == 1 ? "" : "s");
+    return failures == 0 ? 0 : 1;
+}

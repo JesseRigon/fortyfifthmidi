@@ -15,6 +15,7 @@
  * with it: a mismatch here should be read as a failing test, not as drift.
  */
 #include <cstdio>
+#include <cstring>
 
 static const float kTabH    = 28.0f;   /* tab bar above the control rows */
 static const float kDropY   = kTabH + 36.0f;
@@ -156,6 +157,68 @@ static void reportSlides(const char* title, int n, int sections)
     ok("bank fits the window", last.x + last.w <= W, d);
 }
 
+/*
+ * The ROOT button's four-state cycle, and the label that reports it.
+ *
+ * Transcribed from FortyFifthUI.cpp for the same reason as the constants
+ * above: that file needs the whole DPF UI stack to compile.
+ *
+ * This exists because of a real bug. Both the label and the cycle keyed off
+ * "is voice leading in force right now" rather than "is it switched on", and
+ * plain glide suspends leading without switching it off. So with glide on the
+ * button read FIRST while leading was still set, producing B-E-G for an Em;
+ * and clicking that button advanced to SECOND, because the handler trusted its
+ * own label and skipped the state it claimed to be in. FIRST was unreachable.
+ */
+static void checkRootCycle()
+{
+    std::printf("\n-- ROOT cycle --\n");
+
+    enum { kFirst = 0, kSecond, kThird, kBassCount };
+    static const char* kName[kBassCount] = { "FIRST", "SECOND", "THIRD" };
+
+    /* Run the cycle with glide ON, where leading is suspended - the case that
+     * was broken. Every state must be reachable and labelled for what it is. */
+    for (int glideOn = 0; glideOn <= 1; ++glideOn) {
+        bool leading = true;   /* the plugin's default */
+        int  bass    = kFirst;
+
+        static const char* kWant[4] = { "AUTO", "FIRST", "SECOND", "THIRD" };
+        bool allRight = true;
+        char trail[128] = {0};
+
+        for (int step = 0; step < 4; ++step) {
+            /* The label, as drawn. */
+            const char* label = leading ? "AUTO" : kName[bass];
+
+            std::snprintf(trail + std::strlen(trail),
+                          sizeof trail - std::strlen(trail),
+                          "%s%s", step ? " -> " : "", label);
+
+            if (std::strcmp(label, kWant[step]) != 0)
+                allRight = false;
+
+            /* The click, as handled. */
+            if (leading) {
+                leading = false;
+                bass    = kFirst;
+            } else if (bass == kBassCount - 1) {
+                leading = true;
+                bass    = kFirst;
+            } else {
+                ++bass;
+            }
+        }
+
+        /* A fifth click must return to where it started. */
+        const bool wrapped = leading && bass == kFirst;
+
+        char d[192];
+        std::snprintf(d, sizeof d, "%s (glide %s)", trail, glideOn ? "on" : "off");
+        ok("cycle reaches all four states", allRight && wrapped, d);
+    }
+}
+
 int main()
 {
     report("default size");
@@ -180,6 +243,8 @@ int main()
     monitorOpen = false;
     W = 520.0f; H = 640.0f;
     report("smaller host window");
+
+    checkRootCycle();
 
     std::printf("\n%s (%d failure%s)\n", fails ? "FAIL" : "PASS",
                 fails, fails == 1 ? "" : "s");

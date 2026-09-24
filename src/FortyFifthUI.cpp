@@ -1678,16 +1678,25 @@ protected:
                    fSingleNotes ? "SINGLE NOTES" : "CHORDS",
                    fSingleNotes);
         /*
-         * Which chord tone is in the bass. Voice leading overrides it - it
-         * picks the inversion by nearness to the previous chord, which is the
-         * whole point of it - so say so rather than showing a setting that is
-         * not being obeyed.
+         * Which chord tone is in the bass.
+         *
+         * The label reports the SETTING, not whether it happens to be acting
+         * right now. Plain glide suspends voice leading for the duration - a
+         * re-inversion cannot ride a single bend - but the setting is still
+         * auto, and it resumes the moment glide goes off or to MPE. Labelling
+         * that suspension as "FIRST" was a lie that cost real debugging time:
+         * the button read FIRST while leading was quietly producing B-E-G for
+         * an Em, and clicking it jumped to SECOND because the handler believed
+         * its own label and skipped the state it claimed to already be in.
+         *
+         * "(HELD)" marks the suspension without pretending the setting changed.
          */
-        const bool leadInForce = fVoiceLeading && fGlideMode != kGlideOn;
         drawButton(voiceLeadButton(),
-                   leadInForce ? "ROOT: AUTO"
-                               : kBassNoteName[fBassNote],
-                   leadInForce);
+                   fVoiceLeading
+                       ? (fGlideMode == kGlideOn ? "ROOT: AUTO (HELD)"
+                                                 : "ROOT: AUTO")
+                       : kBassNoteName[fBassNote],
+                   fVoiceLeading);
 
         /*
          * Row 2 differs by screen: the wheel wants per-ring extensions and
@@ -2062,9 +2071,13 @@ protected:
              * silently ignored - which is exactly how the old toggle appeared
              * to do nothing while glide had leading suppressed anyway.
              */
-            const bool leadInForce = fVoiceLeading && fGlideMode != kGlideOn;
-
-            if (leadInForce) {
+            /*
+             * Cycle on the SETTING, not on whether leading is currently in
+             * force. Keying off the latter meant that with glide on - where
+             * leading is suspended - a button reading "FIRST" would advance to
+             * SECOND, so FIRST was unreachable by clicking.
+             */
+            if (fVoiceLeading) {
                 fVoiceLeading = false;
                 fBassNote     = kBassFirst;
             } else if (fBassNote == kBassNoteCount - 1) {

@@ -1093,6 +1093,198 @@ struct ActiveCells {
 };
 
 /*
+ * ---- progressions ------------------------------------------------------
+ *
+ * A step sequencer for chords. One cell is one beat; one row is a section; the
+ * sections play one after another and then round again.
+ *
+ * Cells store a DEGREE, not a chord. A progression written as I-vi-IV-V is
+ * then the same progression in every key, and changing the key transposes it
+ * without rewriting it - which is the entire point of a circle-of-fifths
+ * instrument. The degree resolves to a ring and cell through cellForDegree(),
+ * the same call the keyboard and Slide Mode make, so a progression sounds
+ * identical to playing those cells by hand.
+ *
+ * Each cell also carries its own extension, because the user asked for chord
+ * type per cell rather than per column: a ii-V-I wants the ii and V as
+ * sevenths and the I plain, and that is a property of the step, not of the
+ * beat it falls on.
+ */
+
+/* An empty cell is a rest: the beat passes and nothing is triggered. Under
+ * legato a rest does NOT cut the previous chord - the chord rings until the
+ * next real trigger, which is what legato means here. */
+struct ProgCell {
+    bool      filled = false;
+    Degree    degree = kDegreeI;
+    Extension ext    = kExtNone;
+};
+
+static constexpr int kMaxProgSteps    = 16;   /* beats in a section */
+static constexpr int kMaxProgSections = 8;    /* A..H */
+
+struct ProgSection {
+    ProgCell cell[kMaxProgSteps];
+    int      length = 4;        /* beats actually played before moving on */
+};
+
+/* Sections are named by letter, as the user described them: A, B, C, D. */
+inline char sectionLetter(int index)
+{
+    return static_cast<char>('A' + (index % 26));
+}
+
+struct Progression {
+    ProgSection section[kMaxProgSections];
+    int         count = 1;      /* sections in use */
+
+    /* Total beats in one pass through every section. */
+    int totalBeats() const
+    {
+        int n = 0;
+        for (int i = 0; i < count; ++i)
+            n += section[i].length;
+        return n;
+    }
+
+    /*
+     * Where a beat lands, counting from the start of the whole progression and
+     * wrapping at the end.
+     *
+     * Sections CHAIN rather than layer: beat 0 is A's first step, and once A's
+     * length is used up the count carries into B. Returns false only if there
+     * is nothing to play at all, which keeps callers from dividing by zero
+     * when every section has been emptied.
+     */
+    bool locate(long long beat, int& outSection, int& outStep) const
+    {
+        const int total = totalBeats();
+        if (total <= 0)
+            return false;
+
+        /* True modulo: the host's beat count is free to be negative when a
+         * transport is rolled back before the start. */
+        long long b = beat % total;
+        if (b < 0) b += total;
+
+        for (int i = 0; i < count; ++i) {
+            const int len = section[i].length;
+            if (b < len) {
+                outSection = i;
+                outStep    = static_cast<int>(b);
+                return true;
+            }
+            b -= len;
+        }
+
+        /* Unreachable while total is the sum of the lengths, but a sequencer
+         * that silently played the wrong chord would be worse than one that
+         * plays none. */
+        return false;
+    }
+
+    /*
+     * Insert a copy of a section, either straight after it or at the end.
+     *
+     * Returns the new section's index, or -1 when full. "As next" is for
+     * building a variation you want heard immediately after the original; "as
+     * last" is for reusing a section later in the arrangement.
+     */
+    int duplicate(int index, bool asNext)
+    {
+        if (count >= kMaxProgSections || index < 0 || index >= count)
+            return -1;
+
+        const int dest = asNext ? index + 1 : count;
+
+        /* Open a gap, copying backwards so overlapping moves stay intact. */
+        for (int i = count; i > dest; --i)
+            section[i] = section[i - 1];
+
+        section[dest] = section[index];
+        ++count;
+        return dest;
+    }
+
+    /* Remove a section. The last one is never removed: a progression with no
+     * sections has nothing to show and no way back to a usable state. */
+    bool remove(int index)
+    {
+        if (count <= 1 || index < 0 || index >= count)
+            return false;
+
+        for (int i = index; i < count - 1; ++i)
+            section[i] = section[i + 1];
+
+        --count;
+        return true;
+    }
+
+    /* Append an empty section. Returns its index, or -1 when full. */
+    int add()
+    {
+        if (count >= kMaxProgSections)
+            return -1;
+
+        section[count] = ProgSection();
+        return count++;
+    }
+};
+
+/*
+ * Progressions offered in the left-hand menu.
+ *
+ * Written as degrees so each one works in any key. These are the progressions
+ * worth having to hand rather than an exhaustive catalogue - the grid is
+ * editable, so the menu only needs to save typing on the common ones.
+ */
+struct NamedProgression {
+    const char* name;
+    int         length;
+    Degree      degree[kMaxProgSteps];
+};
+
+static constexpr NamedProgression kPresetProgression[] = {
+    { "I-V-vi-IV",  4, { kDegreeI,  kDegreeV,   kDegreeVI, kDegreeIV  } },
+    { "I-vi-IV-V",  4, { kDegreeI,  kDegreeVI,  kDegreeIV, kDegreeV   } },
+    { "ii-V-I",     3, { kDegreeII, kDegreeV,   kDegreeI              } },
+    { "I-IV-V-I",   4, { kDegreeI,  kDegreeIV,  kDegreeV,  kDegreeI   } },
+    { "vi-IV-I-V",  4, { kDegreeVI, kDegreeIV,  kDegreeI,  kDegreeV   } },
+    { "I-IV-vi-V",  4, { kDegreeI,  kDegreeIV,  kDegreeVI, kDegreeV   } },
+    { "12-bar",     8, { kDegreeI,  kDegreeI,   kDegreeIV, kDegreeIV,
+                         kDegreeI,  kDegreeV,   kDegreeIV, kDegreeI   } },
+};
+
+static constexpr int kPresetProgressionCount =
+    static_cast<int>(sizeof(kPresetProgression) / sizeof(kPresetProgression[0]));
+
+/* Load a preset into section A, replacing whatever was there. Other sections
+ * are left alone, so a preset can be dropped into a section of a larger
+ * arrangement without losing the rest of it. */
+inline void loadPreset(Progression& prog, int presetIndex, int section)
+{
+    if (presetIndex < 0 || presetIndex >= kPresetProgressionCount)
+        return;
+    if (section < 0 || section >= kMaxProgSections)
+        return;
+
+    const NamedProgression& p = kPresetProgression[presetIndex];
+    ProgSection&            s = prog.section[section];
+
+    s = ProgSection();
+    s.length = p.length;
+
+    for (int i = 0; i < p.length && i < kMaxProgSteps; ++i) {
+        s.cell[i].filled = true;
+        s.cell[i].degree = p.degree[i];
+        s.cell[i].ext    = kExtNone;
+    }
+
+    if (section >= prog.count)
+        prog.count = section + 1;
+}
+
+/*
  * Bridge between the two translation units.
  *
  * getPluginInstancePointer() hands the UI a void* to the Plugin. Casting that to
