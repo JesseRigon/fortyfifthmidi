@@ -16,6 +16,7 @@
 #include "CircleTheory.hpp"
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +38,7 @@ namespace {
     std::mutex gRegistryMutex;
     std::map<void*, MonitorRing*> gRegistry;
     std::map<void*, ActiveCells*> gCellsRegistry;
+    std::map<void*, LogRing*>     gLogRegistry;
 }
 
 void registerMonitorRing(void* instance, MonitorRing* ring)
@@ -50,6 +52,7 @@ void unregisterMonitorRing(void* instance)
     const std::lock_guard<std::mutex> lock(gRegistryMutex);
     gRegistry.erase(instance);
     gCellsRegistry.erase(instance);
+    gLogRegistry.erase(instance);
 }
 
 void registerActiveCells(void* instance, ActiveCells* cells)
@@ -73,6 +76,20 @@ MonitorRing* monitorRingFor(void* instance)
     return (it != gRegistry.end()) ? it->second : nullptr;
 }
 
+void registerLogRing(void* instance, LogRing* ring)
+{
+    const std::lock_guard<std::mutex> lock(gRegistryMutex);
+    gLogRegistry[instance] = ring;
+}
+
+LogRing* logRingFor(void* instance)
+{
+    const std::lock_guard<std::mutex> lock(gRegistryMutex);
+    const std::map<void*, LogRing*>::const_iterator it =
+        gLogRegistry.find(instance);
+    return (it != gLogRegistry.end()) ? it->second : nullptr;
+}
+
 } /* namespace fortyfifth */
 
 START_NAMESPACE_DISTRHO
@@ -91,6 +108,7 @@ public:
         std::memcpy(fKeyMap, kDefaultKeyMap, sizeof(fKeyMap));
         registerMonitorRing(this, &fMonitor);
         registerActiveCells(this, &fCells);
+        registerLogRing(this, &fLog);
     }
 
     ~FortyFifthPlugin() override
@@ -164,6 +182,7 @@ protected:
         kStateUiScreen,
         kStateStorageMode,
         kStateMergeWindowMs,
+        kStateLogEnabled,
         kStateCount
     };
 
@@ -330,6 +349,13 @@ protected:
                 state.label = "Merge Window (ms)";
                 state.defaultValue = "20";
                 break;
+            case kStateLogEnabled:
+                /* Off by default: this is for chasing a fault, not for
+                 * running. A log left on writes a file forever. */
+                state.key = "logEnabled";
+                state.label = "Write Diagnostic Log";
+                state.defaultValue = "0";
+                break;
         }
     }
 
@@ -457,6 +483,8 @@ protected:
         else if (std::strcmp(key, "mergeWindowMs") == 0)
             fMergeWindowMs = (v < 0) ? 0
                            : (v > kMergeWindowMsMax) ? kMergeWindowMsMax : v;
+        else if (std::strcmp(key, "logEnabled") == 0)
+            fLogEnabled.store(v != 0, std::memory_order_release);
         else if (std::strcmp(key, "progRunning") == 0) {
             const bool want = (v != 0);
             if (want != fProgRunning.load(std::memory_order_acquire)) {
@@ -567,6 +595,8 @@ protected:
         else if (std::strcmp(key, "storageMode") == 0)
             v = static_cast<int>(fStorageMode);
         else if (std::strcmp(key, "mergeWindowMs") == 0) v = fMergeWindowMs;
+        else if (std::strcmp(key, "logEnabled") == 0)
+            v = fLogEnabled.load(std::memory_order_acquire) ? 1 : 0;
 
         std::snprintf(buf, sizeof(buf), "%d", v);
         return String(buf);
@@ -609,17 +639,53 @@ protected:
     void run(const float**, float**, uint32_t frames,
              const MidiEvent* midiEvents, uint32_t midiEventCount) override
     {
+        /* A fresh block means a fresh output buffer. DPF forbids writing again
+         * after a refusal until now, so this is where that latch clears. */
+        fOutputFull = false;
+
+        /*
+         * A refused note-off left the instrument holding a note nothing on
+         * this side will release. Retry it now that the buffer is fresh, since
+         * an all-notes-off is cheap and a stuck note is not.
+         */
+        if (fStuckNotes) {
+            fStuckNotes = false;
+            for (uint8_t ch = 0; ch < 16; ++ch)
+                sendRaw(0, 0xB0 | ch, 123, 0);   /* all notes off */
+            std::memset(fHeld, 0, sizeof(fHeld));
+            logLine("recovered from refused note-offs: all notes off");
+        }
+
         /* Announce the bend range once, before any glide can need it (spec 6.2
          * step 2). Doing it here rather than in activate() guarantees the host has
          * a real event buffer to receive it. */
-        if (fNeedsRpn) {
+        /* One channel per block; sendBendRangeRpn() clears fNeedsRpn when it
+         * has worked through them all. */
+        if (fNeedsRpn)
             sendBendRangeRpn(0);
-            fNeedsRpn = false;
-        }
 
         /* A panic silences everything, including anything the host or a previous
          * session left hanging. */
         if (fPanic.exchange(false, std::memory_order_acquire)) {
+            /*
+             * An UNCONDITIONAL all-notes-off, before anything else.
+             *
+             * stopAllGroups() can only silence notes the refcount says are
+             * held, so it cannot recover from a refcount that is itself wrong
+             * - which is exactly the state a dropped note-on leaves behind.
+             * Panic was therefore useless against the one failure it most
+             * needed to fix, and the user found that toggling glide worked
+             * where panic did not.
+             *
+             * This asks the instrument to release everything regardless of
+             * what this side believes, then resets the bookkeeping to match.
+             */
+            for (uint8_t ch = 0; ch < 16; ++ch) {
+                sendRaw(0, 0xB0 | ch, 123, 0);   /* all notes off */
+                sendRaw(0, 0xB0 | ch, 121, 0);   /* reset controllers */
+            }
+            std::memset(fHeld, 0, sizeof(fHeld));
+
             stopAllGroups(0);
             zeroAllBends(0);
             fGlideActive  = false;
@@ -627,6 +693,11 @@ protected:
              * pedal believed to be down would defer every later release. */
             fPedalDown    = false;
             fHeldKeyCount = 0;
+
+            fStuckNotes    = false;
+            fDroppedEvents = 0;
+            fCells.dropped.store(0, std::memory_order_release);
+            logLine("panic: all notes off on every channel");
         }
 
         /* Incoming MIDI, before gestures: a controller note triggers a cell just
@@ -693,8 +764,35 @@ private:
 
     /* ---- MIDI emission helpers ------------------------------------------- */
 
-    void sendRaw(uint32_t frame, uint8_t a, uint8_t b, uint8_t c, uint8_t size = 3)
+    /*
+     * Emit one MIDI message, and say whether the host actually took it.
+     *
+     * writeMidiEvent() returns false when the host's output buffer is full,
+     * and DPF is explicit that nothing more may be written until the next
+     * run(). Ignoring that return was the cause of a real and confusing bug:
+     * a chord is up to ten messages in one block (note-offs then note-ons), so
+     * a buffer filling part-way through silently dropped the rest. What
+     * reached the instrument was one note, or a fragment of a chord, while the
+     * monitor and the piano roll happily showed the whole thing - because they
+     * logged what was ATTEMPTED, not what was accepted.
+     *
+     * Now the monitor logs only what the host took, so the UI stops lying, and
+     * callers can keep their own bookkeeping honest. fDroppedEvents counts the
+     * rest, because a count of dropped messages is the one number that
+     * explains this class of symptom.
+     */
+    bool sendRaw(uint32_t frame, uint8_t a, uint8_t b, uint8_t c,
+                 uint8_t size = 3)
     {
+        /* Once the buffer has refused an event this block, DPF says not to try
+         * again until the next run(). Trying anyway is undefined. */
+        if (fOutputFull) {
+            ++fDroppedEvents;
+        fCells.dropped.store(fDroppedEvents, std::memory_order_release);
+            logLine("DROP (buffer full) %02X %02X %02X", a, b, c);
+            return false;
+        }
+
         MidiEvent ev;
         ev.frame   = frame;
         ev.size    = size;
@@ -703,9 +801,42 @@ private:
         ev.data[2] = c;
         ev.data[3] = 0;
         ev.dataExt = nullptr;
-        writeMidiEvent(ev);
+
+        if (! writeMidiEvent(ev)) {
+            fOutputFull = true;
+            ++fDroppedEvents;
+        fCells.dropped.store(fDroppedEvents, std::memory_order_release);
+            logLine("DROP (host refused) %02X %02X %02X", a, b, c);
+            return false;
+        }
 
         monitorLog(a, b, c);
+        logLine("out %02X %02X %02X", a, b, c);
+        return true;
+    }
+
+    /*
+     * Write one line to the diagnostic log, if it is enabled.
+     *
+     * Formats on the audio thread, which is fine - vsnprintf into a stack
+     * buffer allocates nothing - and hands the line to a ring the UI drains to
+     * a file. The audio thread never touches the filesystem.
+     *
+     * Costs nothing when logging is off: one atomic load and a return.
+     */
+    void logLine(const char* fmt, ...)
+    {
+        if (! fLogEnabled.load(std::memory_order_relaxed))
+            return;
+
+        char buf[LogRing::kLineMax];
+
+        va_list args;
+        va_start(args, fmt);
+        std::vsnprintf(buf, sizeof buf, fmt, args);
+        va_end(args);
+
+        fLog.push(buf);
     }
 
     /* Mirror every emitted message into the ring the UI drains for its event
@@ -731,16 +862,41 @@ private:
         sendRaw(frame, cc, 100, 127);
     }
 
-    /* Announce the bend range everywhere it could be needed. In MPE mode each
+    /*
+     * Announce the bend range everywhere it could be needed. In MPE mode each
      * member channel needs its own announcement, since a receiving instrument
-     * tracks bend sensitivity per channel. */
+     * tracks bend sensitivity per channel.
+     *
+     * ONE CHANNEL PER BLOCK. The full announcement is six messages per
+     * channel, and in MPE that is thirty-six in a burst - easily enough to
+     * fill a host's output buffer on its own. When that happened, every
+     * note-on for the chord being played at the same moment was silently
+     * dropped, and the chord arrived in pieces or not at all.
+     *
+     * Spreading the announcement over consecutive blocks costs a few
+     * milliseconds before the first bend is accurate, which is inaudible, and
+     * removes a burst that was corrupting real playing.
+     */
     void sendBendRangeRpn(uint32_t frame)
     {
-        sendBendRangeRpnOn(frame, fChannel);
+        if (fRpnChannel == 0) {
+            sendBendRangeRpnOn(frame, fChannel);
+            ++fRpnChannel;
 
-        if (fGlideMode == kGlideMpe) {
-            for (int i = 0; i < kMaxGroupNotes; ++i)
-                sendBendRangeRpnOn(frame, mpeChannelFor(i));
+            /* Non-MPE needs only the base channel. */
+            if (fGlideMode != kGlideMpe) {
+                fRpnChannel = 0;
+                fNeedsRpn   = false;
+            }
+            return;
+        }
+
+        const int i = fRpnChannel - 1;
+        sendBendRangeRpnOn(frame, mpeChannelFor(i));
+
+        if (++fRpnChannel > kMaxGroupNotes) {
+            fRpnChannel = 0;
+            fNeedsRpn   = false;
         }
     }
 
@@ -906,6 +1062,8 @@ private:
         g->midiNote = midiNote;
         g->age      = 0;
 
+        int written = 0;
+
         for (int i = 0; i < n; ++i) {
             const uint8_t note = notes[i];
             const bool    dup  = (fHeld[note] > 0);
@@ -916,10 +1074,38 @@ private:
 
             /* In MPE every voice owns its channel, so a duplicate pitch on a
              * different channel is not really a duplicate - always send it. */
-            if (mpe || ! dup || retriggerDuplicates)
-                sendRaw(frame, 0x90 | g->chan[i], note, velocity);
+            const bool needsSend = (mpe || ! dup || retriggerDuplicates);
+
+            /*
+             * The refcount must track what is SOUNDING, not what was asked
+             * for. Counting a note whose note-on the host refused left
+             * fHeld[note] claiming a note was down that never started: its
+             * note-off was then suppressed as a duplicate, and a note that had
+             * never sounded held a phantom reference for the rest of the
+             * session. That is the stuck-and-missing-note behaviour.
+             *
+             * A voice that could not be sent is dropped from the group
+             * entirely, so stopGroup() will not later try to silence it.
+             */
+            if (needsSend && ! sendRaw(frame, 0x90 | g->chan[i], note, velocity))
+                continue;
+
+            g->note[written] = note;
+            g->target[written] = note;
+            g->chan[written] = g->chan[i];
+            ++written;
 
             ++fHeld[note];
+        }
+
+        /* A group that lost voices is still a group - the ones that did sound
+         * must still be released properly. A group that lost ALL of them is
+         * not, and would otherwise sit active and silent forever. */
+        g->count = written;
+        if (written == 0) {
+            g->active = false;
+            logLine("group dropped: no voices reached the host");
+            return;
         }
 
         /* Light the cell. Driven from the group rather than from the gesture,
@@ -946,12 +1132,34 @@ private:
         for (int i = 0; i < g->count; ++i) {
             const uint8_t note = g->note[i];
 
+            /*
+             * The refcount drops only when the note-off is actually accepted.
+             * Decrementing on a refused note-off would leave the instrument
+             * holding a note that this side believes is already released - a
+             * stuck note with nothing left to release it.
+             *
+             * A refused note-off is recorded, and the next panic clears it.
+             * There is no better recovery inside one block: DPF forbids
+             * writing again until the next run(), and the group is going away
+             * now.
+             */
             if (g->mpe) {
                 /* Dedicated channel: nothing else can be relying on this note. */
-                sendRaw(frame, 0x80 | g->chan[i], note, 0);
-                if (fHeld[note] > 0) --fHeld[note];
-            } else if (fHeld[note] > 0 && --fHeld[note] == 0) {
-                sendRaw(frame, 0x80 | g->chan[i], note, 0);
+                if (sendRaw(frame, 0x80 | g->chan[i], note, 0)) {
+                    if (fHeld[note] > 0) --fHeld[note];
+                } else {
+                    fStuckNotes = true;
+                }
+            } else if (fHeld[note] == 1) {
+                /* Last holder: this note-off really silences the pitch. */
+                if (sendRaw(frame, 0x80 | g->chan[i], note, 0))
+                    --fHeld[note];
+                else
+                    fStuckNotes = true;
+            } else if (fHeld[note] > 1) {
+                /* Another group still wants this pitch: no message needed, and
+                 * the refcount drops with no risk of a drop. */
+                --fHeld[note];
             }
         }
 
@@ -2111,6 +2319,33 @@ private:
     /* Where saved progressions and preferences will live. Held so the choice
      * survives a session; nothing reads it until there is a store to open. */
     StorageMode fStorageMode = kStorageUser;
+
+    /*
+     * ---- MIDI output health -------------------------------------------------
+     *
+     * The host's output buffer can fill mid-chord. DPF says nothing more may
+     * be written until the next run(), so this latches for the rest of the
+     * block and clears at the top of the next one.
+     */
+    bool     fOutputFull    = false;
+
+    /* Messages the host would not take. Shown in the UI, because a non-zero
+     * count is the one number that explains a chord arriving in pieces. */
+    uint32_t fDroppedEvents = 0;
+
+    /* A note-off was refused, so something downstream may still be sounding.
+     * Cleared by an all-notes-off at the top of the next block. */
+    bool     fStuckNotes    = false;
+
+    /* Which channel's bend range is announced next. The announcement is spread
+     * over blocks so it cannot flood the output buffer - see
+     * sendBendRangeRpn(). Zero means the base channel. */
+    int      fRpnChannel    = 0;
+
+    /* The diagnostic log. Written by the audio thread, drained to a file by
+     * the UI. Off by default: it is for chasing a fault, not for running. */
+    LogRing           fLog;
+    std::atomic<bool> fLogEnabled { false };
 
     /* The beat last triggered, so a beat fires once however many times run()
      * is called inside it. -1 means nothing has played yet. */

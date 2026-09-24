@@ -70,6 +70,10 @@ public:
         pushProgression();
     }
 
+    /* Closing the editor must close the log, or the last lines never reach
+     * the file and the handle leaks for the life of the host. */
+    ~FortyFifthUI() override { closeLog(); }
+
 protected:
     void onNanoDisplay() override
     {
@@ -1023,6 +1027,11 @@ protected:
             return;
 
         fOctave = oct;
+
+        /* Record what was sent, so stateChanged() can tell this editor's own
+         * echo from a genuine change made elsewhere. */
+        fPushedOctave = fOctave;
+
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%d", fOctave);
         setState("octave", buf);
@@ -1460,6 +1469,74 @@ protected:
         drawPedalRow(a.y + a.h + 24.0f);
         drawMergeRow(a.y + a.h + 82.0f);
         drawStorageRow(a.y + a.h + 140.0f);
+        drawLogRow(a.y + a.h + 198.0f);
+    }
+
+    /*
+     * The diagnostic log.
+     *
+     * The event monitor shows MIDI as it is emitted; this records what never
+     * became MIDI - a write the host refused, a voice dropped from a chord, a
+     * recovery from a stuck note. Those are invisible in the UI by
+     * construction, and they are exactly what explains a chord arriving in
+     * pieces while the monitor insists it was correct.
+     *
+     * Off by default. A log left running writes a file forever.
+     */
+    void drawLogRow(float labelY)
+    {
+        const Button a = keyboardArea();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(11.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.62f, 0.66f, 0.72f));
+        text(a.x, labelY, "Diagnostic log:", nullptr);
+
+        drawToggle(logButton(),
+                   fLogEnabled ? "WRITING" : "OFF",
+                   fLogEnabled);
+
+        fontSize(9.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.45f, 0.49f, 0.57f));
+
+        if (fLogEnabled && fLogPath[0] != '\0') {
+            /* Truncated from the left: the end of a path identifies it. */
+            const size_t len = std::strlen(fLogPath);
+            const size_t cap = 70;
+            text(logButton().x + logButton().w + 12.0f,
+                 logButton().y + logButton().h * 0.5f,
+                 len > cap ? fLogPath + (len - cap) : fLogPath, nullptr);
+        } else {
+            text(logButton().x + logButton().w + 12.0f,
+                 logButton().y + logButton().h * 0.5f,
+                 "records dropped notes and recoveries", nullptr);
+        }
+
+        /*
+         * The dropped-event count, when it is not zero.
+         *
+         * This is the number that explains the fault. A non-zero count means
+         * the host refused MIDI the plugin tried to send, which is why a chord
+         * came out wrong while every display said it was right.
+         */
+        if (fDroppedEvents > 0) {
+            char warn[96];
+            std::snprintf(warn, sizeof warn,
+                          "%u MIDI message%s dropped by the host",
+                          fDroppedEvents, fDroppedEvents == 1 ? "" : "s");
+
+            fontSize(10.0f);
+            fillColor(Color(0.88f, 0.55f, 0.40f));
+            text(a.x, labelY + 62.0f, warn, nullptr);
+        }
+    }
+
+    Button logButton() const
+    {
+        const Button a = keyboardArea();
+        return { a.x, a.y + a.h + 208.0f, 210.0f, 24.0f };
     }
 
     /*
@@ -3594,6 +3671,21 @@ protected:
                 repaint();
                 return true;
             }
+            if (hit(logButton(), px, py)) {
+                fLogEnabled = ! fLogEnabled;
+
+                char b[8];
+                std::snprintf(b, sizeof b, "%d", fLogEnabled ? 1 : 0);
+                setState("logEnabled", b);
+
+                /* Closing here rather than at the next idle, so the file is
+                 * complete the moment the button says it stopped. */
+                if (! fLogEnabled)
+                    closeLog();
+
+                repaint();
+                return true;
+            }
             const int pc = hitKey(px, py);
             if (pc >= 0) {
                 fEditKey  = pc;
@@ -4362,7 +4454,22 @@ protected:
             fRingVoice[key[5] - '0'] = clampEnum<Voicing>(v, kVoicingCount);
         }
         else if (std::strcmp(key, "octave") == 0) {
-            fOctave = (v < 1) ? 1 : (v > 7) ? 7 : v;
+            /*
+             * NOT taken while Slide Mode is playing.
+             *
+             * applySection() pushes a COMBINED octave - the slider's base plus
+             * the strip's own shift plus the section's - and a host that
+             * echoes state back would land that combined value here, where it
+             * would be read as a new base. The base would then drift by the
+             * shift on every press until every section played the same octave,
+             * which is exactly what was reported.
+             *
+             * fPushedOctave holds what this editor last sent, so anything
+             * equal to it is our own echo and is ignored. A genuine change
+             * from elsewhere still lands.
+             */
+            if (v != fPushedOctave)
+                fOctave = (v < 1) ? 1 : (v > 7) ? 7 : v;
         }
         else if (std::strcmp(key, "latch") == 0)
             fLatchEnabled = (v != 0);
@@ -4388,6 +4495,11 @@ protected:
         else if (std::strcmp(key, "mergeWindowMs") == 0)
             fMergeWindowMs = (v < 0) ? 0
                            : (v > kMergeWindowMsMax) ? kMergeWindowMsMax : v;
+        else if (std::strcmp(key, "logEnabled") == 0) {
+            fLogEnabled = (v != 0);
+            if (! fLogEnabled)
+                closeLog();
+        }
         else if (std::strcmp(key, "progLegato") == 0)
             fProgLegato = (v != 0);
         else if (std::strcmp(key, "progRunning") == 0)
@@ -4410,16 +4522,97 @@ protected:
         return static_cast<T>(((v % count) + count) % count);
     }
 
+    /*
+     * ---- the diagnostic log file -------------------------------------------
+     *
+     * Opened lazily on the first line, so turning the log on does not create a
+     * file until there is something to put in it. Written from uiIdle(), never
+     * from the audio thread.
+     */
+    void openLog()
+    {
+        if (fLogFile != nullptr)
+            return;
+
+        /* Alongside wherever the user chose to keep their data. The log is a
+         * diagnostic, not a document, so it goes to a fixed name that is
+         * overwritten rather than accumulating files nobody deletes. */
+#if defined(_WIN32)
+        const char* base = std::getenv("LOCALAPPDATA");
+        std::snprintf(fLogPath, sizeof fLogPath,
+                      "%s\\FortyFifthMidi\\fortyfifth-log.txt",
+                      base ? base : ".");
+#else
+        const char* home = std::getenv("HOME");
+        std::snprintf(fLogPath, sizeof fLogPath,
+                      "%s/fortyfifth-log.txt", home ? home : ".");
+#endif
+
+        fLogFile = std::fopen(fLogPath, "w");
+
+        if (fLogFile == nullptr) {
+            /* Say so rather than appearing to log into the void. */
+            std::snprintf(fLogPath, sizeof fLogPath, "(cannot open log file)");
+            fLogEnabled = false;
+            return;
+        }
+
+        std::fprintf(fLogFile,
+                     "FortyFifthMidi diagnostic log\n"
+                     "Lines marked DROP are messages the host refused; a chord\n"
+                     "containing one arrived at the instrument incomplete.\n\n");
+        std::fflush(fLogFile);
+    }
+
+    void closeLog()
+    {
+        if (fLogFile == nullptr)
+            return;
+
+        std::fclose(fLogFile);
+        fLogFile = nullptr;
+    }
+
+    /* Drain whatever the DSP has queued. Flushed every pass: a log that loses
+     * its last lines to a crash is no use for diagnosing a crash. */
+    void drainLog()
+    {
+        if (fLogRing == nullptr)
+            return;
+
+        char line[LogRing::kLineMax];
+        bool any = false;
+
+        while (fLogRing->pop(line, sizeof line)) {
+            if (! fLogEnabled)
+                continue;          /* keep draining, but do not write */
+
+            openLog();
+            if (fLogFile == nullptr)
+                return;
+
+            std::fprintf(fLogFile, "%s\n", line);
+            any = true;
+        }
+
+        if (any)
+            std::fflush(fLogFile);
+    }
+
     void uiIdle() override
     {
         if (fRing == nullptr) {
             /* The plugin registers both at construction; look them up once. */
             void* inst = getPluginInstancePointer();
-            fRing  = monitorRingFor(inst);
-            fCells = activeCellsFor(inst);
+            fRing    = monitorRingFor(inst);
+            fCells   = activeCellsFor(inst);
+            fLogRing = logRingFor(inst);
             if (fRing == nullptr)
                 return;
         }
+
+        /* Always drained, so the ring cannot back up while the log is off. */
+        drainLog();
 
         /*
          * Poll the highlight regardless of the monitor, and BEFORE the early
@@ -4456,6 +4649,15 @@ protected:
             if (! fDragging && fPointerSlide >= 0 && ! fCells->any()) {
                 fPointerSlide = -1;
                 repaint();
+            }
+
+            /* The dropped-message count, on the same terms. */
+            const uint32_t drops =
+                fCells->dropped.load(std::memory_order_acquire);
+            if (drops != fDroppedEvents) {
+                fDroppedEvents = drops;
+                if (fScreen == kScreenKeys)
+                    repaint();
             }
 
             /* The sequencer's playhead, on the same terms: polled every idle,
@@ -4643,6 +4845,18 @@ private:
      * replacing the other. */
     int  fMergeWindowMs = kMergeWindowMsDefault;
     bool fMergeDrag     = false;
+
+    /*
+     * The diagnostic log. The DSP formats lines into a ring; this side writes
+     * them out, because the audio thread must never touch a file.
+     */
+    bool        fLogEnabled = false;
+    std::FILE*  fLogFile    = nullptr;
+    char        fLogPath[512] = {0};
+    LogRing*    fLogRing    = nullptr;
+
+    /* Messages the host refused, mirrored from the DSP for the warning line. */
+    uint32_t    fDroppedEvents = 0;
 
     /* How many beats the grid shows. Not the loop length - a section plays its
      * own length, which is free to be shorter. */

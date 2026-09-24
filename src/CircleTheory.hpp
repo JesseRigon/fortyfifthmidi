@@ -1203,6 +1203,62 @@ inline int buildChord(int rootPitchClass,
  * drains from uiIdle(). Events are dropped when the ring is full, which is the
  * right trade for a monitor: it must never stall the audio thread.
  */
+/*
+ * A lock-free ring of TEXT lines, for the diagnostic log.
+ *
+ * The event monitor shows MIDI as it is emitted, which is not enough to
+ * explain why a chord arrives in pieces: the interesting facts are the ones
+ * that never became MIDI - a refused write, a voice dropped from a group, a
+ * gesture that arrived while another was in flight.
+ *
+ * The audio thread must never touch a file, so it formats into this ring and
+ * the UI writes it out from its idle callback. Lines are fixed-width and
+ * pre-allocated: formatting on the audio thread is fine, allocating is not.
+ *
+ * Overflow drops the OLDEST line rather than the newest, because when
+ * something goes wrong the lines immediately before and after it are the ones
+ * worth keeping, and a reader who is behind has already lost the thread.
+ */
+struct LogRing {
+    static constexpr uint32_t kCapacity = 512;
+    static constexpr uint32_t kLineMax  = 96;
+
+    char                  line[kCapacity][kLineMax] = {{0}};
+    std::atomic<uint32_t> write { 0 };
+    std::atomic<uint32_t> read  { 0 };
+
+    /* Audio thread. Never blocks, never allocates. */
+    void push(const char* text)
+    {
+        const uint32_t w = write.load(std::memory_order_relaxed);
+
+        /* snprintf rather than strncpy: it always terminates, and it does not
+         * warn about a source exactly as long as the destination. */
+        std::snprintf(line[w % kCapacity], kLineMax, "%s", text);
+
+        write.store(w + 1, std::memory_order_release);
+
+        /* Full: advance the reader so the oldest line is overwritten rather
+         * than the newest refused. */
+        const uint32_t r = read.load(std::memory_order_acquire);
+        if (w + 1 - r > kCapacity)
+            read.store(w + 1 - kCapacity, std::memory_order_release);
+    }
+
+    /* UI thread. Returns false when drained. */
+    bool pop(char* out, size_t cap)
+    {
+        const uint32_t r = read.load(std::memory_order_relaxed);
+        if (r == write.load(std::memory_order_acquire))
+            return false;
+
+        std::snprintf(out, cap, "%s", line[r % kCapacity]);
+
+        read.store(r + 1, std::memory_order_release);
+        return true;
+    }
+};
+
 struct MonitorRing {
     static constexpr uint32_t kCapacity = 256;
 
@@ -1298,6 +1354,16 @@ struct ActiveCells {
      * holds a pointer to this.
      */
     std::atomic<int32_t> playhead { -1 };
+
+    /*
+     * Messages the host refused, for the editor's warning line.
+     *
+     * Carried here for the same reason as the playhead: one word, written by
+     * the audio thread, read by the UI. A non-zero count is the single number
+     * that explains a chord arriving in pieces while every display insists it
+     * was correct.
+     */
+    std::atomic<uint32_t> dropped { 0 };
 
     void setPlayhead(int section, int step)
     {
@@ -1775,6 +1841,10 @@ void unregisterMonitorRing(void* pluginInstance);
 /* Same registry, so the UI finds its own instance's highlight state. */
 ActiveCells* activeCellsFor(void* pluginInstance);
 void registerActiveCells(void* pluginInstance, ActiveCells* cells);
+
+/* And the diagnostic log, which the UI drains to a file. */
+LogRing* logRingFor(void* pluginInstance);
+void registerLogRing(void* pluginInstance, LogRing* ring);
 
 } /* namespace fortyfifth */
 
