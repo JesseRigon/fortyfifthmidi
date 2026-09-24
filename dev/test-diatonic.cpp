@@ -73,6 +73,19 @@ static void checkDegree(Degree d, Extension ext, int keyIndex, bool verbose)
         extendChord(defaultChordForRing(ring), ext, dominant,
                     semitoneForDegree(d));
 
+    /*
+     * An extension that does not exist on this degree is reported as such
+     * rather than substituted, and the UI omits it. Nothing sounds, so there
+     * is nothing to check against the key.
+     */
+    if (! chordExists(type)) {
+        if (verbose)
+            std::printf("  --    %-4s %-12s in %-2s  not in key, omitted\n",
+                        kDegreeCell[d].numeral, kExtensionName[ext],
+                        kPitch[tonicForKeyIndex(keyIndex)]);
+        return;
+    }
+
     uint8_t notes[kMaxChordTones];
     const int n = buildChord(root, type, 4 * 12, notes, kMaxChordTones);
 
@@ -245,6 +258,138 @@ int main()
         } else {
             std::printf("  FAIL  %-30s got %s\n", "vii7 is m7b5",
                         kChordShape[type].name);
+            ++failures;
+        }
+    }
+
+    /*
+     * The editor offers only the extensions that exist on a degree, and the
+     * row-to-extension mapping must be self-consistent: the menu DRAWS by row
+     * and APPLIES by row, so if those disagree, picking "7th" sets something
+     * else. Transcribed from FortyFifthUI.cpp, which needs the DPF UI stack to
+     * compile.
+     */
+    std::printf("\n=== the menu offers only what exists ===\n");
+    {
+        auto available = [](Degree d, Extension e) -> bool {
+            int  position = 0;
+            Ring ring     = kRingKey;
+            cellForDegree(d, 0, position, ring);
+            return chordExists(extendChord(defaultChordForRing(ring), e,
+                                           degreeIsDominant(d),
+                                           semitoneForDegree(d)));
+        };
+
+        auto countFor = [&](Degree d) {
+            int n = 0;
+            for (int e = 0; e < kExtCount; ++e)
+                if (available(d, static_cast<Extension>(e))) ++n;
+            return n;
+        };
+
+        auto extAt = [&](Degree d, int row) -> Extension {
+            int n = 0;
+            for (int e = 0; e < kExtCount; ++e) {
+                if (! available(d, static_cast<Extension>(e))) continue;
+                if (n == row) return static_cast<Extension>(e);
+                ++n;
+            }
+            return kExtNone;
+        };
+
+        auto rowOf = [&](Degree d, Extension want) {
+            int n = 0;
+            for (int e = 0; e < kExtCount; ++e) {
+                if (! available(d, static_cast<Extension>(e))) continue;
+                if (static_cast<Extension>(e) == want) return n;
+                ++n;
+            }
+            return 0;
+        };
+
+        bool consistent = true;
+        for (int dd = 0; dd < kDegreeCount; ++dd) {
+            const Degree d = static_cast<Degree>(dd);
+            const int    n = countFor(d);
+
+            /* Every row must map to an available extension, and back to the
+             * same row. */
+            for (int r = 0; r < n; ++r) {
+                const Extension e = extAt(d, r);
+                if (! available(d, e) || rowOf(d, e) != r)
+                    consistent = false;
+            }
+
+            char detail[64];
+            std::snprintf(detail, sizeof detail, "%d of %d extensions",
+                          n, static_cast<int>(kExtCount));
+
+            /* A degree must always offer at least the plain triad, or its
+             * cells would have no chord at all. */
+            if (n >= 1) {
+                std::printf("  ok    %-4s %-25s %s\n",
+                            kDegreeCell[dd].numeral, "has options", detail);
+            } else {
+                std::printf("  FAIL  %-4s %-25s none\n",
+                            kDegreeCell[dd].numeral, "has options");
+                ++failures;
+            }
+        }
+
+        if (consistent) {
+            std::printf("  ok    %-30s rows map both ways\n",
+                        "the mapping is consistent");
+        } else {
+            std::printf("  FAIL  %-30s a row maps to the wrong extension\n",
+                        "the mapping is consistent");
+            ++failures;
+        }
+
+        /* The triad is always first, so a cell that loses its extension lands
+         * on something valid. */
+        bool triadFirst = true;
+        for (int dd = 0; dd < kDegreeCount; ++dd)
+            if (extAt(static_cast<Degree>(dd), 0) != kExtNone)
+                triadFirst = false;
+
+        if (triadFirst) {
+            std::printf("  ok    %-30s every degree\n", "the triad is row 0");
+        } else {
+            std::printf("  FAIL  %-30s a degree omits the triad\n",
+                        "the triad is row 0");
+            ++failures;
+        }
+    }
+
+    /*
+     * Where a grid position must be filled - Slide Mode's variation rows,
+     * where each row is an extension and a row cannot vanish - the plain triad
+     * stands in, and it is always a real chord.
+     */
+    std::printf("\n=== the triad fallback always yields a chord ===\n");
+    {
+        bool allReal = true;
+        for (int dd = 0; dd < kDegreeCount; ++dd) {
+            const Degree d = static_cast<Degree>(dd);
+
+            int  position = 0;
+            Ring ring     = kRingKey;
+            cellForDegree(d, 0, position, ring);
+
+            for (int e = 0; e < kExtCount; ++e)
+                if (! chordExists(extendChordOrTriad(
+                        defaultChordForRing(ring), static_cast<Extension>(e),
+                        degreeIsDominant(d), semitoneForDegree(d))))
+                    allReal = false;
+        }
+
+        if (allReal) {
+            std::printf("  ok    %-30s %d combinations\n",
+                        "never returns nothing",
+                        static_cast<int>(kDegreeCount * kExtCount));
+        } else {
+            std::printf("  FAIL  %-30s returned nothing\n",
+                        "never returns nothing");
             ++failures;
         }
     }

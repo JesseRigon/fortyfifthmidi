@@ -1996,15 +1996,26 @@ private:
      * same ring. Without it, G in the key of C came out as Gmaj7 and sounded
      * an F# that is not in the key.
      */
+    /*
+     * The position is needed, not just the ring: V takes a DOMINANT seventh
+     * while I and IV take major ones, and all three are major triads on the
+     * same ring.
+     *
+     * Falls back to the plain triad where the extension is not in the key, so
+     * the DSP always has something to sound. The editor's job is to stop such
+     * a combination being chosen at all; this is the backstop for a state
+     * restored from an older session, or a key changed under a held setting.
+     */
     ChordType chordTypeForRing(Ring ring, int position) const
     {
         if (fSingleNotes)
             return kChordSingleNote;
 
         const int key = fSelectedKey.load(std::memory_order_acquire);
-        return extendChord(defaultChordForRing(ring), fRingExtension[ring],
-                           cellIsDominant(position, ring, key),
-                           semitoneForCell(position, ring, key));
+        return extendChordOrTriad(defaultChordForRing(ring),
+                                  fRingExtension[ring],
+                                  cellIsDominant(position, ring, key),
+                                  semitoneForCell(position, ring, key));
     }
 
     /* As above, but with the extension given rather than taken from the ring.
@@ -2014,9 +2025,9 @@ private:
     {
         if (fSingleNotes)
             return kChordSingleNote;
-        return extendChord(defaultChordForRing(ring), ext,
-                           degreeIsDominant(degree),
-                           semitoneForDegree(degree));
+        return extendChordOrTriad(defaultChordForRing(ring), ext,
+                                  degreeIsDominant(degree),
+                                  semitoneForDegree(degree));
     }
 
 

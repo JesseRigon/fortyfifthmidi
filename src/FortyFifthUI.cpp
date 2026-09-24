@@ -1126,14 +1126,21 @@ protected:
         int       oct;
         sectionSettings(section, ext, oct);
 
-        /* V takes a dominant seventh, not a major one - see extendChord().
+        /*
+         * V takes a dominant seventh, not a major one - see extendChord().
          * The label has to agree with the notes, or the strip would promise
-         * Gmaj7 and sound G7. */
+         * Gmaj7 and sound G7.
+         *
+         * Where the row's extension is not in the key at all, the strip shows
+         * the plain triad: a variation row is a fixed position in a grid and
+         * cannot vanish, and the triad is always available. The label says
+         * "C" rather than "C9", so what is shown is what will sound.
+         */
         const ChordType base = fSingleNotes
             ? kChordSingleNote
-            : extendChord(defaultChordForRing(ring), ext,
-                          degreeIsDominant(defs[slide].degree),
-                          semitoneForDegree(defs[slide].degree));
+            : extendChordOrTriad(defaultChordForRing(ring), ext,
+                                 degreeIsDominant(defs[slide].degree),
+                                 semitoneForDegree(defs[slide].degree));
 
         /* The cell's own label already carries the minor 'm' and the dim sign,
          * so append only what the extension adds beyond the triad. */
@@ -2660,6 +2667,13 @@ protected:
                 } else {
                     cell.filled = true;
                     cell.degree = static_cast<Degree>(row - 1);
+
+                    /* The new degree may not carry the extension the cell
+                     * had - a 9th moved from ii to iii, say. Dropping to the
+                     * triad is the honest outcome; keeping a setting the
+                     * chord cannot express would put the lie back. */
+                    if (! extAvailable(cell.degree, cell.ext))
+                        cell.ext = kExtNone;
                 }
                 break;
 
@@ -2672,7 +2686,7 @@ protected:
 
             default:   /* kMenuCellMod */
                 cell.filled = true;
-                cell.ext    = static_cast<Extension>(row);
+                cell.ext    = availableExtAt(cell.degree, row);
                 break;
         }
 
@@ -2682,6 +2696,65 @@ protected:
     static const char* cellChordRowLabel(int row)
     {
         return (row == 0) ? "Rest" : kDegreeCell[row - 1].numeral;
+    }
+
+    /*
+     * ---- extensions that exist on a degree ----------------------------------
+     *
+     * Not every extension is diatonic on every degree: a 9th on iii and a sus4
+     * on IV both reach outside the key. Those are omitted from the menu
+     * entirely rather than offered and then substituted, because a substitute
+     * looks like the plugin obeyed.
+     *
+     * The three functions below convert between a menu row and an Extension,
+     * and they must agree - the menu draws by row and applies by row.
+     */
+    static bool extAvailable(Degree d, Extension e)
+    {
+        int  position = 0;
+        Ring ring     = kRingKey;
+        cellForDegree(d, 0, position, ring);   /* key-independent: degrees */
+
+        return chordExists(extendChord(defaultChordForRing(ring), e,
+                                       degreeIsDominant(d),
+                                       semitoneForDegree(d)));
+    }
+
+    static int availableExtCount(Degree d)
+    {
+        int n = 0;
+        for (int e = 0; e < kExtCount; ++e)
+            if (extAvailable(d, static_cast<Extension>(e)))
+                ++n;
+        return n;
+    }
+
+    /* The Extension a menu row selects. */
+    static Extension availableExtAt(Degree d, int row)
+    {
+        int n = 0;
+        for (int e = 0; e < kExtCount; ++e) {
+            if (! extAvailable(d, static_cast<Extension>(e)))
+                continue;
+            if (n == row)
+                return static_cast<Extension>(e);
+            ++n;
+        }
+        return kExtNone;
+    }
+
+    /* The row an Extension sits on, for the current-value highlight. */
+    static int availableExtRow(Degree d, Extension want)
+    {
+        int n = 0;
+        for (int e = 0; e < kExtCount; ++e) {
+            if (! extAvailable(d, static_cast<Extension>(e)))
+                continue;
+            if (static_cast<Extension>(e) == want)
+                return n;
+            ++n;
+        }
+        return 0;
     }
 
     static const char* cellOctaveRowLabel(int row)
@@ -3246,12 +3319,17 @@ protected:
                 cur    = fProg.section[fEditSection].cell[fEditStep].octave
                        - kProgOctaveMin;
                 break;
-            case kMenuCellMod:
-                rows   = static_cast<int>(kExtCount);
+            case kMenuCellMod: {
+                /* Only the extensions that exist on this degree in this key.
+                 * An option that cannot be honoured should not be offered. */
+                rows   = availableExtCount(
+                             fProg.section[fEditSection].cell[fEditStep].degree);
                 anchor = cellEditModRect();
-                cur    = static_cast<int>(
+                cur    = availableExtRow(
+                             fProg.section[fEditSection].cell[fEditStep].degree,
                              fProg.section[fEditSection].cell[fEditStep].ext);
                 break;
+            }
             case kMenuDuplicate:
                 rows   = 2;
                 anchor = progDupRect(fMenuSection);
@@ -3276,7 +3354,9 @@ protected:
             case kMenuStorage: return kStorageModeName[i];
             case kMenuCellChord:  return cellChordRowLabel(i);
             case kMenuCellOctave: return cellOctaveRowLabel(i);
-            case kMenuCellMod:    return kExtensionName[i];
+            case kMenuCellMod:
+                return kExtensionName[availableExtAt(
+                    fProg.section[fEditSection].cell[fEditStep].degree, i)];
             case kMenuDuplicate: return i == 0 ? "Duplicate as next"
                                                : "Duplicate as last";
             default:           return kExtensionName[i];

@@ -305,13 +305,12 @@ inline ChordType extendChord(ChordType base, Extension ext,
         case kExt6:
             /*
              * A "minor 6th" chord has a MAJOR sixth interval (+9). That is
-             * diatonic on ii but sharp on iii and vi, where it sounded a C#
-             * and an F# in the key of C. Those degrees fall back to the plain
-             * triad rather than to a minor-sixth interval, which would be the
-             * same note as the flat seventh and not a sixth chord at all.
+             * diatonic on ii but sharp on iii and vi.
              */
-            if (isMinor) return inKey(scaleDegree, 9) ? kChordMinor6 : base;
-            if (isMajor) return inKey(scaleDegree, 9) ? kChordMajor6 : base;
+            if (isMinor) return inKey(scaleDegree, 9) ? kChordMinor6
+                                                      : kChordTypeCount;
+            if (isMajor) return inKey(scaleDegree, 9) ? kChordMajor6
+                                                      : kChordTypeCount;
             return base;                       /* no standard dim 6 */
         case kExt7:
             if (isMinor) return kChordMinor7;
@@ -319,30 +318,53 @@ inline ChordType extendChord(ChordType base, Extension ext,
             if (isMajor) return dominant ? kChordDominant7 : kChordMajor7;
             return base;
         case kExt9:
-            /* The ninth is a major second above the root (+14). On iii that
-             * is sharp, so the chord stays a seventh instead. */
+            /* The ninth is a major second above the root (+14); sharp on
+             * iii. */
             if (isMinor) return inKey(scaleDegree, 14) ? kChordMinor9
-                                                       : kChordMinor7;
+                                                       : kChordTypeCount;
             if (isMajor) return inKey(scaleDegree, 14)
                        ? (dominant ? kChordDominant9 : kChordMajor9)
-                       : (dominant ? kChordDominant7 : kChordMajor7);
+                       : kChordTypeCount;
             return base;
         case kExtAdd9:
-            if (isMajor) return inKey(scaleDegree, 14) ? kChordAdd9 : base;
+            if (isMajor) return inKey(scaleDegree, 14) ? kChordAdd9
+                                                       : kChordTypeCount;
             return base;                       /* add9 on minor not in the table */
         case kExtSus2:
             /* Sus chords replace the third, so what matters is whether the
              * replacement is in the key: +2 for sus2, +5 for sus4. On iii the
-             * second is sharp; on IV the fourth is the tritone. Either way the
-             * triad is the honest answer. */
+             * second is sharp; on IV the fourth is the tritone. */
             if (isDim) return base;
-            return inKey(scaleDegree, 2) ? kChordSus2 : base;
+            return inKey(scaleDegree, 2) ? kChordSus2 : kChordTypeCount;
         case kExtSus4:
             if (isDim) return base;
-            return inKey(scaleDegree, 5) ? kChordSus4 : base;
+            return inKey(scaleDegree, 5) ? kChordSus4 : kChordTypeCount;
         default:
             return base;
     }
+}
+
+/*
+ * kChordTypeCount as a return from extendChord() means "this extension does
+ * not exist on this degree in this key".
+ *
+ * Reported rather than substituted, because a substitute is the same lie in a
+ * different place: asking for a 9th on iii and being handed a 7th looks like
+ * the plugin obeyed. The UI leaves such a cell blank, omits the option, or
+ * falls back to the plain triad where a grid position must be filled - and
+ * each of those tells the truth about what is available.
+ */
+inline bool chordExists(ChordType t) { return t != kChordTypeCount; }
+
+/* The chord for a cell, or its plain triad when the chosen extension is not
+ * in the key. For places that must show SOMETHING in a fixed position - the
+ * variation rows of Slide Mode, where each row is a different extension and a
+ * row cannot simply vanish. */
+inline ChordType extendChordOrTriad(ChordType base, Extension ext,
+                                    bool dominant, int scaleDegree)
+{
+    const ChordType t = extendChord(base, ext, dominant, scaleDegree);
+    return chordExists(t) ? t : base;
 }
 
 /* Semitones above the tonic for each scale degree, for the key check in
