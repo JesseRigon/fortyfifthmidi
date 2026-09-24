@@ -1090,6 +1090,35 @@ struct ActiveCells {
                 return true;
         return false;
     }
+
+    /*
+     * Where the sequencer is, packed as (section << 8) | step, or -1 when it
+     * is not running.
+     *
+     * Carried here rather than through a registry of its own because it is the
+     * same kind of fact as the lit cells - one word, written by the audio
+     * thread, read by the UI to draw what is sounding - and the UI already
+     * holds a pointer to this.
+     */
+    std::atomic<int32_t> playhead { -1 };
+
+    void setPlayhead(int section, int step)
+    {
+        playhead.store((section << 8) | step, std::memory_order_release);
+    }
+
+    void clearPlayhead() { playhead.store(-1, std::memory_order_release); }
+
+    /* UI thread. Returns false when the sequencer is stopped. */
+    bool playheadAt(int& outSection, int& outStep) const
+    {
+        const int32_t v = playhead.load(std::memory_order_acquire);
+        if (v < 0)
+            return false;
+        outSection = (v >> 8) & 0xFF;
+        outStep    = v & 0xFF;
+        return true;
+    }
 };
 
 /*

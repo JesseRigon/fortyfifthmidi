@@ -26,6 +26,14 @@ START_NAMESPACE_DISTRHO
 
 using namespace fortyfifth;
 
+/* Short form of each extension, for the places where the full name does not
+ * fit: "None (triad)" clipped once the per-ring tags went uppercase, and a
+ * clipped label is worse than a terse one. The sequencer's cells are tighter
+ * still, so they use these too. */
+static const char* const kExtShort[kExtCount] = {
+    "TRIAD", "6TH", "7TH", "9TH", "ADD9", "SUS2", "SUS4"
+};
+
 class FortyFifthUI : public UI
 {
     static constexpr size_t kLogLines = 14;
@@ -54,6 +62,12 @@ public:
         /* Same factory bindings the DSP starts with, so the editor shows the
          * truth before anything has been changed. */
         std::memcpy(fKeyMap, kDefaultKeyMap, sizeof(fKeyMap));
+
+        /* A progression to open on, rather than an empty grid that gives no
+         * hint of what the screen is for. Pushed across so the DSP is holding
+         * the same one the grid is showing. */
+        loadPreset(fProg, 0, 0);
+        pushProgression();
     }
 
 protected:
@@ -356,6 +370,72 @@ protected:
         setState("keyMap", out);
     }
 
+    /*
+     * Send the whole grid across as one string.
+     *
+     * Sections are separated by ';', cells by ',', and a cell is
+     * "degree.extension" or "-" for a rest; the section's length comes first.
+     * So "4|0.0,5.2,3.0,4.0;2|0.0,4.0" is a four-beat I-vi-IV-V followed by a
+     * two-beat I-V.
+     *
+     * One string rather than a key per cell because the DSP must never see a
+     * half-applied grid: a progression arriving cell by cell would play a
+     * chimera of the old and new for however many beats the update straddled.
+     */
+    void pushProgression()
+    {
+        char out[1024] = {0};
+        int  len = 0;
+
+        for (int s = 0; s < fProg.count; ++s) {
+            const ProgSection& sec = fProg.section[s];
+
+            len += std::snprintf(out + len, sizeof(out) - len, "%s%d|",
+                                 s ? ";" : "", sec.length);
+
+            for (int i = 0; i < sec.length && i < kMaxProgSteps; ++i) {
+                const ProgCell& c = sec.cell[i];
+                if (c.filled)
+                    len += std::snprintf(out + len, sizeof(out) - len,
+                                         "%s%d.%d", i ? "," : "",
+                                         static_cast<int>(c.degree),
+                                         static_cast<int>(c.ext));
+                else
+                    len += std::snprintf(out + len, sizeof(out) - len,
+                                         "%s-", i ? "," : "");
+
+                /* Bail rather than send a truncated grid, which would decode
+                 * as a different progression than the one on screen. */
+                if (len >= static_cast<int>(sizeof(out)) - 16)
+                    break;
+            }
+
+            if (len >= static_cast<int>(sizeof(out)) - 16)
+                break;
+        }
+
+        setState("progression", out);
+    }
+
+    /* Voice leading and the bass note are one control to the user, so they go
+     * across together - sending one without the other leaves the DSP briefly
+     * in a combination the button never showed. */
+    void pushRootChoice()
+    {
+        char buf[8];
+        std::snprintf(buf, sizeof buf, "%d", fVoiceLeading ? 1 : 0);
+        setState("voiceLeading", buf);
+        std::snprintf(buf, sizeof buf, "%d", static_cast<int>(fBassNote));
+        setState("bassNote", buf);
+    }
+
+    void pushProgRunning()
+    {
+        char buf[8];
+        std::snprintf(buf, sizeof buf, "%d", fProgRunning ? 1 : 0);
+        setState("progRunning", buf);
+    }
+
     /* Which key's wedge is drawn as the diatonic set. Locked, it stays where
      * it was pinned; otherwise it follows the selection. */
     int highlightKey() const
@@ -401,6 +481,12 @@ protected:
 
             if (fScreen == kScreenSlide)
                 return slidePress(ev.pos.getX(), ev.pos.getY());
+
+            /* The sequencer is edited, not played: a press sets a cell or
+             * moves a section and never sends a gesture. The DSP triggers its
+             * chords from the transport instead. */
+            if (fScreen == kScreenProgressions)
+                return progPress(ev.pos.getX(), ev.pos.getY());
 
             Ring ring;
             const int pos = hitTest(ev.pos.getX(), ev.pos.getY(), ring);
@@ -741,11 +827,27 @@ protected:
 
     static constexpr float kMenuRowH = 19.0f;
 
-    /* Menu rows hang below whichever button opened them. */
+    /*
+     * Menu rows hang below whichever button opened them.
+     *
+     * Nudged left when they would overhang the window. Every menu until now
+     * hung off a control on the left, so the overflow never showed; the
+     * sequencer's duplicate button sits at the right-hand end of a row, and
+     * its menu ran straight off the edge with the labels cut in half.
+     */
     Button menuRow(const Button& anchor, int index) const
     {
-        return { anchor.x, anchor.y + anchor.h + 2.0f + index * kMenuRowH,
-                 anchor.w < 120.0f ? 140.0f : anchor.w, kMenuRowH };
+        const float w = (anchor.w < 140.0f) ? 140.0f : anchor.w;
+
+        float x = anchor.x;
+        const float limit = getWidth() - 6.0f;
+        if (x + w > limit)
+            x = limit - w;
+        if (x < 6.0f)
+            x = 6.0f;
+
+        return { x, anchor.y + anchor.h + 2.0f + index * kMenuRowH,
+                 w, kMenuRowH };
     }
 
     Button octaveSlider() const
@@ -1043,6 +1145,18 @@ protected:
         std::snprintf(out, outSize, "%s%s", stem, kChordShape[base].suffix);
     }
 
+    /* The lowest slide carrying a degree, for banks where a degree repeats an
+     * octave up. See drawSlides() for why the first one wins. */
+    int firstSlideForDegree(Degree d) const
+    {
+        const int n = slideCountForScale(fScale);
+        const SlideDef* defs = slidesForScale(fScale);
+        for (int i = 0; i < n; ++i)
+            if (defs[i].degree == d)
+                return i;
+        return -1;
+    }
+
     void drawSlides()
     {
         const int n = slideCountForScale(fScale);
@@ -1082,8 +1196,22 @@ protected:
              * for those frames the old test saw a lit cell with no active
              * slide and lit the entire stack. fPointerSlide remembers which
              * strip the pointer last used, so that window cannot open.
+             *
+             * A degree can appear TWICE in a bank - the diatonic scale ends on
+             * the octave-up I, and the minor pentatonic on the octave-up i -
+             * and cellForDegree ignores the octave, so both resolve to the
+             * same ring cell. Without the check below, pressing the first I
+             * lit the whole of the eighth column, since that column saw its
+             * own cell lit and no pointer on it.
+             *
+             * The DSP reports a cell, not a slide, so there is no way to know
+             * WHICH I a keyboard note meant. Lighting the first match is the
+             * truthful choice: it says "this degree is sounding" once, rather
+             * than claiming both columns are.
              */
-            const bool fromKeyboard = cellLit && (fPointerSlide != i);
+            const bool firstOfDegree = (firstSlideForDegree(defs[i].degree) == i);
+            const bool fromKeyboard =
+                cellLit && (fPointerSlide != i) && firstOfDegree;
 
             for (int sec = 0; sec < sectionCount(); ++sec) {
                 const Button r = sectionRect(i, sec);
@@ -1373,26 +1501,474 @@ protected:
     /* ---- progressions ------------------------------------------------------
      *
      * A step sequencer for chords: each row is a section, each cell one beat,
-     * and the sections chain A -> B -> C -> D and back. Built in the next
-     * commit; this placeholder keeps the tab honest about being empty rather
-     * than showing a broken grid.
+     * and the sections chain A -> B -> C -> D and back.
+     *
+     * Unlike a drum machine, where a row is an instrument and the rows sound
+     * together, here a row is a SECTION and the rows sound in succession. That
+     * one difference drives the whole layout: the letters down the left are
+     * song structure rather than voices, and only one row is ever playing.
      */
+
+    static constexpr float kProgMenuW  = 104.0f;  /* preset list on the left */
+    static constexpr float kProgLabelW = 26.0f;   /* the A/B/C/D column */
+    static constexpr float kProgRowH   = 34.0f;
+    static constexpr float kProgRowGap = 6.0f;
+    static constexpr float kProgBtnW   = 22.0f;   /* per-row +/- buttons */
+
+    /* The grid, right of the preset menu. */
+    Button progGridArea() const
+    {
+        const Button a = slideArea();
+        const float  x = a.x + kProgMenuW + 10.0f;
+        return { x, a.y + 24.0f, a.w - (x - a.x), a.h - 24.0f };
+    }
+
+    /* One section's row, label column included. */
+    Button progRowRect(int section) const
+    {
+        const Button g = progGridArea();
+        return { g.x, g.y + section * (kProgRowH + kProgRowGap),
+                 g.w, kProgRowH };
+    }
+
+    /* Width available for the steps themselves, after the label column on the
+     * left and the two row buttons on the right. */
+    float progStepsWidth() const
+    {
+        return progGridArea().w - kProgLabelW - (kProgBtnW * 2.0f + 8.0f);
+    }
+
+    /*
+     * One cell.
+     *
+     * Every section is drawn at the same step width regardless of its length,
+     * so a four-beat section and an eight-beat one line up beat-for-beat down
+     * the screen. A section that filled its row would make a short section
+     * look slow and a long one look crowded, and the whole point of stacking
+     * them is comparing where the changes fall.
+     */
+    Button progCellRect(int section, int step) const
+    {
+        const Button r = progRowRect(section);
+        const float  w = progStepsWidth() / kMaxProgSteps;
+        return { r.x + kProgLabelW + step * w, r.y + 2.0f,
+                 w - 2.0f, r.h - 4.0f };
+    }
+
+    /* Duplicate and delete, at the right-hand end of a row. */
+    Button progDupRect(int section) const
+    {
+        const Button r = progRowRect(section);
+        return { r.x + r.w - kProgBtnW * 2.0f - 6.0f, r.y + 6.0f,
+                 kProgBtnW, r.h - 12.0f };
+    }
+
+    Button progDelRect(int section) const
+    {
+        const Button r = progRowRect(section);
+        return { r.x + r.w - kProgBtnW, r.y + 6.0f, kProgBtnW, r.h - 12.0f };
+    }
+
+    /* "+ SECTION", below the last row. */
+    Button progAddRect() const
+    {
+        const Button g = progGridArea();
+        return { g.x + kProgLabelW,
+                 g.y + fProg.count * (kProgRowH + kProgRowGap) + 2.0f,
+                 86.0f, 20.0f };
+    }
+
+    /* Transport and legato, along the bottom of the preset column. */
+    Button progPlayRect() const
+    {
+        const Button a = slideArea();
+        return { a.x, a.y + a.h - 54.0f, kProgMenuW, 22.0f };
+    }
+
+    Button progLegatoRect() const
+    {
+        const Button a = slideArea();
+        return { a.x, a.y + a.h - 28.0f, kProgMenuW, 22.0f };
+    }
+
+    Button progPresetRect(int index) const
+    {
+        const Button a = slideArea();
+        return { a.x, a.y + 24.0f + index * 22.0f, kProgMenuW, 20.0f };
+    }
+
     void drawProgressions()
     {
         const Button a = slideArea();
 
         fontFace(NANOVG_DEJAVU_SANS_TTF);
-        fontSize(13.0f);
-        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
-        fillColor(Color(0.50f, 0.55f, 0.63f));
-        text(a.x + a.w * 0.5f, a.y + a.h * 0.5f - 10.0f,
-             "Progression sequencer - not built yet.", nullptr);
 
+        /* ---- the preset menu ---- */
+        fontSize(9.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.45f, 0.49f, 0.57f));
+        text(a.x + 2.0f, a.y + 10.0f, "LOAD", nullptr);
+
+        for (int i = 0; i < kPresetProgressionCount; ++i) {
+            const Button p = progPresetRect(i);
+
+            beginPath();
+            roundedRect(p.x, p.y, p.w, p.h, 3.0f);
+            fillColor(Color(0.13f, 0.14f, 0.18f));
+            fill();
+            strokeColor(Color(0.24f, 0.26f, 0.32f));
+            strokeWidth(1.0f);
+            stroke();
+
+            fontSize(10.0f);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(Color(0.76f, 0.80f, 0.86f));
+            text(p.x + 6.0f, p.y + p.h * 0.5f,
+                 kPresetProgression[i].name, nullptr);
+        }
+
+        /* Loading replaces the section the row buttons point at, so say which
+         * one rather than leaving the user to discover it. */
+        fontSize(9.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.40f, 0.44f, 0.52f));
+        {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "into %c",
+                          sectionLetter(fMenuSection));
+            text(a.x + 2.0f,
+                 progPresetRect(kPresetProgressionCount).y + 6.0f, buf, nullptr);
+        }
+
+        drawToggle(progPlayRect(), fProgRunning ? "STOP" : "PLAY", fProgRunning);
+        drawToggle(progLegatoRect(),
+                   fProgLegato ? "LEGATO: ON" : "LEGATO: OFF", fProgLegato);
+
+        /* ---- the grid ---- */
+        const Button g = progGridArea();
+
+        fontSize(9.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.45f, 0.49f, 0.57f));
+        text(g.x, g.y - 12.0f, "SECTIONS - ONE CELL PER BEAT", nullptr);
+
+        for (int s = 0; s < fProg.count; ++s)
+            drawProgRow(s);
+
+        /* ---- add a section ---- */
+        if (fProg.count < kMaxProgSections) {
+            const Button add = progAddRect();
+
+            beginPath();
+            roundedRect(add.x, add.y, add.w, add.h, 3.0f);
+            fillColor(Color(0.14f, 0.16f, 0.20f));
+            fill();
+            strokeColor(Color(0.28f, 0.31f, 0.38f));
+            strokeWidth(1.0f);
+            stroke();
+
+            fontSize(10.0f);
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            fillColor(Color(0.70f, 0.75f, 0.82f));
+            text(add.x + add.w * 0.5f, add.y + add.h * 0.5f,
+                 "+ SECTION", nullptr);
+        }
+    }
+
+    /* A small filled button used for the transport and legato toggles. */
+    void drawToggle(const Button& b, const char* label, bool on)
+    {
+        beginPath();
+        roundedRect(b.x, b.y, b.w, b.h, 4.0f);
+        fillColor(on ? Color(0.20f, 0.42f, 0.34f) : Color(0.13f, 0.14f, 0.18f));
+        fill();
+        strokeColor(on ? Color(0.34f, 0.64f, 0.50f) : Color(0.26f, 0.28f, 0.34f));
+        strokeWidth(1.0f);
+        stroke();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(10.0f);
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+        fillColor(on ? Color(0.90f, 0.97f, 0.93f) : Color(0.72f, 0.76f, 0.83f));
+        text(b.x + b.w * 0.5f, b.y + b.h * 0.5f, label, nullptr);
+    }
+
+    void drawProgRow(int s)
+    {
+        const Button      r   = progRowRect(s);
+        const ProgSection& sec = fProg.section[s];
+        const bool        playing = (fPlaySection == s);
+
+        /* The section letter. The row the buttons act on is marked, so a
+         * duplicate or a preset load cannot go somewhere unexpected. */
+        const bool target = (fMenuSection == s);
+
+        beginPath();
+        roundedRect(r.x, r.y, kProgLabelW - 3.0f, r.h, 3.0f);
+        fillColor(target ? Color(0.22f, 0.30f, 0.42f)
+                         : Color(0.13f, 0.14f, 0.18f));
+        fill();
+        if (target) {
+            strokeColor(Color(0.40f, 0.56f, 0.76f));
+            strokeWidth(1.0f);
+            stroke();
+        }
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(12.0f);
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+        fillColor(playing ? Color(0.60f, 0.90f, 0.72f)
+                          : Color(0.80f, 0.84f, 0.90f));
+        {
+            char buf[4] = { sectionLetter(s), 0, 0, 0 };
+            text(r.x + (kProgLabelW - 3.0f) * 0.5f, r.y + r.h * 0.5f,
+                 buf, nullptr);
+        }
+
+        for (int i = 0; i < kMaxProgSteps; ++i)
+            drawProgCell(s, i, i < sec.length);
+
+        /* Duplicate, then delete. Delete is omitted on the last remaining
+         * section - there is no state to return from once it is gone. */
+        /* ASCII, not a glyph: DejaVu has no U+29C9, and NanoVG draws a missing
+         * codepoint as a hollow box - which looked like a rendering fault
+         * rather than a button. */
+        drawSmallButton(progDupRect(s), "+");
+        if (fProg.count > 1)
+            drawSmallButton(progDelRect(s), "x");
+    }
+
+    void drawSmallButton(const Button& b, const char* glyph)
+    {
+        beginPath();
+        roundedRect(b.x, b.y, b.w, b.h, 3.0f);
+        fillColor(Color(0.14f, 0.16f, 0.20f));
+        fill();
+        strokeColor(Color(0.28f, 0.31f, 0.38f));
+        strokeWidth(1.0f);
+        stroke();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
         fontSize(11.0f);
-        fillColor(Color(0.38f, 0.42f, 0.50f));
-        text(a.x + a.w * 0.5f, a.y + a.h * 0.5f + 12.0f,
-             "Sections chain A to D, one cell per beat, synced to host tempo.",
-             nullptr);
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+        fillColor(Color(0.70f, 0.75f, 0.82f));
+        text(b.x + b.w * 0.5f, b.y + b.h * 0.5f, glyph, nullptr);
+    }
+
+    /*
+     * One beat.
+     *
+     * Three states are distinguishable at a glance, because all three matter
+     * while playing: beyond the section's length (not part of the loop), a
+     * rest (part of the loop, sounds nothing), and a chord. The playhead is a
+     * brighter fill rather than a border, so it reads from across a room.
+     */
+    void drawProgCell(int s, int step, bool within)
+    {
+        const Button    c = progCellRect(s, step);
+        const ProgCell& cell = fProg.section[s].cell[step];
+        const bool      here = (fPlaySection == s && fPlayStep == step);
+
+        beginPath();
+        roundedRect(c.x, c.y, c.w, c.h, 3.0f);
+
+        if (! within) {
+            /* Outside the loop: dimmed almost to the background, but still
+             * visible and still clickable, since clicking is how a section is
+             * lengthened. */
+            fillColor(Color(0.10f, 0.11f, 0.14f));
+        } else if (here && cell.filled) {
+            fillColor(Color(0.34f, 0.62f, 0.48f));
+        } else if (here) {
+            fillColor(Color(0.20f, 0.30f, 0.28f));
+        } else if (cell.filled) {
+            fillColor(Color(0.19f, 0.26f, 0.36f));
+        } else {
+            fillColor(Color(0.13f, 0.14f, 0.18f));
+        }
+        fill();
+
+        /* Every fourth beat gets a brighter edge: a bar line, so four-four
+         * lands where the eye expects it. */
+        strokeColor(! within         ? Color(0.16f, 0.17f, 0.21f)
+                    : (step % 4 == 0) ? Color(0.38f, 0.42f, 0.50f)
+                                      : Color(0.24f, 0.26f, 0.32f));
+        strokeWidth(1.0f);
+        stroke();
+
+        if (! within || ! cell.filled)
+            return;
+
+        /* The numeral, and the extension beneath it when there is one. */
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+
+        const bool hasExt = (cell.ext != kExtNone);
+
+        fontSize(hasExt ? 11.0f : 12.5f);
+        fillColor(here ? Color(0.98f, 1.00f, 0.99f)
+                       : Color(0.86f, 0.90f, 0.96f));
+        text(c.x + c.w * 0.5f,
+             c.y + c.h * (hasExt ? 0.36f : 0.5f),
+             kDegreeCell[cell.degree].numeral, nullptr);
+
+        if (hasExt) {
+            fontSize(8.5f);
+            fillColor(here ? Color(0.82f, 0.94f, 0.88f)
+                           : Color(0.58f, 0.64f, 0.74f));
+            text(c.x + c.w * 0.5f, c.y + c.h * 0.72f,
+                 kExtShort[cell.ext], nullptr);
+        }
+    }
+
+    /* Returns true when the click landed on the sequencer. */
+    bool progPress(double px, double py)
+    {
+        const float x = static_cast<float>(px);
+        const float y = static_cast<float>(py);
+
+        if (hit(progPlayRect(), x, y)) {
+            fProgRunning = ! fProgRunning;
+            pushProgRunning();
+            repaint();
+            return true;
+        }
+
+        if (hit(progLegatoRect(), x, y)) {
+            fProgLegato = ! fProgLegato;
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "%d", fProgLegato ? 1 : 0);
+            setState("progLegato", buf);
+            repaint();
+            return true;
+        }
+
+        for (int i = 0; i < kPresetProgressionCount; ++i) {
+            if (hit(progPresetRect(i), x, y)) {
+                loadPreset(fProg, i, fMenuSection);
+                pushProgression();
+                repaint();
+                return true;
+            }
+        }
+
+        if (fProg.count < kMaxProgSections && hit(progAddRect(), x, y)) {
+            const int added = fProg.add();
+            if (added >= 0) {
+                fMenuSection = added;
+                pushProgression();
+            }
+            repaint();
+            return true;
+        }
+
+        for (int s = 0; s < fProg.count; ++s) {
+            /* The letter selects the row the buttons and presets act on. */
+            const Button r = progRowRect(s);
+            if (hit({ r.x, r.y, kProgLabelW, r.h }, x, y)) {
+                fMenuSection = s;
+                repaint();
+                return true;
+            }
+
+            if (hit(progDupRect(s), x, y)) {
+                fMenuSection = s;
+                fOpenMenu    = kMenuDuplicate;
+                repaint();
+                return true;
+            }
+
+            if (fProg.count > 1 && hit(progDelRect(s), x, y)) {
+                if (fProg.remove(s)) {
+                    if (fMenuSection >= fProg.count)
+                        fMenuSection = fProg.count - 1;
+                    pushProgression();
+                }
+                repaint();
+                return true;
+            }
+
+            for (int i = 0; i < kMaxProgSteps; ++i) {
+                if (! hit(progCellRect(s, i), x, y))
+                    continue;
+
+                fMenuSection = s;
+
+                /*
+                 * Clicking past the end LENGTHENS the section to include that
+                 * beat, rather than opening a menu for a cell that is not in
+                 * the loop. Dragging a length handle would be the alternative,
+                 * but clicking where you want the section to reach is more
+                 * direct and needs no extra control.
+                 */
+                if (i >= fProg.section[s].length) {
+                    fProg.section[s].length = i + 1;
+                    pushProgression();
+                    repaint();
+                    return true;
+                }
+
+                fEditSection = s;
+                fEditStep    = i;
+                fOpenMenu    = kMenuCell;
+                repaint();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /*
+     * Decode a cell-menu row.
+     *
+     * Rest, then the degrees, then the extensions. An extension applies to
+     * whatever degree the cell already holds, so a chord is built in two
+     * clicks - pick the numeral, then pick its type - without a second menu
+     * for a setting most cells will leave alone.
+     */
+    void applyCellRow(int row)
+    {
+        ProgCell& cell = fProg.section[fEditSection].cell[fEditStep];
+
+        if (row == 0) {
+            cell.filled = false;
+            cell.ext    = kExtNone;
+            return;
+        }
+        --row;
+
+        if (row < static_cast<int>(kDegreeCount)) {
+            cell.filled = true;
+            cell.degree = static_cast<Degree>(row);
+            return;
+        }
+        row -= static_cast<int>(kDegreeCount);
+
+        /* Choosing a type for an empty cell implies wanting a chord there;
+         * silently doing nothing would look broken. */
+        cell.filled = true;
+        cell.ext    = static_cast<Extension>(row);
+    }
+
+    /* Which row of the cell menu is current, for the highlight. */
+    int cellRowFor(const ProgCell& cell) const
+    {
+        if (! cell.filled)
+            return 0;
+        return 1 + static_cast<int>(cell.degree);
+    }
+
+    static const char* cellRowLabel(int row)
+    {
+        if (row == 0)
+            return "Rest";
+        --row;
+
+        if (row < static_cast<int>(kDegreeCount))
+            return kDegreeCell[row].numeral;
+
+        return kExtensionName[row - static_cast<int>(kDegreeCount)];
     }
 
     /*
@@ -1621,9 +2197,28 @@ protected:
 
     void drawButton(const Button& b, const char* label, bool on)
     {
+        drawButtonIn(b, label,
+                     on ? Color(0.30f, 0.62f, 0.45f) : Color(0.17f, 0.18f, 0.23f),
+                     on);
+    }
+
+    /*
+     * A button in a named colour, for controls that are a CHOICE rather than a
+     * switch.
+     *
+     * Grey reads as "off", and for a genuine toggle - legato, glide - that is
+     * right. But CHORDS is not the off state of SINGLE NOTES, and a pinned
+     * wedge is not the off state of a following one: both alternatives are
+     * equally a setting, and greying one of them says the instrument is doing
+     * less than it is. Those controls get a colour per state instead, so the
+     * colour names the mode rather than ranking it.
+     */
+    void drawButtonIn(const Button& b, const char* label,
+                      const Color& fillCol, bool bright)
+    {
         beginPath();
         roundedRect(b.x, b.y, b.w, b.h, 4.0f);
-        fillColor(on ? Color(0.30f, 0.62f, 0.45f) : Color(0.17f, 0.18f, 0.23f));
+        fillColor(fillCol);
         fill();
         strokeColor(Color(0.30f, 0.32f, 0.38f));
         strokeWidth(1.0f);
@@ -1632,7 +2227,8 @@ protected:
         fontFace(NANOVG_DEJAVU_SANS_TTF);
         fontSize(12.0f);
         textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
-        fillColor(on ? Color(0.96f, 0.98f, 0.96f) : Color(0.62f, 0.66f, 0.72f));
+        fillColor(bright ? Color(0.96f, 0.98f, 0.96f)
+                         : Color(0.62f, 0.66f, 0.72f));
         text(b.x + b.w * 0.5f, b.y + b.h * 0.5f, label, nullptr);
     }
 
@@ -1668,15 +2264,27 @@ protected:
                    fLatchEnabled);
         drawButton(glideButton(), kGlideModeName[fGlideMode],
                    fGlideMode != kGlideOff);
-        /* "Wedge", not "Key": the key itself always follows the selection now,
+        /*
+         * "Wedge", not "Key": the key itself always follows the selection now,
          * and only the highlight is pinned. Saying "Key: locked" would suggest
-         * the keyboard was frozen too. */
-        drawButton(keyLockButton(),
-                   fKeyLocked ? "WEDGE: PINNED" : "WEDGE: FOLLOWS",
-                   fKeyLocked);
-        drawButton(singleNoteButton(),
-                   fSingleNotes ? "SINGLE NOTES" : "CHORDS",
-                   fSingleNotes);
+         * the keyboard was frozen too.
+         *
+         * Two colours rather than green-or-grey: following is not "wedge off".
+         * Amber for pinned, blue for following - both lit, because both are
+         * doing something.
+         */
+        drawButtonIn(keyLockButton(),
+                     fKeyLocked ? "WEDGE: PINNED" : "WEDGE: FOLLOWS",
+                     fKeyLocked ? Color(0.58f, 0.42f, 0.18f)
+                                : Color(0.22f, 0.40f, 0.58f),
+                     true);
+        /* Likewise: chords are not the absence of single notes. Violet for
+         * chords, teal for single. */
+        drawButtonIn(singleNoteButton(),
+                     fSingleNotes ? "SINGLE NOTES" : "CHORDS",
+                     fSingleNotes ? Color(0.20f, 0.48f, 0.52f)
+                                  : Color(0.38f, 0.30f, 0.58f),
+                     true);
         /*
          * Which chord tone is in the bass.
          *
@@ -1690,13 +2298,17 @@ protected:
          * its own label and skipped the state it claimed to already be in.
          *
          * "(HELD)" marks the suspension without pretending the setting changed.
+         *
+         * Lit for a CHOSEN bass, grey for auto - the opposite of what it was.
+         * Green here means "you are holding this", which is true of first,
+         * second and third and not of auto, where the plugin is deciding.
          */
         drawButton(voiceLeadButton(),
                    fVoiceLeading
                        ? (fGlideMode == kGlideOn ? "ROOT: AUTO (HELD)"
                                                  : "ROOT: AUTO")
                        : kBassNoteName[fBassNote],
-                   fVoiceLeading);
+                   ! fVoiceLeading);
 
         /*
          * Row 2 differs by screen: the wheel wants per-ring extensions and
@@ -1731,16 +2343,36 @@ protected:
             return;
         }
 
+        /*
+         * The sequencer shows the key instead of the per-ring extensions.
+         *
+         * Those dropdowns set one extension for a whole ring, but a
+         * progression cell carries its own - that is the point of setting the
+         * chord type per cell. Leaving them on screen would offer a control
+         * that the grid overrides on every beat. The key does apply: the cells
+         * hold degrees, so the key is what they resolve against.
+         */
+        if (fScreen == kScreenProgressions) {
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), "KEY: %s",
+                          kMajorLabel[fSelectedKey]);
+            drawDropdown(slideKeyButton(), buf, fOpenMenu == kMenuKey);
+
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(9.5f);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(Color(0.50f, 0.55f, 0.63f));
+            text(slideKeyButton().x + slideKeyButton().w + 12.0f,
+                 kDropY + kDropH * 0.5f,
+                 "cells carry their own chord type", nullptr);
+            return;
+        }
+
         /* Per-ring dropdowns, labelled by ring so the mapping is unambiguous. */
         static const char* const kRingTag[kRingCount] = { "MAJ", "MIN", "DIM" };
 
         for (int r = 0; r < kRingCount; ++r) {
             char ext[48], voi[48];
-            /* Short form: "None (triad)" did not fit once the tag went
-             * uppercase, and a clipped label is worse than a terse one. */
-            static const char* const kExtShort[kExtCount] = {
-                "TRIAD", "6TH", "7TH", "9TH", "ADD9", "SUS2", "SUS4"
-            };
             std::snprintf(ext, sizeof(ext), "%s: %s",
                           kRingTag[r], kExtShort[fRingExt[r]]);
             /* Uppercased to match the row; the menu keeps the full names,
@@ -1832,6 +2464,19 @@ protected:
                 anchor = pedalButton();
                 cur    = static_cast<int>(fPedalAction);
                 break;
+            case kMenuCell:
+                rows   = kCellRows;
+                /* Hangs off the cell being edited, so the list points at the
+                 * beat it will change. */
+                anchor = progCellRect(fEditSection, fEditStep);
+                cur    = cellRowFor(
+                             fProg.section[fEditSection].cell[fEditStep]);
+                break;
+            case kMenuDuplicate:
+                rows   = 2;
+                anchor = progDupRect(fMenuSection);
+                cur    = -1;   /* an action, not a setting - nothing is current */
+                break;
             default:   /* kMenuExt */
                 rows   = static_cast<int>(kExtCount);
                 anchor = extButton(fOpenMenuRing);
@@ -1848,6 +2493,9 @@ protected:
             case kMenuKey:     return kMajorLabel[i];
             case kMenuBinding: return bindingRowLabel(i);
             case kMenuPedal:   return kPedalActionName[i];
+            case kMenuCell:    return cellRowLabel(i);
+            case kMenuDuplicate: return i == 0 ? "Duplicate as next"
+                                               : "Duplicate as last";
             default:           return kExtensionName[i];
         }
     }
@@ -1901,6 +2549,19 @@ protected:
                             fPedalAction = static_cast<PedalAction>(i);
                             setState("pedalAction", buf);
                             break;
+                        case kMenuCell:
+                            applyCellRow(i);
+                            pushProgression();
+                            break;
+                        case kMenuDuplicate: {
+                            /* Row 0 is "as next", row 1 "as last". */
+                            const int made = fProg.duplicate(fMenuSection, i == 0);
+                            if (made >= 0) {
+                                fMenuSection = made;
+                                pushProgression();
+                            }
+                            break;
+                        }
                         default: {   /* kMenuExt */
                             fRingExt[fOpenMenuRing] = static_cast<Extension>(i);
                             char key[8];
@@ -1921,10 +2582,27 @@ protected:
             return true;   /* click-away closes without selecting */
         }
 
-        /* Tabs first: they sit above every other control. */
-        for (int i = 0; i < 2; ++i) {
+        /*
+         * Tabs first: they sit above every other control.
+         *
+         * kScreenCount, not a literal. This was hardcoded to 2 back when there
+         * were two screens, and adding SLIDE and PROGRESSIONS left their tabs
+         * drawn but dead - the bar looked complete and simply did not respond.
+         */
+        for (int i = 0; i < static_cast<int>(kScreenCount); ++i) {
             if (hit(tabButton(i), px, py)) {
                 if (static_cast<int>(fScreen) == i) { repaint(); return true; }
+
+                /*
+                 * Leaving the sequencer stops it. A running sequence is not a
+                 * held note the panic would clear on its own - it would keep
+                 * triggering fresh chords from another screen, with no visible
+                 * transport to stop it from.
+                 */
+                if (fScreen == kScreenProgressions && fProgRunning) {
+                    fProgRunning = false;
+                    pushProgRunning();
+                }
 
                 /* Anything still sounding was built with the OTHER screen's
                  * settings; leaving it running while those change is how a
@@ -1932,6 +2610,14 @@ protected:
                 setState("panic", "1");
 
                 fScreen = static_cast<Screen>(i);
+
+                /* The DSP gates incoming MIDI on this: the keyboard does
+                 * nothing while the sequencer screen is showing. */
+                {
+                    char sbuf[8];
+                    std::snprintf(sbuf, sizeof sbuf, "%d", i);
+                    setState("uiScreen", sbuf);
+                }
                 /* A highlight from the other screen would be a lie here. */
                 fActivePosition = -1;
                 fActiveSlide    = -1;
@@ -1979,6 +2665,14 @@ protected:
                 repaint();
                 return true;
             }
+        }
+
+        /* The sequencer shows the key too - its cells are degrees, so the key
+         * is what they resolve against. */
+        if (fScreen == kScreenProgressions && hit(slideKeyButton(), px, py)) {
+            fOpenMenu = kMenuKey;
+            repaint();
+            return true;
         }
 
         /* Octave slider: takes the press and keeps receiving motion, so it can
@@ -2032,9 +2726,36 @@ protected:
 
         /* Glide cycles off -> on -> MPE -> off. */
         if (hit(glideButton(), px, py)) {
+            const GlideMode was = fGlideMode;
             fGlideMode = static_cast<GlideMode>((fGlideMode + 1) % kGlideModeCount);
             std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(fGlideMode));
             setState("glideMode", buf);
+
+            /*
+             * Plain glide cannot carry a re-inversion, so it suspends voice
+             * leading - which makes ROOT: AUTO meaningless for as long as it
+             * is on. Rather than leave a setting showing that nothing obeys,
+             * entering that mode falls back to the last bass the user chose,
+             * and leaving it puts auto back.
+             *
+             * The remembered value is the user's own last pick, not a default,
+             * so the button returns to where they left it instead of resetting
+             * to FIRST each time glide is cycled.
+             */
+            if (fGlideMode == kGlideOn && was != kGlideOn) {
+                fLeadBeforeGlide = fVoiceLeading;
+                if (fVoiceLeading) {
+                    fVoiceLeading = false;
+                    fBassNote     = fLastManualBass;
+                    pushRootChoice();
+                }
+            } else if (was == kGlideOn && fGlideMode != kGlideOn) {
+                if (fLeadBeforeGlide && ! fVoiceLeading) {
+                    fVoiceLeading = true;
+                    pushRootChoice();
+                }
+            }
+
             repaint();
             return true;
         }
@@ -2088,10 +2809,18 @@ protected:
                 fBassNote     = static_cast<BassNote>(fBassNote + 1);
             }
 
-            std::snprintf(buf, sizeof(buf), "%d", fVoiceLeading ? 1 : 0);
-            setState("voiceLeading", buf);
-            std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(fBassNote));
-            setState("bassNote", buf);
+            /* Remember a hand-picked bass so that glide suspending auto comes
+             * back to it. Auto itself is not remembered here - it is not a
+             * bass, and fLeadBeforeGlide already tracks it. */
+            if (! fVoiceLeading)
+                fLastManualBass = fBassNote;
+
+            /* Choosing by hand while glide holds auto off means the user has
+             * decided; leaving glide should no longer restore auto over it. */
+            if (fGlideMode == kGlideOn)
+                fLeadBeforeGlide = fVoiceLeading;
+
+            pushRootChoice();
             repaint();
             return true;
         }
@@ -2654,6 +3383,19 @@ protected:
             }
             if (changed)
                 repaint();
+
+            /* The sequencer's playhead, on the same terms: polled every idle,
+             * repainted only when the beat actually changes. */
+            int s = -1, st = -1;
+            const bool running = fCells->playheadAt(s, st);
+            if (! running) { s = -1; st = -1; }
+
+            if (s != fPlaySection || st != fPlayStep) {
+                fPlaySection = s;
+                fPlayStep    = st;
+                if (fScreen == kScreenProgressions)
+                    repaint();
+            }
         }
 
         /*
@@ -2733,8 +3475,55 @@ private:
     enum OpenMenu {
         kMenuNone = 0, kMenuExt, kMenuVoicing, kMenuScale, kMenuKey,
         kMenuBinding,   /* what a keyboard key does */
-        kMenuPedal
+        kMenuPedal,
+        kMenuCell,      /* what chord a sequencer cell plays */
+        kMenuDuplicate  /* as next, or as last */
     };
+
+    /*
+     * ---- progression state -------------------------------------------------
+     *
+     * The grid the user edits. The DSP holds its own copy and plays from that;
+     * this one is what the screen draws and what edits are made against, with
+     * each change pushed across as state. Keeping them separate rather than
+     * sharing a pointer means an edit mid-bar cannot tear a chord the audio
+     * thread is part-way through reading.
+     */
+    Progression fProg;
+
+    /* Which cell the chord menu is editing. */
+    int fEditSection = 0;
+    int fEditStep    = 0;
+
+    /* Section the duplicate menu will copy, and the row buttons' target. */
+    int fMenuSection = 0;
+
+    /* Sequencer transport, mirrored from the DSP for drawing the playhead.
+     * -1 means stopped, so no cell is lit. */
+    int fPlaySection = -1;
+    int fPlayStep    = -1;
+
+    /*
+     * Legato here means what latch means on the wheel: a chord stays sounding
+     * until the next one replaces it, rather than stopping at the end of its
+     * beat. Separate from the wheel's latch because they are different
+     * performances - you can want a staccato wheel and a sustained sequence.
+     */
+    bool fProgLegato = true;
+
+    /* Running or stopped. Kept in the UI so the button can be drawn without
+     * waiting for the DSP to answer. */
+    bool fProgRunning = false;
+
+    /*
+     * The cell menu is one flat list: a rest, then the seven degrees, then the
+     * extensions - which apply to the degree already in the cell, so the chord
+     * and its type are set in two passes rather than needing a second menu.
+     */
+    static constexpr int kCellRows =
+        1 +                                /* rest */
+        static_cast<int>(kDegreeCount) +   /* I..vii */
+        static_cast<int>(kExtCount);       /* triad..sus4 */
 
     /*
      * The binding menu is one flat list covering every action a key can take,
@@ -2829,6 +3618,14 @@ private:
      * stacks upward from its own root. */
     bool     fVoiceLeading = true;
     BassNote fBassNote     = kBassFirst;
+
+    /* The last bass the user picked by hand, so that suspending auto for the
+     * duration of plain glide returns to their choice rather than to FIRST. */
+    BassNote fLastManualBass = kBassFirst;
+
+    /* Whether auto was set before plain glide suspended it, so leaving glide
+     * can put it back without guessing. */
+    bool     fLeadBeforeGlide = true;
 
     /* Octave for pointer and touch input. Mirrors the DSP's setting; a played
      * MIDI note carries its own octave instead. */

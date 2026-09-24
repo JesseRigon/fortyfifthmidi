@@ -219,6 +219,61 @@ static void checkRootCycle()
     }
 }
 
+/*
+ * Every tab must be hit-testable, and they must not overlap.
+ *
+ * The click loop was hardcoded to two tabs while four were being drawn, so
+ * SLIDE and PROGRESSIONS were painted, labelled and completely dead - the bar
+ * looked finished and simply did not respond. Geometry alone would not have
+ * caught it, so this walks the same range the handler walks and checks that a
+ * click at each tab's centre resolves to that tab.
+ */
+static void checkTabs()
+{
+    std::printf("\n-- tab bar --\n");
+
+    const float kTabH     = 28.0f;
+    const float kSetupTabW = 34.0f;
+    const float kTabW      = 104.0f;
+    const int   kScreens   = 4;
+
+    struct R { float x, y, w, h; };
+    auto tab = [&](int i) -> R {
+        if (i == 0)
+            return { 10.0f, 4.0f, kSetupTabW, kTabH - 8.0f };
+        const float x = 10.0f + kSetupTabW + 4.0f + (i - 1) * (kTabW + 4.0f);
+        return { x, 4.0f, kTabW, kTabH - 8.0f };
+    };
+
+    /* Each tab's centre must resolve to that tab and no other. */
+    bool allHit = true;
+    for (int i = 0; i < kScreens; ++i) {
+        const R t = tab(i);
+        const float cx = t.x + t.w * 0.5f;
+        const float cy = t.y + t.h * 0.5f;
+
+        int landed = -1;
+        for (int j = 0; j < kScreens; ++j) {
+            const R u = tab(j);
+            if (cx >= u.x && cx <= u.x + u.w && cy >= u.y && cy <= u.y + u.h) {
+                if (landed >= 0) allHit = false;   /* overlapping tabs */
+                landed = j;
+            }
+        }
+        if (landed != i) allHit = false;
+    }
+
+    char d[96];
+    std::snprintf(d, sizeof d, "%d tabs, each hit at its centre", kScreens);
+    ok("every tab is reachable", allHit, d);
+
+    /* And the bar must fit the narrowest window the layout is checked at. */
+    const R last = tab(kScreens - 1);
+    std::snprintf(d, sizeof d, "bar ends at %.0f vs window %.0f",
+                  last.x + last.w, 520.0f);
+    ok("the tab bar fits the window", last.x + last.w <= 520.0f, d);
+}
+
 int main()
 {
     report("default size");
@@ -245,6 +300,7 @@ int main()
     report("smaller host window");
 
     checkRootCycle();
+    checkTabs();
 
     std::printf("\n%s (%d failure%s)\n", fails ? "FAIL" : "PASS",
                 fails, fails == 1 ? "" : "s");

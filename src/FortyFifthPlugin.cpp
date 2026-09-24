@@ -319,12 +319,84 @@ protected:
         std::memcpy(fKeyMap, parsed, sizeof(fKeyMap));
     }
 
+    /*
+     * Decode the grid the UI sends.
+     *
+     * Sections separated by ';', cells by ',', a cell being "degree.extension"
+     * or "-" for a rest, with the section's length ahead of a '|'. See
+     * pushProgression() in the UI for the encoding.
+     *
+     * Parsed into a local and copied in one go, so a malformed string leaves
+     * the running progression alone rather than half-replacing it. The copy is
+     * made under a flag the audio thread checks between beats, so a grid can
+     * never change part-way through a chord.
+     */
+    void parseProgression(const char* value)
+    {
+        Progression parsed;
+        parsed.count = 0;
+
+        const char* p = value;
+        while (p != nullptr && *p != '\0' && parsed.count < kMaxProgSections) {
+            ProgSection& sec = parsed.section[parsed.count];
+            sec = ProgSection();
+
+            int len = 0;
+            if (std::sscanf(p, "%d|", &len) != 1)
+                break;
+
+            sec.length = (len < 0) ? 0
+                       : (len > kMaxProgSteps) ? kMaxProgSteps : len;
+
+            const char* c = std::strchr(p, '|');
+            if (c == nullptr)
+                break;
+            ++c;
+
+            for (int i = 0; i < sec.length; ++i) {
+                if (*c == '-') {
+                    sec.cell[i].filled = false;
+                } else {
+                    int d = 0, e = 0;
+                    if (std::sscanf(c, "%d.%d", &d, &e) == 2 &&
+                        d >= 0 && d < kDegreeCount &&
+                        e >= 0 && e < kExtCount) {
+                        sec.cell[i].filled = true;
+                        sec.cell[i].degree = static_cast<Degree>(d);
+                        sec.cell[i].ext    = static_cast<Extension>(e);
+                    }
+                }
+
+                const char* comma = std::strchr(c, ',');
+                const char* semi  = std::strchr(c, ';');
+                if (comma == nullptr || (semi != nullptr && semi < comma))
+                    break;
+                c = comma + 1;
+            }
+
+            ++parsed.count;
+
+            p = std::strchr(p, ';');
+            if (p != nullptr) ++p;
+        }
+
+        if (parsed.count == 0)
+            return;   /* nothing usable - keep playing what we have */
+
+        fPendingProg = parsed;
+        fProgDirty.store(true, std::memory_order_release);
+    }
+
     void setState(const char* key, const char* value) override
     {
         /* Before the numeric parse: this one is a structured string, and
          * atoi would read only its first field. */
         if (std::strcmp(key, "keyMap") == 0) {
             parseKeyMap(value);
+            return;
+        }
+        if (std::strcmp(key, "progression") == 0) {
+            parseProgression(value);
             return;
         }
 
@@ -390,6 +462,21 @@ protected:
         else if (std::strcmp(key, "bassNote") == 0)
             fBassNote = static_cast<BassNote>(
                 ((v % kBassNoteCount) + kBassNoteCount) % kBassNoteCount);
+        else if (std::strcmp(key, "progLegato") == 0)
+            fProgLegato = (v != 0);
+        else if (std::strcmp(key, "uiScreen") == 0)
+            fUiScreen.store(v, std::memory_order_release);
+        else if (std::strcmp(key, "progRunning") == 0) {
+            const bool want = (v != 0);
+            if (want != fProgRunning.load(std::memory_order_acquire)) {
+                fProgRunning.store(want, std::memory_order_release);
+                /* Stopping must silence the sequencer's own chord, or a legato
+                 * one would hang for good - there is no next trigger coming to
+                 * replace it. Left to the audio thread, which owns the voices. */
+                if (! want)
+                    fProgStopping.store(true, std::memory_order_release);
+            }
+        }
         else if (std::strcmp(key, "voiceLeading") == 0) {
             fVoiceLeading = (v != 0);
             /* Turning it off must not leave the next chord leading from a
@@ -556,6 +643,10 @@ protected:
                                                         std::memory_order_acquire);
         if (packed != kNoGesture)
             handleGesture(packed);
+
+        /* The sequencer, before the glide: a beat that lands this block should
+         * be sounding by the time the glide is advanced over it. */
+        runSequencer();
 
         if (fGlideActive)
             advanceGlide(frames);
@@ -1292,6 +1383,21 @@ private:
             return;
         }
 
+        /*
+         * The sequencer screen takes the keyboard out of circuit entirely.
+         *
+         * There, chords come from the grid and the transport; a key press
+         * would sound a chord the grid did not ask for and, worse, would fight
+         * the sequencer for the same voices. Nothing is passed through either:
+         * the plugin is a generator, and forwarding raw notes would put the
+         * played key into the output alongside the sequenced chord.
+         *
+         * The pedal is included. Its actions - glide, legato, panic - all act
+         * on hand playing that cannot happen here.
+         */
+        if (fUiScreen.load(std::memory_order_acquire) == kUiScreenProgressions)
+            return;
+
         const uint8_t status = ev.data[0] & 0xF0;
         const uint8_t d1     = ev.data[1];
         const uint8_t d2     = (ev.size > 2) ? ev.data[2] : 0;
@@ -1702,6 +1808,138 @@ private:
     }
 
     /*
+     * ---- the sequencer -----------------------------------------------------
+     *
+     * Drive the progression from the host's musical position.
+     *
+     * Position, not elapsed frames. DPF documents TimePosition::frame as not
+     * necessarily monotonic - a host is free to loop, relocate or scrub - so
+     * counting samples would drift out of step with the bar lines the moment
+     * anyone touched the transport. Reading bar/beat/tick instead means the
+     * sequencer is wherever the host says it is, and a loop or a jump lands on
+     * the right chord with no resynchronising.
+     *
+     * When the host offers no BBT at all (bbt.valid false, which some hosts
+     * report while stopped) the sequencer simply does not advance. Inventing a
+     * tempo would put the plugin in a different place from everything else in
+     * the session.
+     *
+     * Takes no frame count for that reason: nothing here is measured in
+     * samples. A block is only an opportunity to ask the host where it is.
+     */
+    void runSequencer()
+    {
+        /* Take a pending grid while nothing is mid-beat. Done first so a grid
+         * edited during playback takes effect on the next trigger rather than
+         * a bar later. */
+        if (fProgDirty.exchange(false, std::memory_order_acquire))
+            fProg = fPendingProg;
+
+        /* A stop must silence the sequencer's chord even under legato, where
+         * no later trigger would ever replace it. */
+        if (fProgStopping.exchange(false, std::memory_order_acquire)) {
+            stopSequencerGroup(0);
+            fProgLastBeat = -1;
+            fCells.clearPlayhead();
+        }
+
+        if (! fProgRunning.load(std::memory_order_acquire))
+            return;
+
+        const TimePosition& t = getTimePosition();
+
+        /* Following the host's transport: a stopped transport holds the
+         * sequence rather than running it free. */
+        if (! t.playing || ! t.bbt.valid) {
+            if (fProgLastBeat >= 0) {
+                stopSequencerGroup(0);
+                fProgLastBeat = -1;
+                fCells.clearPlayhead();
+            }
+            return;
+        }
+
+        /*
+         * The running beat count, from the top of the timeline.
+         *
+         * bar and beat are 1-based in DPF, hence the subtractions. The tick
+         * fraction is carried so that a block starting part-way through a beat
+         * is placed correctly rather than rounded to the beat it began in.
+         */
+        const double ticksPerBeat = (t.bbt.ticksPerBeat > 0.0)
+                                  ? t.bbt.ticksPerBeat : 1920.0;
+        const double beatsPerBar  = (t.bbt.beatsPerBar > 0.0f)
+                                  ? static_cast<double>(t.bbt.beatsPerBar) : 4.0;
+
+        const double beatNow =
+            (static_cast<double>(t.bbt.bar) - 1.0) * beatsPerBar +
+            (static_cast<double>(t.bbt.beat) - 1.0) +
+            (t.bbt.tick / ticksPerBeat);
+
+        const long long beat = static_cast<long long>(std::floor(beatNow));
+
+        /* Nothing to do until the beat changes. Comparing beats rather than
+         * timing from frames is what makes a repeated run() inside one beat
+         * harmless, and a skipped beat - from a jump - land correctly. */
+        if (beat == fProgLastBeat)
+            return;
+
+        int section = 0, step = 0;
+        if (! fProg.locate(beat, section, step)) {
+            /* An empty progression: stop rather than hold a stale chord. */
+            stopSequencerGroup(0);
+            fCells.clearPlayhead();
+            fProgLastBeat = beat;
+            return;
+        }
+
+        fProgLastBeat = beat;
+        fCells.setPlayhead(section, step);
+
+        const ProgCell& cell = fProg.section[section].cell[step];
+
+        /*
+         * A rest.
+         *
+         * Under legato it does NOT cut the chord - legato means a trigger
+         * stays live until the NEXT trigger, and a rest is the absence of one.
+         * Without legato the beat is where the chord ends, so it stops.
+         */
+        if (! cell.filled) {
+            if (! fProgLegato)
+                stopSequencerGroup(0);
+            return;
+        }
+
+        /* Resolve the degree in whatever key is selected, through the same
+         * call the keyboard and Slide Mode make - so a sequenced chord is
+         * identical to the one you would get by playing that cell. */
+        int  position = 0;
+        Ring ring     = kRingKey;
+        cellForDegree(cell.degree,
+                      fSelectedKey.load(std::memory_order_acquire),
+                      position, ring);
+
+        const int       root = rootForPosition(position, ring);
+        const ChordType type = chordTypeFor(ring, cell.ext);
+
+        /* The previous chord goes first: two chords sounding at once would be
+         * a harmony the grid never asked for. */
+        stopSequencerGroup(0);
+
+        startGroup(0, kProgSource, root, type, ring, pickVelocity(), true,
+                   fOctave);
+    }
+
+    /* Silence the sequencer's group, leaving hand-played ones alone. */
+    void stopSequencerGroup(uint32_t frame)
+    {
+        for (int i = 0; i < kMaxGroups; ++i)
+            if (fGroup[i].active && fGroup[i].source == kProgSource)
+                stopGroup(frame, &fGroup[i]);
+    }
+
+    /*
      * Can a move from one chord to another be carried by a glide?
      *
      *   off  never.
@@ -1766,6 +2004,16 @@ private:
         return extendChord(defaultChordForRing(ring), fRingExtension[ring]);
     }
 
+    /* As above, but with the extension given rather than taken from the ring.
+     * The sequencer carries an extension per CELL - a ii-V-I wants sevenths on
+     * the ii and V and a plain I - so it cannot use the ring-wide setting. */
+    ChordType chordTypeFor(Ring ring, Extension ext) const
+    {
+        if (fSingleNotes)
+            return kChordSingleNote;
+        return extendChord(defaultChordForRing(ring), ext);
+    }
+
 
     /* ---- settings: live state, never automation (spec section 5) ---------- */
     /*
@@ -1794,6 +2042,43 @@ private:
     bool      fVoiceLeading   = true;
     /* Which chord tone sits lowest, when voice leading is not choosing. */
     BassNote  fBassNote       = kBassFirst;
+
+    /*
+     * ---- the sequencer ---------------------------------------------------
+     *
+     * fProg is owned by the audio thread. The UI writes fPendingProg from
+     * setState and raises fProgDirty; the audio thread takes the copy at a
+     * point where no chord is mid-flight. Double-buffering rather than a lock
+     * because the audio thread must never wait on the UI.
+     */
+    Progression       fProg;
+    Progression       fPendingProg;
+    std::atomic<bool> fProgDirty    { false };
+    std::atomic<bool> fProgRunning  { false };
+    std::atomic<bool> fProgStopping { false };
+
+    /* Legato: a chord rings until the next one replaces it, rather than
+     * stopping at the end of its beat. */
+    bool fProgLegato = true;
+
+    /* The beat last triggered, so a beat fires once however many times run()
+     * is called inside it. -1 means nothing has played yet. */
+    long long fProgLastBeat = -1;
+
+    /* The sequencer's own voice group, kept apart from the wheel's so that
+     * playing along by hand does not cut the sequence. */
+    static constexpr int kProgSource = 0xF000;
+
+    /*
+     * Which screen the editor is showing.
+     *
+     * The DSP is otherwise screen-agnostic by design - a strip and a wedge
+     * send the same gesture - but the sequencer screen genuinely changes what
+     * incoming MIDI means, so this one fact has to cross. Only the value the
+     * gate needs is defined, rather than mirroring the UI's whole enum.
+     */
+    static constexpr int kUiScreenProgressions = 3;
+    std::atomic<int32_t> fUiScreen { 1 };   /* circle, as the UI starts */
 
     /* The chord most recently started, as the reference the next one leads
      * from. Kept after it stops, so a gap between chords still leads smoothly

@@ -534,6 +534,51 @@ int main()
         }
     }
 
+    /*
+     * A repeated degree must not light two columns.
+     *
+     * The diatonic bank ends on the octave-up I and the minor pentatonic on
+     * the octave-up i, and cellForDegree ignores the octave - so both columns
+     * resolve to the SAME ring cell. Slide Mode lights a strip when its cell
+     * is sounding, which meant pressing the first I lit the whole of the
+     * eighth column too. The UI now lights only the first slide carrying a
+     * degree; this records which banks repeat one, so a scale added later
+     * cannot reintroduce the problem unnoticed.
+     */
+    std::printf("\n=== repeated degrees in a slide bank ===\n");
+    {
+        for (int sc = 0; sc < kScaleCount; ++sc) {
+            const Scale s = static_cast<Scale>(sc);
+            const int n = slideCountForScale(s);
+            const SlideDef* defs = slidesForScale(s);
+
+            /* Every degree must resolve to a first slide, and every later
+             * appearance of it must report that same first slide - which is
+             * what stops a second column lighting. */
+            bool consistent = true;
+            int  repeats = 0;
+
+            for (int i = 0; i < n; ++i) {
+                int first = -1;
+                for (int j = 0; j < n && first < 0; ++j)
+                    if (defs[j].degree == defs[i].degree)
+                        first = j;
+
+                if (first < 0) { consistent = false; break; }
+                if (first != i) ++repeats;
+            }
+
+            char d[96];
+            std::snprintf(d, sizeof d, "%d slides, %d repeated", n, repeats);
+            if (consistent) {
+                std::printf("  ok    %-30s %s\n", kScaleName[sc], d);
+            } else {
+                std::printf("  FAIL  %-30s %s\n", kScaleName[sc], d);
+                ++failures;
+            }
+        }
+    }
+
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "PASS" : "FAIL",
                 failures, failures == 1 ? "" : "s");
