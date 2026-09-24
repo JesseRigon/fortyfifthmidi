@@ -76,6 +76,8 @@ protected:
             drawWheel();
         else if (fScreen == kScreenSlide)
             drawSlides();
+        else if (fScreen == kScreenProgressions)
+            drawProgressions();
         else
             drawKeyboardSetup();
 
@@ -117,20 +119,41 @@ protected:
      * shared chrome below it never moves when the screen changes.
      */
 
-    enum Screen { kScreenCircle = 0, kScreenSlide, kScreenKeys, kScreenCount };
+    /*
+     * Setup sits first because it is where a session starts - bindings before
+     * playing. The three performance screens follow in the order they were
+     * added, which is also increasing order of structure: a wheel, a strip, a
+     * sequence.
+     */
+    enum Screen {
+        kScreenKeys = 0,
+        kScreenCircle,
+        kScreenSlide,
+        kScreenProgressions,
+        kScreenCount
+    };
 
     static constexpr float kTabH = 28.0f;
 
+    /* Setup is an icon, so it needs less room than the word tabs. */
+    static constexpr float kSetupTabW = 34.0f;
+    static constexpr float kTabW      = 104.0f;
+
     Button tabButton(int index) const
     {
-        const float w = 112.0f;
-        return { 10.0f + index * (w + 4.0f), 4.0f, w, kTabH - 8.0f };
+        if (index == kScreenKeys)
+            return { 10.0f, 4.0f, kSetupTabW, kTabH - 8.0f };
+
+        const float x = 10.0f + kSetupTabW + 4.0f
+                      + (index - 1) * (kTabW + 4.0f);
+        return { x, 4.0f, kTabW, kTabH - 8.0f };
     }
 
     void drawTabBar()
     {
+        /* "Mode" told the user nothing the tab bar did not already say. */
         static const char* const kNames[kScreenCount] = {
-            "Circle Mode", "Slide Mode", "Keyboard Setup"
+            "⚙", "CIRCLE", "SLIDE", "PROGRESSIONS"
         };
 
         for (int i = 0; i < kScreenCount; ++i) {
@@ -148,7 +171,8 @@ protected:
             stroke();
 
             fontFace(NANOVG_DEJAVU_SANS_TTF);
-            fontSize(12.0f);
+            /* The gear needs more size than the word tabs to read at all. */
+            fontSize(i == kScreenKeys ? 15.0f : 11.5f);
             textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
             fillColor(on ? Color(0.96f, 0.98f, 1.00f)
                          : Color(0.62f, 0.66f, 0.72f));
@@ -1346,6 +1370,31 @@ protected:
              nullptr);
     }
 
+    /* ---- progressions ------------------------------------------------------
+     *
+     * A step sequencer for chords: each row is a section, each cell one beat,
+     * and the sections chain A -> B -> C -> D and back. Built in the next
+     * commit; this placeholder keeps the tab honest about being empty rather
+     * than showing a broken grid.
+     */
+    void drawProgressions()
+    {
+        const Button a = slideArea();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(13.0f);
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+        fillColor(Color(0.50f, 0.55f, 0.63f));
+        text(a.x + a.w * 0.5f, a.y + a.h * 0.5f - 10.0f,
+             "Progression sequencer - not built yet.", nullptr);
+
+        fontSize(11.0f);
+        fillColor(Color(0.38f, 0.42f, 0.50f));
+        text(a.x + a.w * 0.5f, a.y + a.h * 0.5f + 12.0f,
+             "Sections chain A to D, one cell per beat, synced to host tempo.",
+             nullptr);
+    }
+
     /*
      * A slide press is a wheel press.
      *
@@ -1611,7 +1660,11 @@ protected:
 
     void drawControls()
     {
-        drawButton(latchButton(), fLatchEnabled ? "Latch: on" : "Latch: off",
+        /* "Legato" describes what it does - a selection sounds on until the
+         * next one replaces it. The state key stays "latch": renaming it
+         * would break every saved session for a label change. */
+        drawButton(latchButton(),
+                   fLatchEnabled ? "LEGATO: ON" : "LEGATO: OFF",
                    fLatchEnabled);
         drawButton(glideButton(), kGlideModeName[fGlideMode],
                    fGlideMode != kGlideOff);
@@ -1619,10 +1672,10 @@ protected:
          * and only the highlight is pinned. Saying "Key: locked" would suggest
          * the keyboard was frozen too. */
         drawButton(keyLockButton(),
-                   fKeyLocked ? "Wedge: pinned" : "Wedge: follows",
+                   fKeyLocked ? "WEDGE: PINNED" : "WEDGE: FOLLOWS",
                    fKeyLocked);
         drawButton(singleNoteButton(),
-                   fSingleNotes ? "Single notes" : "Chords",
+                   fSingleNotes ? "SINGLE NOTES" : "CHORDS",
                    fSingleNotes);
         /*
          * Which chord tone is in the bass. Voice leading overrides it - it
@@ -1632,7 +1685,7 @@ protected:
          */
         const bool leadInForce = fVoiceLeading && fGlideMode != kGlideOn;
         drawButton(voiceLeadButton(),
-                   leadInForce ? "Root: auto (lead)"
+                   leadInForce ? "ROOT: AUTO"
                                : kBassNoteName[fBassNote],
                    leadInForce);
 
@@ -1644,16 +1697,16 @@ protected:
         if (fScreen == kScreenSlide) {
             char buf[48];
 
-            std::snprintf(buf, sizeof(buf), "Sections: %s",
-                          fSectionMode == kSectionOctave ? "octave"
-                                                         : "variation");
+            std::snprintf(buf, sizeof(buf), "SECTIONS: %s",
+                          fSectionMode == kSectionOctave ? "OCTAVE"
+                                                         : "VARIATION");
             drawDropdown(sectionModeButton(), buf, false);
 
             std::snprintf(buf, sizeof(buf), "%s", kScaleName[fScale]);
             drawDropdown(scaleButton(), buf,
                          fOpenMenu == kMenuScale);
 
-            std::snprintf(buf, sizeof(buf), "Key: %s",
+            std::snprintf(buf, sizeof(buf), "KEY: %s",
                           kMajorLabel[fSelectedKey]);
             drawDropdown(slideKeyButton(), buf, fOpenMenu == kMenuKey);
 
@@ -1670,13 +1723,22 @@ protected:
         }
 
         /* Per-ring dropdowns, labelled by ring so the mapping is unambiguous. */
-        static const char* const kRingTag[kRingCount] = { "Maj", "Min", "Dim" };
+        static const char* const kRingTag[kRingCount] = { "MAJ", "MIN", "DIM" };
 
         for (int r = 0; r < kRingCount; ++r) {
             char ext[48], voi[48];
+            /* Short form: "None (triad)" did not fit once the tag went
+             * uppercase, and a clipped label is worse than a terse one. */
+            static const char* const kExtShort[kExtCount] = {
+                "TRIAD", "6TH", "7TH", "9TH", "ADD9", "SUS2", "SUS4"
+            };
             std::snprintf(ext, sizeof(ext), "%s: %s",
-                          kRingTag[r], kExtensionName[fRingExt[r]]);
+                          kRingTag[r], kExtShort[fRingExt[r]]);
+            /* Uppercased to match the row; the menu keeps the full names,
+             * where there is room for them. */
             std::snprintf(voi, sizeof(voi), "%s", kVoicingName[fRingVoice[r]]);
+            for (char* p = voi; *p != '\0'; ++p)
+                if (*p >= 'a' && *p <= 'z') *p = static_cast<char>(*p - 32);
 
             drawDropdown(extButton(r), ext,
                          fOpenMenu == kMenuExt && fOpenMenuRing == r);

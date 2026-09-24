@@ -571,7 +571,7 @@ enum BassNote {
 };
 
 static constexpr const char* kBassNoteName[kBassNoteCount] = {
-    "Root: first", "Root: second", "Root: third"
+    "ROOT: FIRST", "ROOT: SECOND", "ROOT: THIRD"
 };
 
 /*
@@ -929,7 +929,7 @@ enum GlideMode {
 };
 
 static constexpr const char* kGlideModeName[kGlideModeCount] = {
-    "Glide: off", "Glide: on", "Glide: MPE"
+    "GLIDE: OFF", "GLIDE: ON", "GLIDE: MPE"
 };
 
 /*
