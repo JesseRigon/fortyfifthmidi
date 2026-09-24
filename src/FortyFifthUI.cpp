@@ -1035,22 +1035,42 @@ protected:
         for (int i = 0; i < n; ++i) {
             const Button s = slideRect(i);
 
-            /* Does the DSP say this strip's cell is sounding? Checked once per
-             * strip rather than per section - a cell is a cell, whichever
-             * section was used to reach it. */
+            /*
+             * A cell sounding from the KEYBOARD lights the whole strip, since
+             * a played note picks a degree and not a section. A cell sounding
+             * from the pointer lights only the section that was pressed.
+             *
+             * Distinguishing them matters: lighting the strip in both cases
+             * lit every section of a pressed column, which read as the whole
+             * stack coming on at once. fActiveSlide is what tells them apart -
+             * the pointer sets it, the keyboard never does.
+             */
             int  cellPos;
             Ring cellRing;
             cellForDegree(defs[i].degree, fSelectedKey, cellPos, cellRing);
             const bool cellLit =
                 (fCells != nullptr && fCells->isOn(cellRing, cellPos));
 
+            /*
+             * "From the keyboard" means the pointer never touched this strip -
+             * not merely that it is not touching it NOW. Releasing clears
+             * fActiveSlide while the DSP's note-offs are still in flight, and
+             * for those frames the old test saw a lit cell with no active
+             * slide and lit the entire stack. fPointerSlide remembers which
+             * strip the pointer last used, so that window cannot open.
+             */
+            const bool fromKeyboard = cellLit && (fPointerSlide != i);
+
             for (int sec = 0; sec < sectionCount(); ++sec) {
                 const Button r = sectionRect(i, sec);
-                const bool pressed = (fActiveSlide == i && fActiveSection == sec);
-                /* A keyboard note lights the whole strip, since the keyboard
-                 * chooses a degree and not a section. */
-                const bool active = pressed ||
-                    (cellLit && fActiveSlide != i);
+                /* Lit by the pointer: either mid-drag, or still sounding from
+                 * the section the pointer last used (latch, or a release
+                 * whose note-offs have not landed yet). */
+                const bool pressed =
+                    (fActiveSlide == i && fActiveSection == sec) ||
+                    (fPointerSlide == i && fPointerSection == sec && cellLit);
+
+                const bool active = pressed || fromKeyboard;
 
                 /* Filled edge to edge - cells touch, so a drag never leaves
                  * the bank between them. */
@@ -1358,10 +1378,15 @@ protected:
         sendGesture("press", pos, ring);
 
         if (same) {
-            fActiveSlide = -1;
+            fActiveSlide    = -1;
+            fPointerSlide   = -1;
         } else {
-            fActiveSlide   = slide;
-            fActiveSection = section;
+            fActiveSlide    = slide;
+            fActiveSection  = section;
+            /* Remembered past the release, so the highlight knows this strip
+             * was played by the pointer rather than by the keyboard. */
+            fPointerSlide   = slide;
+            fPointerSection = section;
         }
 
         fDragging       = true;
@@ -1383,6 +1408,18 @@ protected:
         if (slide == fActiveSlide && section == fActiveSection)
             return false;
 
+        /*
+         * Moving WITHIN a column lands on the same cell, so a "move" gesture
+         * would tell the DSP nothing changed and the chord would not
+         * retrigger - even though the section genuinely changed it, to another
+         * octave or another extension.
+         *
+         * So a same-column move is a fresh press: release what is sounding,
+         * then start the new chord. A different column keeps "move", which is
+         * what lets it glide.
+         */
+        const bool sameColumn = (slide == fActiveSlide);
+
         applySection(slide, section);
 
         const SlideDef* defs = slidesForScale(fScale);
@@ -1394,8 +1431,14 @@ protected:
         fActiveSection  = section;
         fActivePosition = pos;
         fActiveRing     = ring;
+        fPointerSlide   = slide;
+        fPointerSection = section;
 
-        sendGesture("move", pos, ring);
+        /* One gesture, not a release followed by a press: the handoff to the
+         * audio thread holds a single slot, so the second would overwrite the
+         * first and the old chord would never stop. */
+        sendGesture(sameColumn ? "retrigger" : "move", pos, ring);
+
         repaint();
         return true;
     }
@@ -1769,7 +1812,8 @@ protected:
                             fScale = static_cast<Scale>(i);
                             /* Fewer slides may leave the highlight past the
                              * end of the bank. */
-                            fActiveSlide = -1;
+                            fActiveSlide  = -1;
+                            fPointerSlide = -1;
                             break;
                         case kMenuKey:
                             selectKey(i);
@@ -1821,6 +1865,7 @@ protected:
                 /* A highlight from the other screen would be a lie here. */
                 fActivePosition = -1;
                 fActiveSlide    = -1;
+                fPointerSlide   = -1;
                 fOpenMenu       = kMenuNone;
                 fLastChord.clear();
 
@@ -1849,7 +1894,8 @@ protected:
             if (hit(sectionModeButton(), px, py)) {
                 fSectionMode = (fSectionMode == kSectionOctave)
                     ? kSectionVariation : kSectionOctave;
-                fActiveSlide = -1;
+                fActiveSlide  = -1;
+                fPointerSlide = -1;
                 repaint();
                 return true;
             }
@@ -2703,6 +2749,14 @@ private:
 
     int fActiveSlide   = -1;
     int fActiveSection = 0;
+
+    /* The strip and section the POINTER last played, kept past the release.
+     * fActiveSlide is cleared as soon as the drag ends, which leaves a window
+     * where the DSP still reports the cell sounding and the highlight cannot
+     * tell a pointer press from a keyboard note - that window is what lit the
+     * whole stack. */
+    int fPointerSlide   = -1;
+    int fPointerSection = 0;
 
     /* First visible variation row, so all seven extensions are reachable
      * while only four are on screen. */

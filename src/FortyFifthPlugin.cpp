@@ -422,9 +422,10 @@ protected:
             return;
 
         int kind;
-        if (std::strcmp(verb, "press") == 0)        kind = kGesturePress;
-        else if (std::strcmp(verb, "move") == 0)    kind = kGestureMove;
-        else if (std::strcmp(verb, "release") == 0) kind = kGestureRelease;
+        if (std::strcmp(verb, "press") == 0)          kind = kGesturePress;
+        else if (std::strcmp(verb, "move") == 0)      kind = kGestureMove;
+        else if (std::strcmp(verb, "release") == 0)   kind = kGestureRelease;
+        else if (std::strcmp(verb, "retrigger") == 0) kind = kGestureRetrigger;
         else return;
 
         fPendingGesture.store((kind << 16) | (ring << 8) | position,
@@ -564,7 +565,16 @@ private:
     enum GestureKind {
         kGesturePress = 1,
         kGestureMove,
-        kGestureRelease
+        kGestureRelease,
+        /*
+         * Same cell, different settings - a drag within one Slide Mode column,
+         * where the section changed the octave or the extension but not the
+         * chord's position. A "move" would be a no-op there, since the DSP
+         * would see the same cell; this says "rebuild it" in one gesture,
+         * which matters because the handoff holds a single slot and a
+         * release-then-press pair would lose the release.
+         */
+        kGestureRetrigger
     };
     static constexpr int32_t kNoGesture = -1;
 
@@ -1125,6 +1135,31 @@ private:
                     startGroup(0, source, root, type, r, vel, false, oct, note);
                     fDragSource = source;
                 }
+                break;
+            }
+
+            case kGestureRetrigger: {
+                /*
+                 * Rebuild whatever the pointer is holding, with the settings
+                 * as they are now. Every group is stopped rather than just the
+                 * drag's, because a latched chord on the same cell must not be
+                 * left sounding with the old voicing beside the new one.
+                 */
+                if (fGlideActive) {
+                    fGlideActive = false;
+                    zeroAllBends(0);
+                }
+
+                stopAllGroups(0);
+
+                fGestureVelocity = pickVelocity();
+                startGroup(0, source, root, type, r, fGestureVelocity,
+                           /* retriggerDuplicates */ true, fOctave);
+                fDragSource = source;
+
+                fNoteOffCountdown = fHoldToSustain
+                    ? 0
+                    : static_cast<int32_t>(fNoteLengthMs * fSampleRate / 1000.0);
                 break;
             }
 
