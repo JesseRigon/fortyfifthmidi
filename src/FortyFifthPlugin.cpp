@@ -36,6 +36,7 @@ namespace fortyfifth {
 namespace {
     std::mutex gRegistryMutex;
     std::map<void*, MonitorRing*> gRegistry;
+    std::map<void*, ActiveCells*> gCellsRegistry;
 }
 
 void registerMonitorRing(void* instance, MonitorRing* ring)
@@ -48,6 +49,21 @@ void unregisterMonitorRing(void* instance)
 {
     const std::lock_guard<std::mutex> lock(gRegistryMutex);
     gRegistry.erase(instance);
+    gCellsRegistry.erase(instance);
+}
+
+void registerActiveCells(void* instance, ActiveCells* cells)
+{
+    const std::lock_guard<std::mutex> lock(gRegistryMutex);
+    gCellsRegistry[instance] = cells;
+}
+
+ActiveCells* activeCellsFor(void* instance)
+{
+    const std::lock_guard<std::mutex> lock(gRegistryMutex);
+    const std::map<void*, ActiveCells*>::const_iterator it =
+        gCellsRegistry.find(instance);
+    return (it != gCellsRegistry.end()) ? it->second : nullptr;
 }
 
 MonitorRing* monitorRingFor(void* instance)
@@ -74,6 +90,7 @@ public:
         std::memset(fHeld, 0, sizeof(fHeld));
         std::memcpy(fKeyMap, kDefaultKeyMap, sizeof(fKeyMap));
         registerMonitorRing(this, &fMonitor);
+        registerActiveCells(this, &fCells);
     }
 
     ~FortyFifthPlugin() override
@@ -674,6 +691,14 @@ private:
     VoiceGroup fGroup[kMaxGroups];
     uint8_t    fHeld[128] = {0};
 
+    /* A source packs the cell as (ring << 8) | position. Decoded here rather
+     * than open-coded at each use, so the two halves cannot drift apart. */
+    static int position_from_source(int source) { return source & 0xFF; }
+    static Ring ring_from_source(int source)
+    {
+        return static_cast<Ring>((source >> 8) & 0xFF);
+    }
+
     VoiceGroup* findGroup(int source)
     {
         for (int i = 0; i < kMaxGroups; ++i)
@@ -767,6 +792,11 @@ private:
             ++fHeld[note];
         }
 
+        /* Light the cell. Driven from the group rather than from the gesture,
+         * so the UI shows what is actually SOUNDING - including notes played
+         * from a MIDI keyboard, which never pass through the UI at all. */
+        fCells.set(ring, position_from_source(source), true);
+
         /* Remember this chord as the reference the next one leads from. Kept
          * even after the chord stops, so a gap between chords still leads
          * smoothly rather than resetting to root position. */
@@ -795,9 +825,27 @@ private:
             }
         }
 
+        /*
+         * Unlight the cell only when no OTHER group still holds it. Two groups
+         * can share a cell - a latched chord and a new press on the same one -
+         * and clearing unconditionally would darken a cell that is still
+         * sounding, which is the highlight telling a lie.
+         */
+        const int  src  = g->source;
+        const Ring r    = ring_from_source(src);
+        const int  pos  = position_from_source(src);
+
         g->active = false;
         g->count  = 0;
         g->source = -1;
+
+        if (src >= 0) {
+            bool stillHeld = false;
+            for (int i = 0; i < kMaxGroups && ! stillHeld; ++i)
+                stillHeld = (fGroup[i].active && fGroup[i].source == src);
+            if (! stillHeld)
+                fCells.set(r, pos, false);
+        }
         /* Clear the identity too. A recycled slot that kept a stale note number
          * would be found by the next lookup for that note and silence the wrong
          * chord - the same class of bookkeeping slip that stranded notes before. */
@@ -817,6 +865,11 @@ private:
         for (int i = 0; i < kMaxGroups; ++i)
             stopGroup(frame, &fGroup[i]);
         fNoteOffCountdown = 0;
+
+        /* Everything stopped, so nothing may still be lit. Clearing outright
+         * rather than relying on the per-group unlight, which cannot know
+         * about the stranded pitches this function also sweeps. */
+        fCells.clear();
 
         /* Nothing is sounding, so nothing may still be referenced. A stale
          * last-note would make the next keypress try to glide from a group
@@ -1698,6 +1751,10 @@ private:
 
     /* DSP -> UI event log. Always built; the UI reads it via direct access. */
     MonitorRing fMonitor;
+
+    /* Which cells are sounding, for the UI highlight. Separate from the ring
+     * because the highlight must work whether or not the monitor is open. */
+    ActiveCells fCells;
 
     /* Set from the UI or on (de)activate; consumed by run() to silence
      * everything. */

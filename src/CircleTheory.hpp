@@ -965,6 +965,63 @@ struct MonitorRing {
 };
 
 /*
+ * What the DSP is currently sounding, for the UI to light up.
+ *
+ * The monitor ring cannot answer this. It carries raw MIDI, so the UI would
+ * have to guess which cell produced a pitch - and several cells can produce
+ * the same one. It is also only drained while the monitor panel is open,
+ * whereas the highlight has to work whether or not the panel is expanded.
+ *
+ * So the DSP publishes the cells themselves. One bit per cell of each ring,
+ * written by the audio thread and read by the UI: a plain atomic word, so
+ * neither side blocks and a torn read is impossible.
+ *
+ * The 24-cell minor ring is why this is 32-bit per ring rather than 16.
+ */
+struct ActiveCells {
+    std::atomic<uint32_t> ring[kRingCount];
+
+    ActiveCells()
+    {
+        for (int i = 0; i < kRingCount; ++i)
+            ring[i].store(0, std::memory_order_relaxed);
+    }
+
+    /* Audio thread. */
+    void set(Ring r, int position, bool on)
+    {
+        const int n = kRingSegments[r];
+        const uint32_t bit = 1u << (((position % n) + n) % n);
+
+        uint32_t cur = ring[r].load(std::memory_order_relaxed);
+        ring[r].store(on ? (cur | bit) : (cur & ~bit),
+                      std::memory_order_release);
+    }
+
+    void clear()
+    {
+        for (int i = 0; i < kRingCount; ++i)
+            ring[i].store(0, std::memory_order_release);
+    }
+
+    /* UI thread. */
+    bool isOn(Ring r, int position) const
+    {
+        const int n = kRingSegments[r];
+        const uint32_t bit = 1u << (((position % n) + n) % n);
+        return (ring[r].load(std::memory_order_acquire) & bit) != 0;
+    }
+
+    bool any() const
+    {
+        for (int i = 0; i < kRingCount; ++i)
+            if (ring[i].load(std::memory_order_acquire) != 0)
+                return true;
+        return false;
+    }
+};
+
+/*
  * Bridge between the two translation units.
  *
  * getPluginInstancePointer() hands the UI a void* to the Plugin. Casting that to
@@ -977,6 +1034,10 @@ struct MonitorRing {
 MonitorRing* monitorRingFor(void* pluginInstance);
 void registerMonitorRing(void* pluginInstance, MonitorRing* ring);
 void unregisterMonitorRing(void* pluginInstance);
+
+/* Same registry, so the UI finds its own instance's highlight state. */
+ActiveCells* activeCellsFor(void* pluginInstance);
+void registerActiveCells(void* pluginInstance, ActiveCells* cells);
 
 } /* namespace fortyfifth */
 

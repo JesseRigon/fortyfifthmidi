@@ -186,7 +186,13 @@ protected:
         float start, end;
         segmentAngles(index, ring, start, end);
 
-        const bool active = (fActivePosition == index && fActiveRing == ring);
+        /*
+         * Lit if the pointer is on it, OR if the DSP says it is sounding.
+         * The second is what shows notes played from a MIDI keyboard, which
+         * never touch the UI's own gesture state at all.
+         */
+        const bool active = (fActivePosition == index && fActiveRing == ring)
+                         || (fCells != nullptr && fCells->isOn(ring, index));
 
         beginPath();
         arc(cx, cy, rOut, start, end, NanoVG::CW);
@@ -1004,9 +1010,22 @@ protected:
         for (int i = 0; i < n; ++i) {
             const Button s = slideRect(i);
 
+            /* Does the DSP say this strip's cell is sounding? Checked once per
+             * strip rather than per section - a cell is a cell, whichever
+             * section was used to reach it. */
+            int  cellPos;
+            Ring cellRing;
+            cellForDegree(defs[i].degree, fSelectedKey, cellPos, cellRing);
+            const bool cellLit =
+                (fCells != nullptr && fCells->isOn(cellRing, cellPos));
+
             for (int sec = 0; sec < sectionCount(); ++sec) {
                 const Button r = sectionRect(i, sec);
-                const bool active = (fActiveSlide == i && fActiveSection == sec);
+                const bool pressed = (fActiveSlide == i && fActiveSection == sec);
+                /* A keyboard note lights the whole strip, since the keyboard
+                 * chooses a degree and not a section. */
+                const bool active = pressed ||
+                    (cellLit && fActiveSlide != i);
 
                 /* Filled edge to edge - cells touch, so a drag never leaves
                  * the bank between them. */
@@ -1203,10 +1222,21 @@ protected:
         const bool sel = (fEditKey == pc);
         const KeyMapEntry& e = fKeyMap[pc];
 
+        /* Light a key whose degree is currently sounding, so a binding can be
+         * confirmed by playing it rather than by trusting the label. */
+        bool playing = false;
+        if (fCells != nullptr && e.action == kKeyDegree) {
+            int  p;
+            Ring rg;
+            cellForDegree(static_cast<Degree>(e.value), fSelectedKey, p, rg);
+            playing = fCells->isOn(rg, p);
+        }
+
         beginPath();
         roundedRect(r.x, r.y, r.w, r.h, 3.0f);
 
-        if (sel)                             fillColor(Color(0.98f, 0.72f, 0.24f));
+        if (playing)                         fillColor(Color(0.42f, 0.78f, 0.95f));
+        else if (sel)                        fillColor(Color(0.98f, 0.72f, 0.24f));
         else if (black)                      fillColor(Color(0.13f, 0.14f, 0.18f));
         else if (e.action == kKeyDegree)     fillColor(Color(0.90f, 0.92f, 0.95f));
         else                                 fillColor(Color(0.72f, 0.75f, 0.80f));
@@ -1225,8 +1255,10 @@ protected:
         fontFace(NANOVG_DEJAVU_SANS_TTF);
         textAlign(ALIGN_CENTER | ALIGN_BOTTOM);
 
+        const bool lit = (sel || playing);
+
         fontSize(black ? 9.5f : 11.0f);
-        if (sel)          fillColor(Color(0.10f, 0.09f, 0.06f));
+        if (lit)          fillColor(Color(0.10f, 0.09f, 0.06f));
         else if (silent)  fillColor(Color(0.45f, 0.30f, 0.30f));
         else if (black)   fillColor(Color(0.80f, 0.84f, 0.90f));
         else              fillColor(Color(0.15f, 0.17f, 0.22f));
@@ -1234,7 +1266,7 @@ protected:
 
         /* Note name underneath, so the key is identifiable at a glance. */
         fontSize(black ? 8.5f : 10.0f);
-        if (sel)        fillColor(Color(0.30f, 0.26f, 0.14f));
+        if (lit)        fillColor(Color(0.30f, 0.26f, 0.14f));
         else if (black) fillColor(Color(0.48f, 0.52f, 0.60f));
         else            fillColor(Color(0.45f, 0.49f, 0.56f));
         text(r.x + r.w * 0.5f, r.y + r.h - 22.0f, kPitchName[pc], nullptr);
@@ -2281,10 +2313,37 @@ protected:
     void uiIdle() override
     {
         if (fRing == nullptr) {
-            /* The plugin registers its ring at construction; look it up once. */
-            fRing = monitorRingFor(getPluginInstancePointer());
+            /* The plugin registers both at construction; look them up once. */
+            void* inst = getPluginInstancePointer();
+            fRing  = monitorRingFor(inst);
+            fCells = activeCellsFor(inst);
             if (fRing == nullptr)
                 return;
+        }
+
+        /*
+         * Poll the highlight regardless of the monitor, and BEFORE the early
+         * return below - notes played from a MIDI keyboard must light the UI
+         * whether or not the log panel happens to be expanded.
+         *
+         * Only repaint when the set actually changes, so an idle plugin costs
+         * nothing: uiIdle runs at frame rate, and repainting every tick would
+         * burn a core for no reason.
+         */
+        if (fCells != nullptr) {
+            /* Compared word for word rather than hashed: there are only three,
+             * and a hash collision would silently drop a highlight change. */
+            bool changed = false;
+            for (int r = 0; r < kRingCount; ++r) {
+                const uint32_t now =
+                    fCells->ring[r].load(std::memory_order_acquire);
+                if (now != fCellsSeen[r]) {
+                    fCellsSeen[r] = now;
+                    changed = true;
+                }
+            }
+            if (changed)
+                repaint();
         }
 
         /* Only drain while the log is visible, so a collapsed panel cannot grow
@@ -2313,6 +2372,11 @@ protected:
     /* Collapsed by default: the wheel is the point, the log is for debugging. */
     bool         fMonitorOpen = false;
     MonitorRing* fRing        = nullptr;
+
+    /* What the DSP is sounding, for the highlight, plus the last state seen so
+     * an idle plugin does not repaint every frame. */
+    ActiveCells* fCells = nullptr;
+    uint32_t     fCellsSeen[kRingCount] = { 0, 0, 0 };
 
     /* What is currently sounding, rebuilt from the note-on/note-off stream, so
      * the log can report the chord rather than only the events that made it. */
