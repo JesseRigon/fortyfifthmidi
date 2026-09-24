@@ -1140,17 +1140,42 @@ struct ActiveCells {
  * beat it falls on.
  */
 
-/* An empty cell is a rest: the beat passes and nothing is triggered. Under
+/*
+ * An empty cell is a rest: the beat passes and nothing is triggered. Under
  * legato a rest does NOT cut the previous chord - the chord rings until the
- * next real trigger, which is what legato means here. */
+ * next real trigger, which is what legato means here.
+ *
+ * The octave is per cell, and relative: 0 means the plugin's own octave
+ * setting, -1 an octave below, +1 above. Relative rather than absolute so
+ * that moving the whole instrument up or down carries the progression with
+ * it, and a chord written an octave below its neighbours stays an octave
+ * below them.
+ */
 struct ProgCell {
     bool      filled = false;
     Degree    degree = kDegreeI;
     Extension ext    = kExtNone;
+    int8_t    octave = 0;       /* -2..+2, relative to the global octave */
 };
 
-static constexpr int kMaxProgSteps    = 16;   /* beats in a section */
+static constexpr int kProgOctaveMin = -2;
+static constexpr int kProgOctaveMax =  2;
+
+/*
+ * Beats in a section.
+ *
+ * 64 is the ceiling; a section is set to 16, 32 or 64 through
+ * kProgLengthChoice. Sixteen was too short to hold a verse at one chord per
+ * beat, which is what the longer grids are for.
+ */
+static constexpr int kMaxProgSteps    = 64;
 static constexpr int kMaxProgSections = 8;    /* A..H */
+
+/* The grid sizes offered. A section's length is free to be anything up to the
+ * chosen size; this is the size of the editable grid, not the loop. */
+static constexpr int kProgLengthChoice[] = { 16, 32, 64 };
+static constexpr int kProgLengthChoiceCount =
+    static_cast<int>(sizeof(kProgLengthChoice) / sizeof(kProgLengthChoice[0]));
 
 struct ProgSection {
     ProgCell cell[kMaxProgSteps];
@@ -1303,10 +1328,14 @@ struct Progression {
  * worth having to hand rather than an exhaustive catalogue - the grid is
  * editable, so the menu only needs to save typing on the common ones.
  */
+/* Presets are short phrases, so they are sized for a phrase rather than for
+ * the whole 64-beat grid - which would make every entry mostly padding. */
+static constexpr int kMaxPresetSteps = 16;
+
 struct NamedProgression {
     const char* name;
     int         length;
-    Degree      degree[kMaxProgSteps];
+    Degree      degree[kMaxPresetSteps];
 };
 
 static constexpr NamedProgression kPresetProgression[] = {
@@ -1356,6 +1385,7 @@ inline void loadPresetAt(Progression& prog, int presetIndex,
         s.cell[at].filled = true;
         s.cell[at].degree = p.degree[i];
         s.cell[at].ext    = kExtNone;
+        s.cell[at].octave = 0;
     }
 
     const int end = startStep + p.length;

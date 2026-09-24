@@ -278,7 +278,7 @@ int main()
         bool allGood = true;
         for (int i = 0; i < kPresetProgressionCount; ++i) {
             const NamedProgression& n = kPresetProgression[i];
-            if (n.length <= 0 || n.length > kMaxProgSteps)
+            if (n.length <= 0 || n.length > kMaxPresetSteps)
                 allGood = false;
             for (int s = 0; s < n.length; ++s)
                 if (n.degree[s] < 0 || n.degree[s] >= kDegreeCount)

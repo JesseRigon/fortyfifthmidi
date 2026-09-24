@@ -95,10 +95,17 @@ protected:
         else
             drawKeyboardSetup();
 
-        /* The setup screen edits bindings rather than playing, so the
-         * performance controls would only be noise there. */
+        /*
+         * The setup screen edits bindings rather than playing, so the
+         * performance controls would only be noise there.
+         *
+         * The sequencer has no slider either: it would set one octave for the
+         * whole grid, which is the opposite of what a per-cell octave is for.
+         * Each cell carries its own offset, edited in the cell menu.
+         */
         if (fScreen != kScreenKeys) {
-            drawOctaveSlider();
+            if (fScreen != kScreenProgressions)
+                drawOctaveSlider();
             drawControls();
         }
 
@@ -150,7 +157,8 @@ protected:
     static constexpr float kTabH = 28.0f;
 
     /* Setup is an icon, so it needs less room than the word tabs. */
-    static constexpr float kSetupTabW = 34.0f;
+    /* Wide enough for a drawn keyboard and a gear side by side. */
+    static constexpr float kSetupTabW = 52.0f;
     static constexpr float kTabW      = 104.0f;
 
     Button tabButton(int index) const
@@ -184,14 +192,61 @@ protected:
             strokeWidth(1.0f);
             stroke();
 
+            if (i == kScreenKeys) {
+                /* A keyboard AND a gear: the screen is keyboard settings, and
+                 * either symbol alone says only half of that. The keyboard is
+                 * drawn rather than typed - no font here has a piano glyph,
+                 * and a missing codepoint renders as a hollow box. */
+                drawKeyboardIcon(b, on);
+                continue;
+            }
+
             fontFace(NANOVG_DEJAVU_SANS_TTF);
-            /* The gear needs more size than the word tabs to read at all. */
-            fontSize(i == kScreenKeys ? 15.0f : 11.5f);
+            fontSize(11.5f);
             textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
             fillColor(on ? Color(0.96f, 0.98f, 1.00f)
                          : Color(0.62f, 0.66f, 0.72f));
             text(b.x + b.w * 0.5f, b.y + b.h * 0.5f, kNames[i], nullptr);
         }
+    }
+
+    /* Five white keys with three blacks, then a gear, inside the Setup tab. */
+    void drawKeyboardIcon(const Button& b, bool on)
+    {
+        const float kw = 3.0f;                  /* white key width */
+        const float kh = 11.0f;
+        const float x0 = b.x + 6.0f;
+        const float y0 = b.y + (b.h - kh) * 0.5f;
+
+        const Color white = on ? Color(0.92f, 0.95f, 1.00f)
+                               : Color(0.60f, 0.64f, 0.70f);
+        const Color black = on ? Color(0.16f, 0.22f, 0.32f)
+                               : Color(0.13f, 0.14f, 0.18f);
+
+        for (int k = 0; k < 5; ++k) {
+            beginPath();
+            rect(x0 + k * kw, y0, kw - 0.6f, kh);
+            fillColor(white);
+            fill();
+        }
+
+        /* Blacks sit between the first two and the last three whites, which is
+         * what makes five keys read as a keyboard rather than a barcode. */
+        static const int kBlackAfter[3] = { 0, 2, 3 };
+        for (int j = 0; j < 3; ++j) {
+            beginPath();
+            rect(x0 + (kBlackAfter[j] + 1) * kw - kw * 0.30f, y0,
+                 kw * 0.60f, kh * 0.62f);
+            fillColor(black);
+            fill();
+        }
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(13.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(on ? Color(0.96f, 0.98f, 1.00f)
+                     : Color(0.62f, 0.66f, 0.72f));
+        text(x0 + 5 * kw + 4.0f, b.y + b.h * 0.5f, "⚙", nullptr);
     }
 
     /* Angular span of one cell on one ring. */
@@ -374,9 +429,9 @@ protected:
      * Send the whole grid across as one string.
      *
      * Sections are separated by ';', cells by ',', and a cell is
-     * "degree.extension" or "-" for a rest; the section's length comes first.
-     * So "4|0.0,5.2,3.0,4.0;2|0.0,4.0" is a four-beat I-vi-IV-V followed by a
-     * two-beat I-V.
+     * "degree.extension.octave" or "-" for a rest; the section's length comes
+     * first. So "4|0.0.0,5.2.0,3.0.-1,4.0.0;2|0.0.0,4.0.0" is a four-beat
+     * I-vi-IV-V, the IV an octave down, followed by a two-beat I-V.
      *
      * One string rather than a key per cell because the DSP must never see a
      * half-applied grid: a progression arriving cell by cell would play a
@@ -384,7 +439,10 @@ protected:
      */
     void pushProgression()
     {
-        char out[1024] = {0};
+        /* Sized for the worst case: every section full at 64 beats, each cell
+         * "d.e.o," at up to 8 bytes, plus the length prefix. A truncated grid
+         * would decode as a different progression than the one on screen. */
+        char out[kMaxProgSections * (kMaxProgSteps * 10 + 8) + 16] = {0};
         int  len = 0;
 
         for (int s = 0; s < fProg.count; ++s) {
@@ -397,9 +455,10 @@ protected:
                 const ProgCell& c = sec.cell[i];
                 if (c.filled)
                     len += std::snprintf(out + len, sizeof(out) - len,
-                                         "%s%d.%d", i ? "," : "",
+                                         "%s%d.%d.%d", i ? "," : "",
                                          static_cast<int>(c.degree),
-                                         static_cast<int>(c.ext));
+                                         static_cast<int>(c.ext),
+                                         static_cast<int>(c.octave));
                 else
                     len += std::snprintf(out + len, sizeof(out) - len,
                                          "%s-", i ? "," : "");
@@ -802,10 +861,26 @@ protected:
     Button latchButton() const { return { 10.0f,  kRow1Y,  78.0f, 22.0f }; }
     Button glideButton() const { return { 94.0f,  kRow1Y,  92.0f, 22.0f }; }
     Button keyLockButton() const { return { 192.0f, kRow1Y, 108.0f, 22.0f }; }
+
+    /*
+     * What the buttons after WEDGE shift by when it is not drawn.
+     *
+     * Leaving a hole where a hidden control used to be reads as a rendering
+     * fault rather than as a control that does not apply here, so the row
+     * closes up instead.
+     */
+    float row1Shift() const { return screenUsesWedge() ? 0.0f : 114.0f; }
+
     /* Bypass chord generation: the wheel becomes a note selector. */
-    Button singleNoteButton() const { return { 306.0f, kRow1Y, 104.0f, 22.0f }; }
+    Button singleNoteButton() const
+    {
+        return { 306.0f - row1Shift(), kRow1Y, 104.0f, 22.0f };
+    }
     /* Settle each chord near the last instead of stacking from its own root. */
-    Button voiceLeadButton() const { return { 416.0f, kRow1Y, 126.0f, 22.0f }; }
+    Button voiceLeadButton() const
+    {
+        return { 416.0f - row1Shift(), kRow1Y, 126.0f, 22.0f };
+    }
 
     /*
      * Row 2: one dropdown pair per ring. Extensions and voicings are per-ring,
@@ -1064,8 +1139,15 @@ protected:
     Button slideArea() const
     {
         const float top = chromeTop();
-        return { chromeLeft(), top,
-                 getWidth() - chromeLeft() - 10.0f,
+
+        /* The sequencer draws no octave slider, so it takes the width the
+         * slider would have occupied - which at 64 beats is the difference
+         * between a usable cell and a hairline. */
+        const float left = (fScreen == kScreenProgressions)
+                         ? 10.0f : chromeLeft();
+
+        return { left, top,
+                 getWidth() - left - 10.0f,
                  getHeight() - top - chromeBottom() - 8.0f };
     }
 
@@ -1560,7 +1642,7 @@ protected:
     Button progCellRect(int section, int step) const
     {
         const Button r = progRowRect(section);
-        const float  w = progStepsWidth() / kMaxProgSteps;
+        const float  w = progStepsWidth() / fGridBeats;
         return { r.x + kProgLabelW + step * w, r.y + 2.0f,
                  w - 2.0f, r.h - 4.0f };
     }
@@ -1579,6 +1661,15 @@ protected:
         return { r.x + r.w - kProgBtnW, r.y + 6.0f, kProgBtnW, r.h - 12.0f };
     }
 
+    /* 16 / 32 / 64, at the right-hand end of the header line. */
+    Button progGridSizeRect(int index) const
+    {
+        const Button g = progGridArea();
+        const float  w = 26.0f;
+        const float  x = g.x + g.w - (kProgLengthChoiceCount - index) * (w + 3.0f);
+        return { x, g.y - 21.0f, w, 16.0f };
+    }
+
     /* "+ SECTION", below the last row. */
     Button progAddRect() const
     {
@@ -1588,14 +1679,9 @@ protected:
                  86.0f, 20.0f };
     }
 
-    /* Transport and legato, along the bottom of the preset column. */
+    /* Transport, at the bottom of the preset column. Legato is in the header
+     * with the other performance controls. */
     Button progPlayRect() const
-    {
-        const Button a = slideArea();
-        return { a.x, a.y + a.h - 54.0f, kProgMenuW, 22.0f };
-    }
-
-    Button progLegatoRect() const
     {
         const Button a = slideArea();
         return { a.x, a.y + a.h - 28.0f, kProgMenuW, 22.0f };
@@ -1650,17 +1736,73 @@ protected:
                  progPresetRect(kPresetProgressionCount).y + 6.0f, buf, nullptr);
         }
 
+        /* Legato lives in the header with the other performance controls; on
+         * this screen that button drives the sequencer's own legato. Two
+         * buttons with the same name on one screen was the confusing part. */
         drawToggle(progPlayRect(), fProgRunning ? "STOP" : "PLAY", fProgRunning);
-        drawToggle(progLegatoRect(),
-                   fProgLegato ? "LEGATO: ON" : "LEGATO: OFF", fProgLegato);
 
         /* ---- the grid ---- */
         const Button g = progGridArea();
 
+        /*
+         * The header doubles as the detail readout.
+         *
+         * At 32 and 64 beats the cells are dots, so this line is the only
+         * place a chord's identity can be read. It follows the pointer, and
+         * falls back to naming the grid size when nothing is under it.
+         */
         fontSize(9.5f);
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        fillColor(Color(0.45f, 0.49f, 0.57f));
-        text(g.x, g.y - 12.0f, "SECTIONS - ONE CELL PER BEAT", nullptr);
+
+        char head[96];
+        if (fHoverSection >= 0 && fHoverSection < fProg.count &&
+            fHoverStep >= 0 && fHoverStep < fGridBeats) {
+            const ProgSection& sec = fProg.section[fHoverSection];
+            const ProgCell&    hc  = sec.cell[fHoverStep];
+
+            if (fHoverStep >= sec.length)
+                std::snprintf(head, sizeof head, "%c BEAT %d - PAST THE END",
+                              sectionLetter(fHoverSection), fHoverStep + 1);
+            else if (! hc.filled)
+                std::snprintf(head, sizeof head, "%c BEAT %d - REST",
+                              sectionLetter(fHoverSection), fHoverStep + 1);
+            else
+                std::snprintf(head, sizeof head, "%c BEAT %d - %s %s  OCT %+d",
+                              sectionLetter(fHoverSection), fHoverStep + 1,
+                              kDegreeCell[hc.degree].numeral,
+                              kExtShort[hc.ext], hc.octave);
+
+            fillColor(Color(0.72f, 0.78f, 0.86f));
+        } else {
+            std::snprintf(head, sizeof head,
+                          "SECTIONS - ONE CELL PER BEAT");
+            fillColor(Color(0.45f, 0.49f, 0.57f));
+        }
+        text(g.x, g.y - 12.0f, head, nullptr);
+
+        /* Grid size, at the right-hand end of the same line. */
+        for (int i = 0; i < kProgLengthChoiceCount; ++i) {
+            const Button b = progGridSizeRect(i);
+            const bool   on = (fGridBeats == kProgLengthChoice[i]);
+
+            beginPath();
+            roundedRect(b.x, b.y, b.w, b.h, 3.0f);
+            fillColor(on ? Color(0.22f, 0.40f, 0.58f)
+                         : Color(0.13f, 0.14f, 0.18f));
+            fill();
+            strokeColor(on ? Color(0.40f, 0.56f, 0.76f)
+                           : Color(0.24f, 0.26f, 0.32f));
+            strokeWidth(1.0f);
+            stroke();
+
+            char n[8];
+            std::snprintf(n, sizeof n, "%d", kProgLengthChoice[i]);
+            fontSize(9.5f);
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            fillColor(on ? Color(0.92f, 0.96f, 1.00f)
+                         : Color(0.62f, 0.66f, 0.74f));
+            text(b.x + b.w * 0.5f, b.y + b.h * 0.5f, n, nullptr);
+        }
 
         for (int s = 0; s < fProg.count; ++s)
             drawProgRow(s);
@@ -1735,7 +1877,7 @@ protected:
                  buf, nullptr);
         }
 
-        for (int i = 0; i < kMaxProgSteps; ++i)
+        for (int i = 0; i < fGridBeats; ++i)
             drawProgCell(s, i, i < sec.length);
 
         /* Duplicate, then delete. Delete is omitted on the last remaining
@@ -1836,25 +1978,55 @@ protected:
         if (! within || ! cell.filled)
             return;
 
+        /*
+         * Past sixteen beats a cell is a few pixels wide and a numeral would
+         * be unreadable - or, worse, half-drawn and mistakable for another.
+         * A dot says "there is a chord here", the fill says which cells are
+         * grouped, and the detail line above the grid answers what it is.
+         */
+        if (fGridBeats > 16) {
+            const float r = (c.w < 7.0f ? c.w : 7.0f) * 0.30f;
+            beginPath();
+            circle(c.x + c.w * 0.5f, c.y + c.h * 0.5f, r);
+            fillColor(here ? Color(0.98f, 1.00f, 0.99f)
+                           : Color(0.80f, 0.86f, 0.94f));
+            fill();
+            return;
+        }
+
         /* The numeral, and the extension beneath it when there is one. */
         fontFace(NANOVG_DEJAVU_SANS_TTF);
         textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
 
-        const bool hasExt = (cell.ext != kExtNone);
+        const bool hasExt   = (cell.ext != kExtNone);
+        const bool hasOct   = (cell.octave != 0);
+        const bool twoLines = hasExt || hasOct;
 
-        fontSize(hasExt ? 11.0f : 12.5f);
+        fontSize(twoLines ? 11.0f : 12.5f);
         fillColor(here ? Color(0.98f, 1.00f, 0.99f)
                        : Color(0.86f, 0.90f, 0.96f));
         text(c.x + c.w * 0.5f,
-             c.y + c.h * (hasExt ? 0.36f : 0.5f),
+             c.y + c.h * (twoLines ? 0.36f : 0.5f),
              kDegreeCell[cell.degree].numeral, nullptr);
 
-        if (hasExt) {
+        if (twoLines) {
+            /* Extension and octave share the lower line: both are qualifiers
+             * on the numeral above, and a cell has room for one line of them.
+             * The octave is signed, so "+1" reads as an offset rather than an
+             * absolute octave number. */
+            char sub[24];
+            if (hasExt && hasOct)
+                std::snprintf(sub, sizeof sub, "%s%+d",
+                              kExtShort[cell.ext], cell.octave);
+            else if (hasExt)
+                std::snprintf(sub, sizeof sub, "%s", kExtShort[cell.ext]);
+            else
+                std::snprintf(sub, sizeof sub, "%+d", cell.octave);
+
             fontSize(8.5f);
             fillColor(here ? Color(0.82f, 0.94f, 0.88f)
                            : Color(0.58f, 0.64f, 0.74f));
-            text(c.x + c.w * 0.5f, c.y + c.h * 0.72f,
-                 kExtShort[cell.ext], nullptr);
+            text(c.x + c.w * 0.5f, c.y + c.h * 0.72f, sub, nullptr);
         }
     }
 
@@ -1871,13 +2043,33 @@ protected:
             return true;
         }
 
-        if (hit(progLegatoRect(), x, y)) {
-            fProgLegato = ! fProgLegato;
-            char buf[8];
-            std::snprintf(buf, sizeof buf, "%d", fProgLegato ? 1 : 0);
-            setState("progLegato", buf);
-            repaint();
-            return true;
+        for (int i = 0; i < kProgLengthChoiceCount; ++i) {
+            if (hit(progGridSizeRect(i), x, y)) {
+                /*
+                 * Only the VIEW changes. Cells past the new size keep their
+                 * chords - shrinking the grid to 16 and back to 64 must not
+                 * quietly erase beats 17 to 64 - but a section's length is
+                 * clamped, because a loop cannot run past the grid the user
+                 * can see and edit.
+                 */
+                fGridBeats = kProgLengthChoice[i];
+
+                bool clamped = false;
+                for (int s = 0; s < fProg.count; ++s)
+                    if (fProg.section[s].length > fGridBeats) {
+                        fProg.section[s].length = fGridBeats;
+                        clamped = true;
+                    }
+
+                if (fEditStep >= fGridBeats)
+                    fEditStep = fGridBeats - 1;
+
+                if (clamped)
+                    pushProgression();
+
+                repaint();
+                return true;
+            }
         }
 
         for (int i = 0; i < kPresetProgressionCount; ++i) {
@@ -1932,7 +2124,7 @@ protected:
                 return true;
             }
 
-            for (int i = 0; i < kMaxProgSteps; ++i) {
+            for (int i = 0; i < fGridBeats; ++i) {
                 if (! hit(progCellRect(s, i), x, y))
                     continue;
 
@@ -1991,7 +2183,7 @@ protected:
         const float y = static_cast<float>(py);
 
         for (int s = 0; s < fProg.count; ++s)
-            for (int i = 0; i < kMaxProgSteps; ++i)
+            for (int i = 0; i < fGridBeats; ++i)
                 if (hit(progCellRect(s, i), x, y)) {
                     outSection = s;
                     outStep    = i;
@@ -2009,6 +2201,20 @@ protected:
      */
     bool progMotion(double px, double py)
     {
+        /* Hover tracking runs whether or not a drag is in progress: at 32 and
+         * 64 beats the cells are dots, so the detail line is the only way to
+         * read what a cell holds. */
+        {
+            int hs = -1, hi = -1;
+            if (! progCellAt(px, py, hs, hi)) { hs = -1; hi = -1; }
+
+            if (hs != fHoverSection || hi != fHoverStep) {
+                fHoverSection = hs;
+                fHoverStep    = hi;
+                repaint();
+            }
+        }
+
         if (fDragCellFrom < 0)
             return false;
 
@@ -2096,10 +2302,18 @@ protected:
         }
         row -= static_cast<int>(kDegreeCount);
 
-        /* Choosing a type for an empty cell implies wanting a chord there;
-         * silently doing nothing would look broken. */
+        if (row < static_cast<int>(kExtCount)) {
+            /* Choosing a type for an empty cell implies wanting a chord there;
+             * silently doing nothing would look broken. */
+            cell.filled = true;
+            cell.ext    = static_cast<Extension>(row);
+            return;
+        }
+        row -= static_cast<int>(kExtCount);
+
+        /* The octave offset, relative to the plugin's own octave. */
         cell.filled = true;
-        cell.ext    = static_cast<Extension>(row);
+        cell.octave = static_cast<int8_t>(kProgOctaveMin + row);
     }
 
     /* Which row of the cell menu is current, for the highlight. */
@@ -2118,8 +2332,21 @@ protected:
 
         if (row < static_cast<int>(kDegreeCount))
             return kDegreeCell[row].numeral;
+        row -= static_cast<int>(kDegreeCount);
 
-        return kExtensionName[row - static_cast<int>(kDegreeCount)];
+        if (row < static_cast<int>(kExtCount))
+            return kExtensionName[row];
+        row -= static_cast<int>(kExtCount);
+
+        /* Static, because menuRowLabel returns a bare pointer. One slot per
+         * offset rather than a shared buffer: the menu asks for every label
+         * while drawing, so a single buffer would show the last one in every
+         * octave row. */
+        static char oct[kCellOctaveRows][12];
+        const int   off = kProgOctaveMin + row;
+        std::snprintf(oct[row], sizeof oct[row],
+                      off == 0 ? "Octave %d (base)" : "Octave %+d", off);
+        return oct[row];
     }
 
     /*
@@ -2405,14 +2632,38 @@ protected:
         text(b.x + b.w - 5.0f, b.y + b.h * 0.5f, open ? "▲" : "▼", nullptr);
     }
 
+    /*
+     * Which of the shared controls a screen actually uses.
+     *
+     * A header that shows the same row everywhere invites the user to set
+     * something that the screen they are on ignores - which is how the ROOT
+     * confusion started. A control appears only where it does something.
+     *
+     * WEDGE pins the highlighted wedge ON THE WHEEL, so it means nothing
+     * where there is no wheel. Everything else applies to any chord this
+     * plugin builds, however it was triggered, so it stays on every
+     * performance screen.
+     */
+    bool screenUsesWedge() const { return fScreen == kScreenCircle; }
+
     void drawControls()
     {
-        /* "Legato" describes what it does - a selection sounds on until the
+        /*
+         * "Legato" describes what it does - a selection sounds on until the
          * next one replaces it. The state key stays "latch": renaming it
-         * would break every saved session for a label change. */
+         * would break every saved session for a label change.
+         *
+         * On the sequencer screen this same button drives the SEQUENCER's
+         * legato instead. They are different settings - you can want a
+         * staccato wheel and a sustained sequence - but only one of them
+         * applies on any given screen, so one button showing the one in force
+         * is clearer than two buttons with the same name.
+         */
+        const bool legatoOn = (fScreen == kScreenProgressions)
+                            ? fProgLegato : fLatchEnabled;
         drawButton(latchButton(),
-                   fLatchEnabled ? "LEGATO: ON" : "LEGATO: OFF",
-                   fLatchEnabled);
+                   legatoOn ? "LEGATO: ON" : "LEGATO: OFF",
+                   legatoOn);
         drawButton(glideButton(), kGlideModeName[fGlideMode],
                    fGlideMode != kGlideOff);
         /*
@@ -2424,11 +2675,12 @@ protected:
          * Amber for pinned, blue for following - both lit, because both are
          * doing something.
          */
-        drawButtonIn(keyLockButton(),
-                     fKeyLocked ? "WEDGE: PINNED" : "WEDGE: FOLLOWS",
-                     fKeyLocked ? Color(0.58f, 0.42f, 0.18f)
-                                : Color(0.22f, 0.40f, 0.58f),
-                     true);
+        if (screenUsesWedge())
+            drawButtonIn(keyLockButton(),
+                         fKeyLocked ? "WEDGE: PINNED" : "WEDGE: FOLLOWS",
+                         fKeyLocked ? Color(0.58f, 0.42f, 0.18f)
+                                    : Color(0.22f, 0.40f, 0.58f),
+                         true);
         /* Likewise: chords are not the absence of single notes. Violet for
          * chords, teal for single. */
         drawButtonIn(singleNoteButton(),
@@ -2460,6 +2712,23 @@ protected:
                                                  : "ROOT: AUTO")
                        : kBassNoteName[fBassNote],
                    ! fVoiceLeading);
+
+        /*
+         * Say why AUTO is missing from the cycle while plain glide is on,
+         * rather than letting the user click round and round wondering where
+         * it went. The reason is real and not obvious: a single pitch bend
+         * moves every voice by the same interval, so it cannot express a
+         * re-inversion, and voice leading re-inverts by design.
+         */
+        if (fGlideMode == kGlideOn) {
+            const Button vb = voiceLeadButton();
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(9.0f);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(Color(0.62f, 0.55f, 0.35f));
+            text(vb.x + vb.w + 8.0f, vb.y + vb.h * 0.5f,
+                 "auto needs glide off or MPE", nullptr);
+        }
 
         /*
          * Row 2 differs by screen: the wheel wants per-ring extensions and
@@ -2868,9 +3137,17 @@ protected:
             return false;
 
         if (hit(latchButton(), px, py)) {
-            fLatchEnabled = ! fLatchEnabled;
-            std::snprintf(buf, sizeof(buf), "%d", fLatchEnabled ? 1 : 0);
-            setState("latch", buf);
+            /* Drives whichever legato is in force on this screen. See
+             * drawControls() for why there is one button and not two. */
+            if (fScreen == kScreenProgressions) {
+                fProgLegato = ! fProgLegato;
+                std::snprintf(buf, sizeof(buf), "%d", fProgLegato ? 1 : 0);
+                setState("progLegato", buf);
+            } else {
+                fLatchEnabled = ! fLatchEnabled;
+                std::snprintf(buf, sizeof(buf), "%d", fLatchEnabled ? 1 : 0);
+                setState("latch", buf);
+            }
             repaint();
             return true;
         }
@@ -2915,7 +3192,9 @@ protected:
          * captures whatever key is selected now, so the wedge freezes where the
          * user is looking rather than at some earlier key. The keyboard keeps
          * following the selection either way. */
-        if (hit(keyLockButton(), px, py)) {
+        /* Only where it is drawn: an invisible hit box would swallow clicks
+         * meant for whatever moved into its place. */
+        if (screenUsesWedge() && hit(keyLockButton(), px, py)) {
             if (! fKeyLocked)
                 fLockedKey = fSelectedKey;
             fKeyLocked = ! fKeyLocked;
@@ -3704,12 +3983,27 @@ private:
     /*
      * The cell menu is one flat list: a rest, then the seven degrees, then the
      * extensions - which apply to the degree already in the cell, so the chord
-     * and its type are set in two passes rather than needing a second menu.
+     * and its type are set in two passes rather than needing a second menu -
+     * and finally the octave offsets, for the same reason.
      */
+    static constexpr int kCellOctaveRows =
+        kProgOctaveMax - kProgOctaveMin + 1;    /* -2..+2 */
+
     static constexpr int kCellRows =
         1 +                                /* rest */
         static_cast<int>(kDegreeCount) +   /* I..vii */
-        static_cast<int>(kExtCount);       /* triad..sus4 */
+        static_cast<int>(kExtCount) +      /* triad..sus4 */
+        kCellOctaveRows;                   /* oct -2..+2 */
+
+    /* How many beats the grid shows. Not the loop length - a section plays its
+     * own length, which is free to be shorter. */
+    int fGridBeats = 16;
+
+    /* The cell the pointer is resting on, for the detail readout. At 32 and 64
+     * beats a cell is too narrow for a numeral, so the grid shows dots and the
+     * detail is read from the hover line instead. */
+    int fHoverSection = -1;
+    int fHoverStep    = -1;
 
     /*
      * The binding menu is one flat list covering every action a key can take,

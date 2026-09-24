@@ -357,13 +357,18 @@ protected:
                 if (*c == '-') {
                     sec.cell[i].filled = false;
                 } else {
-                    int d = 0, e = 0;
-                    if (std::sscanf(c, "%d.%d", &d, &e) == 2 &&
+                    int d = 0, e = 0, o = 0;
+                    if (std::sscanf(c, "%d.%d.%d", &d, &e, &o) == 3 &&
                         d >= 0 && d < kDegreeCount &&
                         e >= 0 && e < kExtCount) {
                         sec.cell[i].filled = true;
                         sec.cell[i].degree = static_cast<Degree>(d);
                         sec.cell[i].ext    = static_cast<Extension>(e);
+                        /* Clamped rather than rejected: an out-of-range octave
+                         * should still play the right chord. */
+                        sec.cell[i].octave = static_cast<int8_t>(
+                            (o < kProgOctaveMin) ? kProgOctaveMin
+                          : (o > kProgOctaveMax) ? kProgOctaveMax : o);
                     }
                 }
 
@@ -1927,8 +1932,11 @@ private:
          * a harmony the grid never asked for. */
         stopSequencerGroup(0);
 
+        /* The cell's octave is an OFFSET from the instrument's own, so moving
+         * the plugin up or down carries the progression with it and a chord
+         * written low stays low relative to its neighbours. */
         startGroup(0, kProgSource, root, type, ring, pickVelocity(), true,
-                   fOctave);
+                   fOctave + cell.octave);
     }
 
     /* Silence the sequencer's group, leaving hand-played ones alone. */
