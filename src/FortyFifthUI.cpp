@@ -2307,8 +2307,9 @@ protected:
 
         const float pad = 8.0f;
         const float kw  = (a.w - pad * 2.0f) / rollWhiteCount();
-        const float top = a.y + 6.0f;
-        const float kh  = a.h - 16.0f;
+        const float top = a.y + 5.0f;
+        /* Leaves room under the keys for the octave labels. */
+        const float kh  = a.h - 22.0f;
 
         /* Whites first, then blacks over them, as on a real keyboard. */
         for (int m = kRollLow; m <= kRollHigh; ++m) {
@@ -2327,16 +2328,17 @@ protected:
             strokeWidth(1.0f);
             stroke();
 
-            /* Label the Cs, so the octave is readable without counting. */
+            /* Label the Cs, so the octave is readable without counting. Drawn
+             * under the keys rather than on them: a white key is about 9px
+             * wide here, which is narrower than the text. */
             if (m % 12 == 0) {
                 char lbl[8];
                 std::snprintf(lbl, sizeof(lbl), "C%d", (m / 12) - 1);
                 fontFace(NANOVG_DEJAVU_SANS_TTF);
-                fontSize(8.0f);
-                textAlign(ALIGN_CENTER | ALIGN_BOTTOM);
-                fillColor(on ? Color(0.10f, 0.20f, 0.12f)
-                             : Color(0.45f, 0.49f, 0.56f));
-                text(x + kw * 0.5f, top + kh - 2.0f, lbl, nullptr);
+                fontSize(8.5f);
+                textAlign(ALIGN_CENTER | ALIGN_TOP);
+                fillColor(Color(0.45f, 0.49f, 0.56f));
+                text(x + kw * 0.5f, top + kh + 1.0f, lbl, nullptr);
             }
         }
 
