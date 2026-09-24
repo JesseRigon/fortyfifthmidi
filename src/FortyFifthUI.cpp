@@ -570,9 +570,34 @@ protected:
     /* Horizontal space the slider claims, so the wheel never sits under it. */
     float chromeLeft() const { return kSliderW + 16.0f; }
 
+    /* Height of the piano-roll body when open. */
+    static constexpr float kRollH = 54.0f;
+
+    /*
+     * Two independent panels stacked at the bottom, each with its own header
+     * and its own collapsed state: the keyboard is useful on its own, and
+     * having to open the text stream to see it would defeat the point.
+     *
+     *   [ log body    ]  optional
+     *   [ MIDI Monitor ] header
+     *   [ roll body    ]  optional
+     *   [ Notes        ] header
+     */
     float chromeBottom() const
     {
-        return kHeaderH + (fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f);
+        return kHeaderH * 2.0f
+             + (fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f)
+             + (fRollOpen    ? kRollH : 0.0f);
+    }
+
+    /* Bottom-up stacking: the roll sits under the log, so opening one does not
+     * move the other's header out from under the pointer. */
+    float rollHeaderY() const { return getHeight() - kHeaderH; }
+    float rollBodyY()   const { return rollHeaderY() - (fRollOpen ? kRollH : 0.0f); }
+    float logHeaderY()  const { return rollBodyY() - kHeaderH; }
+    float logBodyY()    const
+    {
+        return logHeaderY() - (fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f);
     }
 
     /* Centred in the space left of the slider, not of the window. */
@@ -1869,6 +1894,12 @@ protected:
             return true;
         }
 
+        if (hit(rollHeader(), px, py)) {
+            fRollOpen = ! fRollOpen;
+            repaint();
+            return true;
+        }
+
         /* Row 1 is not drawn on the setup screen, so it must not be clickable
          * there either - the monitor and panic above stay live, since those
          * are useful from any screen. */
@@ -2223,25 +2254,176 @@ protected:
         }
     }
 
+    /* ---- piano roll --------------------------------------------------------
+     *
+     * What the chord algorithms actually PRODUCED, laid out on a keyboard, as
+     * opposed to the log's stream of individual events. Reading five note-ons
+     * and assembling them in your head is exactly the work the monitor should
+     * be doing - and seeing the notes in pitch order is what makes a voicing
+     * or an inversion obvious at a glance.
+     *
+     * It reads fSounding, the same set the chord namer uses, so the roll and
+     * the CHORD line can never disagree about what is playing.
+     */
+
+    /* C1 to C7 - six octaves, which covers everything the octave slider and a
+     * controller keyboard can reach without wasting width on the extremes. */
+    static constexpr int kRollLow  = 24;    /* C1 */
+    static constexpr int kRollHigh = 96;    /* C7 */
+
+    static int rollWhiteCount()
+    {
+        int n = 0;
+        for (int m = kRollLow; m <= kRollHigh; ++m)
+            if (! isBlackKey(m % 12)) ++n;
+        return n;
+    }
+
+    /* White-key ordinal of a note within the displayed range. */
+    static int rollWhiteIndex(int midi)
+    {
+        int n = 0;
+        for (int m = kRollLow; m < midi; ++m)
+            if (! isBlackKey(m % 12)) ++n;
+        return n;
+    }
+
+    Button rollArea() const
+    {
+        return { 0.0f, rollBodyY(), static_cast<float>(getWidth()), kRollH };
+    }
+
+    void drawPianoRoll()
+    {
+        if (! fRollOpen)
+            return;
+
+        const Button a = rollArea();
+
+        beginPath();
+        rect(a.x, a.y, a.w, a.h);
+        fillColor(Color(0.07f, 0.08f, 0.10f));
+        fill();
+
+        const float pad = 8.0f;
+        const float kw  = (a.w - pad * 2.0f) / rollWhiteCount();
+        const float top = a.y + 6.0f;
+        const float kh  = a.h - 16.0f;
+
+        /* Whites first, then blacks over them, as on a real keyboard. */
+        for (int m = kRollLow; m <= kRollHigh; ++m) {
+            if (isBlackKey(m % 12))
+                continue;
+
+            const float x = a.x + pad + rollWhiteIndex(m) * kw;
+            const bool  on = fSounding[m];
+
+            beginPath();
+            rect(x, top, kw - 1.0f, kh);
+            fillColor(on ? Color(0.42f, 0.86f, 0.55f)
+                         : Color(0.82f, 0.85f, 0.90f));
+            fill();
+            strokeColor(Color(0.10f, 0.11f, 0.14f));
+            strokeWidth(1.0f);
+            stroke();
+
+            /* Label the Cs, so the octave is readable without counting. */
+            if (m % 12 == 0) {
+                char lbl[8];
+                std::snprintf(lbl, sizeof(lbl), "C%d", (m / 12) - 1);
+                fontFace(NANOVG_DEJAVU_SANS_TTF);
+                fontSize(8.0f);
+                textAlign(ALIGN_CENTER | ALIGN_BOTTOM);
+                fillColor(on ? Color(0.10f, 0.20f, 0.12f)
+                             : Color(0.45f, 0.49f, 0.56f));
+                text(x + kw * 0.5f, top + kh - 2.0f, lbl, nullptr);
+            }
+        }
+
+        for (int m = kRollLow; m <= kRollHigh; ++m) {
+            if (! isBlackKey(m % 12))
+                continue;
+
+            /* Sits over the boundary between its neighbouring whites. */
+            const float x = a.x + pad + rollWhiteIndex(m) * kw - kw * 0.30f;
+            const bool  on = fSounding[m];
+
+            beginPath();
+            rect(x, top, kw * 0.60f, kh * 0.62f);
+            fillColor(on ? Color(0.30f, 0.72f, 0.42f)
+                         : Color(0.14f, 0.15f, 0.19f));
+            fill();
+            strokeColor(Color(0.07f, 0.08f, 0.10f));
+            strokeWidth(1.0f);
+            stroke();
+        }
+
+        /* Count on the right, so "how many voices" needs no counting either -
+         * it is the quickest check that a chord has the size it should. */
+        if (fSoundingCount > 0) {
+            char n[24];
+            std::snprintf(n, sizeof(n), "%d note%s", fSoundingCount,
+                          fSoundingCount == 1 ? "" : "s");
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(9.5f);
+            textAlign(ALIGN_RIGHT | ALIGN_TOP);
+            fillColor(Color(0.50f, 0.78f, 0.58f));
+            text(a.x + a.w - 8.0f, a.y - 1.0f, n, nullptr);
+        }
+    }
+
     /* The header bar is always present; the log below it only when expanded. */
     Button monitorHeader() const
     {
-        return { 0.0f, getHeight() - kHeaderH,
-                 static_cast<float>(getWidth()), kHeaderH };
+        return { 0.0f, logHeaderY(), static_cast<float>(getWidth()), kHeaderH };
     }
 
+    Button rollHeader() const
+    {
+        return { 0.0f, rollHeaderY(), static_cast<float>(getWidth()), kHeaderH };
+    }
+
+    /* Panic lives on the bottom-most header, so it stays in one place
+     * regardless of which panels happen to be open. */
     Button panicButton() const
     {
-        return { getWidth() - 62.0f, getHeight() - kHeaderH + 3.0f, 54.0f,
+        return { getWidth() - 62.0f, rollHeaderY() + 3.0f, 54.0f,
                  kHeaderH - 6.0f };
+    }
+
+    /* One collapsible header bar. Both panels use it, so they cannot drift
+     * apart visually. */
+    void drawPanelHeader(const Button& hdr, const char* title, bool open,
+                         const char* hint)
+    {
+        beginPath();
+        rect(hdr.x, hdr.y, hdr.w, hdr.h);
+        fillColor(Color(0.12f, 0.13f, 0.17f));
+        fill();
+
+        beginPath();
+        moveTo(hdr.x, hdr.y);
+        lineTo(hdr.x + hdr.w, hdr.y);
+        strokeColor(Color(0.26f, 0.28f, 0.34f));
+        strokeWidth(1.0f);
+        stroke();
+
+        char text_[96];
+        std::snprintf(text_, sizeof(text_), "%s  %s%s",
+                      open ? "▼" : "▶", title, open ? "" : hint);
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(11.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.72f, 0.76f, 0.83f));
+        text(10.0f, hdr.y + hdr.h * 0.5f, text_, nullptr);
     }
 
     void drawMonitor()
     {
         const float w = getWidth();
-        const float h = getHeight();
         const float logH = fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f;
-        const float top  = h - kHeaderH - logH;
+        const float top  = logBodyY();
 
         /* Expanded log body. */
         if (fMonitorOpen) {
@@ -2268,30 +2450,14 @@ protected:
             }
         }
 
-        /* Header bar: disclosure triangle, title, panic. */
-        const Button hdr = monitorHeader();
-        beginPath();
-        rect(hdr.x, hdr.y, hdr.w, hdr.h);
-        fillColor(Color(0.12f, 0.13f, 0.17f));
-        fill();
+        drawPanelHeader(monitorHeader(), "Event log", fMonitorOpen,
+                        "  (click to expand)");
 
-        beginPath();
-        moveTo(0.0f, hdr.y);
-        lineTo(w, hdr.y);
-        strokeColor(Color(0.26f, 0.28f, 0.34f));
-        strokeWidth(1.0f);
-        stroke();
-
-        fontFace(NANOVG_DEJAVU_SANS_TTF);
-        fontSize(11.0f);
-        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        fillColor(Color(0.72f, 0.76f, 0.83f));
-
-        char title[64];
-        std::snprintf(title, sizeof(title), "%s  MIDI Monitor%s",
-                      fMonitorOpen ? "▼" : "▶",
-                      fMonitorOpen ? "" : "  (click to expand)");
-        text(10.0f, hdr.y + hdr.h * 0.5f, title, nullptr);
+        /* The keyboard sits below the log, and opens independently - seeing
+         * what the chords produced should not require the text stream. */
+        drawPianoRoll();
+        drawPanelHeader(rollHeader(), "Notes", fRollOpen,
+                        "  (click to expand)");
 
         const Button pb = panicButton();
         beginPath();
@@ -2346,9 +2512,16 @@ protected:
                 repaint();
         }
 
-        /* Only drain while the log is visible, so a collapsed panel cannot grow
-         * an unbounded backlog of work. The ring drops its own overflow. */
-        if (! fMonitorOpen)
+        /*
+         * Drain while EITHER panel is open. The piano roll is built from the
+         * same note stream as the log, so gating on the log alone would leave
+         * the keyboard frozen whenever the text stream was collapsed - which
+         * is exactly the combination the roll exists to support.
+         *
+         * With both closed nothing is drained, so a collapsed monitor still
+         * cannot grow an unbounded backlog. The ring drops its own overflow.
+         */
+        if (! fMonitorOpen && ! fRollOpen)
             return;
 
         uint32_t word;
@@ -2371,6 +2544,9 @@ protected:
     std::deque<std::string> fLog;
     /* Collapsed by default: the wheel is the point, the log is for debugging. */
     bool         fMonitorOpen = false;
+    /* The keyboard opens by default: it answers "what did the chord produce?"
+     * at a glance, which is the question the monitor is usually opened for. */
+    bool         fRollOpen    = true;
     MonitorRing* fRing        = nullptr;
 
     /* What the DSP is sounding, for the highlight, plus the last state seen so

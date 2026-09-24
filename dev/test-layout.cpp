@@ -32,7 +32,16 @@ static const int kLogLines = 14;
 
 static float chromeTop()    { return kDropY + kDropH + 10.0f; }
 static float chromeLeft()   { return kSliderW + 16.0f; }
-static float chromeBottom() { return kHeaderH + (monitorOpen ? kLogLines*14.0f + 10.0f : 0.0f); }
+/* Two stacked panels, each with its own header and collapsed state. */
+static const float kRollH = 54.0f;
+static bool rollOpen = true;
+
+static float chromeBottom()
+{
+    return kHeaderH * 2.0f
+         + (monitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f)
+         + (rollOpen    ? kRollH : 0.0f);
+}
 
 static float wheelCentreX() { return chromeLeft() + (W - chromeLeft()) * 0.5f; }
 static float wheelCentreY() { return chromeTop() + (H - chromeTop() - chromeBottom()) * 0.5f; }
@@ -153,8 +162,20 @@ int main()
     reportSlides("diatonic, octave sections", 8, 5);
     reportSlides("pentatonic, variation sections", 6, 4);
 
+    /* Both panels open is the tightest the wheel ever gets - if the layout
+     * survives this it survives everything. */
     monitorOpen = true;
-    report("monitor expanded");
+    rollOpen    = true;
+    report("log + keyboard both open");
+
+    /* Keyboard alone: the combination the roll exists to support. */
+    monitorOpen = false;
+    rollOpen    = true;
+    report("keyboard only");
+
+    monitorOpen = true;
+    rollOpen    = false;
+    report("log only");
 
     monitorOpen = false;
     W = 520.0f; H = 640.0f;
