@@ -319,6 +319,180 @@ int main()
         }
     }
 
+    /*
+     * The wire format must survive a round trip.
+     *
+     * Both sides of the plugin encode and decode grids - the editor sends one,
+     * the DSP hands it back when the host saves a project - so a format that
+     * loses anything loses it from every saved session.
+     */
+    std::printf("\n=== the grid survives encode and decode ===\n");
+    {
+        Progression p;
+        p.count = 3;
+
+        /* Something with every feature in it: rests, extensions, octaves
+         * above and below, and sections of different lengths. */
+        p.section[0].length = 5;
+        p.section[0].cell[0] = { true,  kDegreeI,   kExtNone,  0 };
+        p.section[0].cell[1] = { false, kDegreeI,   kExtNone,  0 };  /* rest */
+        p.section[0].cell[2] = { true,  kDegreeV,   kExt7,    -2 };
+        p.section[0].cell[3] = { true,  kDegreeVI,  kExtSus4,  2 };
+        p.section[0].cell[4] = { true,  kDegreeVII, kExt9,    -1 };
+
+        p.section[1].length = 1;
+        p.section[1].cell[0] = { true,  kDegreeIV,  kExtAdd9,  1 };
+
+        p.section[2].length = 2;
+        p.section[2].cell[0] = { false, kDegreeI,   kExtNone,  0 };
+        p.section[2].cell[1] = { true,  kDegreeII,  kExt6,     0 };
+
+        char wire[kProgStringMax];
+        encodeProgression(p, wire, sizeof wire);
+
+        Progression back;
+        const bool decoded = decodeProgression(wire, back);
+
+        /* The wire string is bounded by kProgStringMax, which is far larger
+         * than any detail line; print a prefix rather than widen the buffer to
+         * five kilobytes for a label. */
+        char d[160];
+        std::snprintf(d, sizeof d, "%.150s", wire);
+        ok("decodes at all", decoded, d);
+
+        bool same = (back.count == p.count);
+        for (int s = 0; s < p.count && same; ++s) {
+            if (back.section[s].length != p.section[s].length) same = false;
+
+            for (int i = 0; i < p.section[s].length && same; ++i) {
+                const ProgCell& a = p.section[s].cell[i];
+                const ProgCell& b = back.section[s].cell[i];
+
+                if (a.filled != b.filled) { same = false; break; }
+                if (! a.filled) continue;   /* a rest carries nothing else */
+
+                if (a.degree != b.degree || a.ext != b.ext ||
+                    a.octave != b.octave)
+                    same = false;
+            }
+        }
+        ok("every cell comes back identical", same, "3 sections, 8 beats");
+
+        /* A negative octave is the case a naive format breaks on: "-1" and the
+         * rest marker "-" begin the same way. */
+        ok("negative octaves survive",
+           back.section[0].cell[2].octave == -2 &&
+           back.section[0].cell[4].octave == -1, "-2 and -1");
+
+        /* Garbage must leave the target alone rather than blanking it. */
+        Progression keep = p;
+        ok("garbage is refused", ! decodeProgression("not a grid", keep),
+           "declined");
+        ok("the target is untouched after a refusal",
+           keep.count == p.count, "3 sections");
+    }
+
+    std::printf("\n=== the key map survives encode and decode ===\n");
+    {
+        KeyMapEntry map[12];
+        std::memcpy(map, kDefaultKeyMap, sizeof map);
+
+        /* Rebind a few, including to actions with no argument. */
+        map[0]  = { kKeyLatchToggle, 0 };
+        map[3]  = { kKeyExtension,   kExtSus2 };
+        map[7]  = { kKeyPanic,       0 };
+        map[11] = { kKeyNone,        0 };
+
+        char wire[kKeyMapStringMax];
+        encodeKeyMap(map, wire, sizeof wire);
+
+        KeyMapEntry back[12];
+        decodeKeyMap(wire, back);
+
+        bool same = true;
+        for (int i = 0; i < 12; ++i)
+            if (back[i].action != map[i].action ||
+                back[i].value  != map[i].value)
+                same = false;
+
+        ok("every binding comes back identical", same, wire);
+
+        /* A malformed entry falls back to the FACTORY binding for that key,
+         * not to silence - a keyboard that stops responding is worse than one
+         * that ignores a bad setting. */
+        KeyMapEntry fallback[12];
+        decodeKeyMap("", fallback);
+        ok("an empty map is the factory map",
+           std::memcmp(fallback, kDefaultKeyMap, sizeof fallback) == 0,
+           "defaults restored");
+    }
+
+    /*
+     * Every SETTING the plugin declares must also be read back by the
+     * editor's stateChanged().
+     *
+     * Without that the editor never learns what a restored project holds: the
+     * controls show factory defaults while the DSP plays the saved values, and
+     * the first click on any control pushes its default back over the restored
+     * setting. Opening a project and touching one button would silently
+     * discard the rest of the session.
+     *
+     * gesture and panic are excluded deliberately: they are commands, not
+     * settings, and there is nothing in the editor for them to restore.
+     */
+    std::printf("\n=== the editor reads back every setting ===\n");
+    {
+        std::FILE* f = std::fopen("src/FortyFifthUI.cpp", "rb");
+        if (f == nullptr) {
+            std::printf("  FAIL  %-36s cannot open source\n", "stateChanged");
+            ++failures;
+        } else {
+            static char src[512 * 1024];
+            const size_t n = std::fread(src, 1, sizeof src - 1, f);
+            src[n] = '\0';
+            std::fclose(f);
+
+            const char* sc = std::strstr(src, "void stateChanged(");
+            ok("the editor overrides stateChanged", sc != nullptr,
+               sc ? "present" : "MISSING");
+
+            if (sc != nullptr) {
+                static const char* const kSettings[] = {
+                    "keyMap", "progression", "octave", "latch", "glideMode",
+                    "selectedKey", "singleNotes", "voiceLeading", "bassNote",
+                    "pedalAction", "storageMode", "progLegato", "progRunning",
+                    "uiScreen",
+                };
+
+                for (const char* k : kSettings) {
+                    char quoted[64];
+                    std::snprintf(quoted, sizeof quoted, "\"%s\"", k);
+
+                    char what[64];
+                    std::snprintf(what, sizeof what, "%s is read back", k);
+
+                    /* Searched from stateChanged onward, so a mention
+                     * elsewhere in the file does not count as handling. */
+                    ok(what, std::strstr(sc, quoted) != nullptr,
+                       std::strstr(sc, quoted) ? "in stateChanged" : "MISSING");
+                }
+
+                /* The per-ring keys are matched by prefix rather than by
+                 * name, since there are three of each. */
+                ok("per-ring extensions are read back",
+                   std::strstr(sc, "\"ext\"") != nullptr ||
+                   std::strstr(sc, "\"ext\", 3") != nullptr ||
+                   std::strstr(sc, "key, \"ext\"") != nullptr ||
+                   std::strstr(sc, "\"ext\", 3) == 0") != nullptr ||
+                   std::strstr(sc, "strncmp(key, \"ext\"") != nullptr,
+                   "prefix match");
+                ok("per-ring voicings are read back",
+                   std::strstr(sc, "strncmp(key, \"voice\"") != nullptr,
+                   "prefix match");
+            }
+        }
+    }
+
     std::printf("\n=== every preset is well formed ===\n");
     {
         bool allGood = true;

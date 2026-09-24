@@ -370,65 +370,17 @@ protected:
      * disagreeing about what a key does. */
     void pushKeyMap()
     {
-        char out[128] = {0};
-        for (int i = 0; i < 12; ++i) {
-            char one[16];
-            std::snprintf(one, sizeof(one), "%s%d:%d", i ? "," : "",
-                          static_cast<int>(fKeyMap[i].action),
-                          fKeyMap[i].value);
-            std::strncat(out, one, sizeof(out) - std::strlen(out) - 1);
-        }
+        char out[kKeyMapStringMax];
+        encodeKeyMap(fKeyMap, out, sizeof out);
         setState("keyMap", out);
     }
 
-    /*
-     * Send the whole grid across as one string.
-     *
-     * Sections are separated by ';', cells by ',', and a cell is
-     * "degree.extension.octave" or "-" for a rest; the section's length comes
-     * first. So "4|0.0.0,5.2.0,3.0.-1,4.0.0;2|0.0.0,4.0.0" is a four-beat
-     * I-vi-IV-V, the IV an octave down, followed by a two-beat I-V.
-     *
-     * One string rather than a key per cell because the DSP must never see a
-     * half-applied grid: a progression arriving cell by cell would play a
-     * chimera of the old and new for however many beats the update straddled.
-     */
+    /* The whole grid as one string - see encodeProgression(). One key rather
+     * than one per cell, so the DSP never sees a half-applied grid. */
     void pushProgression()
     {
-        /* Sized for the worst case: every section full at 64 beats, each cell
-         * "d.e.o," at up to 8 bytes, plus the length prefix. A truncated grid
-         * would decode as a different progression than the one on screen. */
-        char out[kMaxProgSections * (kMaxProgSteps * 10 + 8) + 16] = {0};
-        int  len = 0;
-
-        for (int s = 0; s < fProg.count; ++s) {
-            const ProgSection& sec = fProg.section[s];
-
-            len += std::snprintf(out + len, sizeof(out) - len, "%s%d|",
-                                 s ? ";" : "", sec.length);
-
-            for (int i = 0; i < sec.length && i < kMaxProgSteps; ++i) {
-                const ProgCell& c = sec.cell[i];
-                if (c.filled)
-                    len += std::snprintf(out + len, sizeof(out) - len,
-                                         "%s%d.%d.%d", i ? "," : "",
-                                         static_cast<int>(c.degree),
-                                         static_cast<int>(c.ext),
-                                         static_cast<int>(c.octave));
-                else
-                    len += std::snprintf(out + len, sizeof(out) - len,
-                                         "%s-", i ? "," : "");
-
-                /* Bail rather than send a truncated grid, which would decode
-                 * as a different progression than the one on screen. */
-                if (len >= static_cast<int>(sizeof(out)) - 16)
-                    break;
-            }
-
-            if (len >= static_cast<int>(sizeof(out)) - 16)
-                break;
-        }
-
+        char out[kProgStringMax];
+        encodeProgression(fProg, out, sizeof out);
         setState("progression", out);
     }
 
@@ -4216,6 +4168,127 @@ protected:
 
     /* Drain this instance's ring on the UI thread. uiIdle runs at roughly frame
      * rate, which is ample for a human-readable log. */
+    /*
+     * ---- state arriving from the plugin -------------------------------------
+     *
+     * The host calls this when it restores a saved project, and whenever the
+     * plugin changes state the editor did not initiate.
+     *
+     * Without it the editor never learned what was restored: a project saved
+     * with a progression, a rebound keyboard and a chosen key reopened showing
+     * the factory defaults, while the DSP played the saved values. Every
+     * control lied, and the first click on any of them pushed the default back
+     * over the restored setting - so merely opening a project and touching one
+     * button silently discarded the rest of the session's settings.
+     *
+     * Each key writes ONLY the editor's own copy. Pushing back here would echo
+     * every restored value straight to the plugin, and on a host that reports
+     * its own changes that is an endless loop.
+     */
+    void stateChanged(const char* key, const char* value) override
+    {
+        if (key == nullptr || value == nullptr)
+            return;
+
+        /* Structured keys first: atoi would read only their first field. */
+        if (std::strcmp(key, "keyMap") == 0) {
+            decodeKeyMap(value, fKeyMap);
+            repaint();
+            return;
+        }
+
+        if (std::strcmp(key, "progression") == 0) {
+            /* An unusable string leaves the grid alone rather than blanking
+             * it - see decodeProgression(). */
+            if (decodeProgression(value, fProg)) {
+                /* The selection may now point past the end of a shorter
+                 * grid. */
+                if (fEditSection >= fProg.count)
+                    fEditSection = fProg.count - 1;
+                if (fEditStep >= kMaxProgSteps)
+                    fEditStep = kMaxProgSteps - 1;
+                if (fMenuSection >= fProg.count)
+                    fMenuSection = fProg.count - 1;
+
+                /* Show enough of the grid to contain what was restored, so a
+                 * 32-beat section does not open looking truncated. */
+                int longest = 0;
+                for (int s = 0; s < fProg.count; ++s)
+                    if (fProg.section[s].length > longest)
+                        longest = fProg.section[s].length;
+
+                for (int i = 0; i < kProgLengthChoiceCount; ++i)
+                    if (kProgLengthChoice[i] >= longest) {
+                        fGridBeats = kProgLengthChoice[i];
+                        break;
+                    }
+            }
+            repaint();
+            return;
+        }
+
+        const int v = std::atoi(value);
+
+        /* Per-ring keys: extN and voiceN, where N is the ring index. */
+        if (std::strncmp(key, "ext", 3) == 0 && key[3] >= '0' && key[3] <= '2') {
+            fRingExt[key[3] - '0'] = clampEnum<Extension>(v, kExtCount);
+        }
+        else if (std::strncmp(key, "voice", 5) == 0 &&
+                 key[5] >= '0' && key[5] <= '2') {
+            fRingVoice[key[5] - '0'] = clampEnum<Voicing>(v, kVoicingCount);
+        }
+        else if (std::strcmp(key, "octave") == 0) {
+            fOctave = (v < 1) ? 1 : (v > 7) ? 7 : v;
+        }
+        else if (std::strcmp(key, "latch") == 0)
+            fLatchEnabled = (v != 0);
+        else if (std::strcmp(key, "glideMode") == 0)
+            fGlideMode = clampEnum<GlideMode>(v, kGlideModeCount);
+        else if (std::strcmp(key, "selectedKey") == 0) {
+            fSelectedKey = ((v % 12) + 12) % 12;
+            /* The pinned wedge follows a restored key, or the highlight would
+             * point at whatever key the editor happened to start on. */
+            if (! fKeyLocked)
+                fLockedKey = fSelectedKey;
+        }
+        else if (std::strcmp(key, "singleNotes") == 0)
+            fSingleNotes = (v != 0);
+        else if (std::strcmp(key, "voiceLeading") == 0)
+            fVoiceLeading = (v != 0);
+        else if (std::strcmp(key, "bassNote") == 0) {
+            fBassNote = clampEnum<BassNote>(v, kBassNoteCount);
+            /* Restoring a hand-picked bass makes it the one glide returns to,
+             * so suspending and resuming auto lands where the session left
+             * off rather than on FIRST. */
+            if (! fVoiceLeading)
+                fLastManualBass = fBassNote;
+        }
+        else if (std::strcmp(key, "pedalAction") == 0)
+            fPedalAction = clampEnum<PedalAction>(v, kPedalActionCount);
+        else if (std::strcmp(key, "storageMode") == 0)
+            fStorageMode = clampEnum<StorageMode>(v, kStorageModeCount);
+        else if (std::strcmp(key, "progLegato") == 0)
+            fProgLegato = (v != 0);
+        else if (std::strcmp(key, "progRunning") == 0)
+            fProgRunning = (v != 0);
+        else if (std::strcmp(key, "uiScreen") == 0) {
+            const int s = (v < 0) ? 0
+                        : (v >= kScreenCount) ? kScreenCount - 1 : v;
+            fScreen = static_cast<Screen>(s);
+        }
+
+        repaint();
+    }
+
+    /* Wrap a restored integer into an enum's range. A host is free to hand
+     * back anything - a truncated file, a value from a newer version - and a
+     * wild index would read past the end of a name table. */
+    template <typename T>
+    static T clampEnum(int v, int count)
+    {
+        return static_cast<T>(((v % count) + count) % count);
+    }
+
     void uiIdle() override
     {
         if (fRing == nullptr) {

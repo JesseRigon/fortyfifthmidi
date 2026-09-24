@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 
 #include <atomic>
@@ -931,6 +932,53 @@ static constexpr KeyMapEntry kDefaultKeyMap[12] = {
     /* B  */ { kKeyDegree,      kDegreeVII },
 };
 
+/*
+ * The key map's wire format: "action:value" per key, comma separated, twelve
+ * entries. Plain text so a saved session stays readable and diffable.
+ *
+ * Encode and decode live together here for the same reason the progression's
+ * do: the editor sends the map, the DSP receives it, and the DSP hands it back
+ * when the host saves.
+ */
+static constexpr int kKeyMapStringMax = 128;
+
+inline void encodeKeyMap(const KeyMapEntry* map, char* out, size_t cap)
+{
+    out[0] = '\0';
+    int len = 0;
+
+    for (int i = 0; i < 12; ++i)
+        len += std::snprintf(out + len, cap - len, "%s%d:%d",
+                             i ? "," : "",
+                             static_cast<int>(map[i].action), map[i].value);
+}
+
+/*
+ * Anything malformed leaves that key at its FACTORY binding rather than
+ * silently unbinding it - a keyboard that stops responding is a worse failure
+ * than one that ignores a bad setting.
+ */
+inline void decodeKeyMap(const char* value, KeyMapEntry* out)
+{
+    KeyMapEntry parsed[12];
+    std::memcpy(parsed, kDefaultKeyMap, sizeof(parsed));
+
+    const char* p = value;
+    for (int i = 0; i < 12 && p != nullptr && *p != '\0'; ++i) {
+        int a = 0, v = 0;
+        if (std::sscanf(p, "%d:%d", &a, &v) == 2) {
+            if (a >= 0 && a < kKeyActionCount) {
+                parsed[i].action = static_cast<KeyAction>(a);
+                parsed[i].value  = v;
+            }
+        }
+        p = std::strchr(p, ',');
+        if (p != nullptr) ++p;
+    }
+
+    std::memcpy(out, parsed, sizeof(parsed));
+}
+
 /* Pedal bindings, so a player with a sustain pedal can spend it on something
  * other than sustain - and free C# for another use. */
 enum PedalAction {
@@ -1523,6 +1571,133 @@ inline void loadPresetAt(Progression& prog, int presetIndex,
 
     if (section >= prog.count)
         prog.count = section + 1;
+}
+
+/*
+ * ---- the progression wire format ---------------------------------------
+ *
+ * Sections separated by ';', cells by ',', a cell being
+ * "degree.extension.octave" or "-" for a rest, with the section's length
+ * ahead of a '|'. So "4|0.0.0,5.2.0,3.0.-1,4.0.0;2|0.0.0,4.0.0" is a
+ * four-beat I-vi-IV-V with the IV an octave down, then a two-beat I-V.
+ *
+ * One string rather than a key per cell, because a reader must never see a
+ * half-applied grid - a progression arriving cell by cell would be a chimera
+ * of the old and new for however many beats the update straddled.
+ *
+ * Encode and decode live here, together, because three places need them: the
+ * editor sends the grid, the DSP receives it, and the DSP sends it back when
+ * the host saves. Two copies of this format drifting apart would corrupt
+ * every saved session.
+ *
+ * Buffer size for the encoded form: every section full at the maximum length,
+ * each cell "dd.e.oo," at up to ten bytes, plus the length prefix.
+ */
+static constexpr int kProgStringMax =
+    kMaxProgSections * (kMaxProgSteps * 10 + 8) + 16;
+
+inline void encodeProgression(const Progression& prog, char* out, size_t cap)
+{
+    out[0] = '\0';
+    int len = 0;
+
+    for (int s = 0; s < prog.count; ++s) {
+        const ProgSection& sec = prog.section[s];
+
+        len += std::snprintf(out + len, cap - len, "%s%d|",
+                             s ? ";" : "", sec.length);
+
+        for (int i = 0; i < sec.length && i < kMaxProgSteps; ++i) {
+            const ProgCell& c = sec.cell[i];
+
+            if (c.filled)
+                len += std::snprintf(out + len, cap - len, "%s%d.%d.%d",
+                                     i ? "," : "",
+                                     static_cast<int>(c.degree),
+                                     static_cast<int>(c.ext),
+                                     static_cast<int>(c.octave));
+            else
+                len += std::snprintf(out + len, cap - len, "%s-",
+                                     i ? "," : "");
+
+            /* Stop rather than emit a truncated grid, which would decode as a
+             * different progression than the one held. */
+            if (len >= static_cast<int>(cap) - 16)
+                return;
+        }
+
+        if (len >= static_cast<int>(cap) - 16)
+            return;
+    }
+}
+
+/*
+ * Decode into out, returning false if nothing usable was found - in which case
+ * out is untouched, so a malformed string leaves the caller's grid alone
+ * rather than half-replacing it.
+ */
+inline bool decodeProgression(const char* value, Progression& out)
+{
+    if (value == nullptr)
+        return false;
+
+    Progression parsed;
+    parsed.count = 0;
+
+    const char* p = value;
+    while (p != nullptr && *p != '\0' && parsed.count < kMaxProgSections) {
+        ProgSection& sec = parsed.section[parsed.count];
+        sec = ProgSection();
+
+        int len = 0;
+        if (std::sscanf(p, "%d|", &len) != 1)
+            break;
+
+        sec.length = (len < 0) ? 0
+                   : (len > kMaxProgSteps) ? kMaxProgSteps : len;
+
+        const char* c = std::strchr(p, '|');
+        if (c == nullptr)
+            break;
+        ++c;
+
+        for (int i = 0; i < sec.length; ++i) {
+            if (*c == '-') {
+                sec.cell[i].filled = false;
+            } else {
+                int d = 0, e = 0, o = 0;
+                if (std::sscanf(c, "%d.%d.%d", &d, &e, &o) == 3 &&
+                    d >= 0 && d < kDegreeCount &&
+                    e >= 0 && e < kExtCount) {
+                    sec.cell[i].filled = true;
+                    sec.cell[i].degree = static_cast<Degree>(d);
+                    sec.cell[i].ext    = static_cast<Extension>(e);
+                    /* Clamped rather than rejected: an out-of-range octave
+                     * should still play the right chord. */
+                    sec.cell[i].octave = static_cast<int8_t>(
+                        (o < kProgOctaveMin) ? kProgOctaveMin
+                      : (o > kProgOctaveMax) ? kProgOctaveMax : o);
+                }
+            }
+
+            const char* comma = std::strchr(c, ',');
+            const char* semi  = std::strchr(c, ';');
+            if (comma == nullptr || (semi != nullptr && semi < comma))
+                break;
+            c = comma + 1;
+        }
+
+        ++parsed.count;
+
+        p = std::strchr(p, ';');
+        if (p != nullptr) ++p;
+    }
+
+    if (parsed.count == 0)
+        return false;
+
+    out = parsed;
+    return true;
 }
 
 /* Replace a section outright with a preset. Used for the opening grid, where

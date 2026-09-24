@@ -342,110 +342,26 @@ protected:
         return String(buf);
     }
 
-    void parseKeyMap(const char* value)
-    {
-        /* Anything malformed leaves that key at its factory binding rather
-         * than silently unbinding it - a keyboard that stops responding is a
-         * worse failure than one that ignores a bad setting. */
-        KeyMapEntry parsed[12];
-        std::memcpy(parsed, kDefaultKeyMap, sizeof(parsed));
-
-        const char* p = value;
-        for (int i = 0; i < 12 && p != nullptr && *p != '\0'; ++i) {
-            int a = 0, v = 0;
-            if (std::sscanf(p, "%d:%d", &a, &v) == 2) {
-                if (a >= 0 && a < kKeyActionCount) {
-                    parsed[i].action = static_cast<KeyAction>(a);
-                    parsed[i].value  = v;
-                }
-            }
-            p = std::strchr(p, ',');
-            if (p != nullptr) ++p;
-        }
-        std::memcpy(fKeyMap, parsed, sizeof(fKeyMap));
-    }
+    void parseKeyMap(const char* value) { decodeKeyMap(value, fKeyMap); }
 
     /*
-     * Decode the grid the UI sends.
+     * Take a grid from the editor or from a restored session.
      *
-     * Sections separated by ';', cells by ',', a cell being "degree.extension"
-     * or "-" for a rest, with the section's length ahead of a '|'. See
-     * pushProgression() in the UI for the encoding.
-     *
-     * Parsed into a local and copied in one go, so a malformed string leaves
-     * the running progression alone rather than half-replacing it. The copy is
-     * made under a flag the audio thread checks between beats, so a grid can
-     * never change part-way through a chord.
+     * Handed to the audio thread through a second buffer and a flag it checks
+     * between beats, so a grid can never change part-way through a chord.
+     * fSavedProg is the copy getState() reads: fProg belongs to the audio
+     * thread and only updates between beats, so reading it there could hand
+     * the host a grid one block out of date - or, if the transport never ran,
+     * the grid the plugin started with rather than the one the user built.
      */
     void parseProgression(const char* value)
     {
         Progression parsed;
-        parsed.count = 0;
-
-        const char* p = value;
-        while (p != nullptr && *p != '\0' && parsed.count < kMaxProgSections) {
-            ProgSection& sec = parsed.section[parsed.count];
-            sec = ProgSection();
-
-            int len = 0;
-            if (std::sscanf(p, "%d|", &len) != 1)
-                break;
-
-            sec.length = (len < 0) ? 0
-                       : (len > kMaxProgSteps) ? kMaxProgSteps : len;
-
-            const char* c = std::strchr(p, '|');
-            if (c == nullptr)
-                break;
-            ++c;
-
-            for (int i = 0; i < sec.length; ++i) {
-                if (*c == '-') {
-                    sec.cell[i].filled = false;
-                } else {
-                    int d = 0, e = 0, o = 0;
-                    if (std::sscanf(c, "%d.%d.%d", &d, &e, &o) == 3 &&
-                        d >= 0 && d < kDegreeCount &&
-                        e >= 0 && e < kExtCount) {
-                        sec.cell[i].filled = true;
-                        sec.cell[i].degree = static_cast<Degree>(d);
-                        sec.cell[i].ext    = static_cast<Extension>(e);
-                        /* Clamped rather than rejected: an out-of-range octave
-                         * should still play the right chord. */
-                        sec.cell[i].octave = static_cast<int8_t>(
-                            (o < kProgOctaveMin) ? kProgOctaveMin
-                          : (o > kProgOctaveMax) ? kProgOctaveMax : o);
-                    }
-                }
-
-                const char* comma = std::strchr(c, ',');
-                const char* semi  = std::strchr(c, ';');
-                if (comma == nullptr || (semi != nullptr && semi < comma))
-                    break;
-                c = comma + 1;
-            }
-
-            ++parsed.count;
-
-            p = std::strchr(p, ';');
-            if (p != nullptr) ++p;
-        }
-
-        if (parsed.count == 0)
+        if (! decodeProgression(value, parsed))
             return;   /* nothing usable - keep playing what we have */
 
         fPendingProg = parsed;
         fProgDirty.store(true, std::memory_order_release);
-
-        /*
-         * The saved copy, for getState().
-         *
-         * fProg belongs to the audio thread and is only updated between
-         * beats, so reading it here could hand the host a grid one block out
-         * of date - or, if the transport never runs, the grid the plugin
-         * started with rather than the one the user built. This copy is
-         * written on the same (UI) thread that getState() is called from.
-         */
         fSavedProg = parsed;
     }
 
@@ -597,52 +513,17 @@ protected:
 
     String getState(const char* key) const override
     {
-        /*
-         * The grid, re-encoded exactly as the UI sends it, so a saved project
-         * restores the progression it had. Structured, so it is handled before
-         * the integer path below.
-         */
+        /* Structured, not numeric - handled before the integer path below,
+         * where atoi would read only the first field. Both encoders are shared
+         * with the editor, so what is saved is exactly what was sent. */
         if (std::strcmp(key, "progression") == 0) {
-            char out[kMaxProgSections * (kMaxProgSteps * 10 + 8) + 16] = {0};
-            int  len = 0;
-
-            for (int s = 0; s < fSavedProg.count; ++s) {
-                const ProgSection& sec = fSavedProg.section[s];
-
-                len += std::snprintf(out + len, sizeof(out) - len, "%s%d|",
-                                     s ? ";" : "", sec.length);
-
-                for (int i = 0; i < sec.length && i < kMaxProgSteps; ++i) {
-                    const ProgCell& c = sec.cell[i];
-                    if (c.filled)
-                        len += std::snprintf(out + len, sizeof(out) - len,
-                                             "%s%d.%d.%d", i ? "," : "",
-                                             static_cast<int>(c.degree),
-                                             static_cast<int>(c.ext),
-                                             static_cast<int>(c.octave));
-                    else
-                        len += std::snprintf(out + len, sizeof(out) - len,
-                                             "%s-", i ? "," : "");
-
-                    if (len >= static_cast<int>(sizeof(out)) - 16)
-                        break;
-                }
-                if (len >= static_cast<int>(sizeof(out)) - 16)
-                    break;
-            }
+            char out[kProgStringMax];
+            encodeProgression(fSavedProg, out, sizeof out);
             return String(out);
         }
-
-        /* Structured, not numeric - handled before the integer path below. */
         if (std::strcmp(key, "keyMap") == 0) {
-            char out[128] = {0};
-            for (int i = 0; i < 12; ++i) {
-                char one[16];
-                std::snprintf(one, sizeof(one), "%s%d:%d", i ? "," : "",
-                              static_cast<int>(fKeyMap[i].action),
-                              fKeyMap[i].value);
-                std::strncat(out, one, sizeof(out) - std::strlen(out) - 1);
-            }
+            char out[kKeyMapStringMax];
+            encodeKeyMap(fKeyMap, out, sizeof out);
             return String(out);
         }
 
