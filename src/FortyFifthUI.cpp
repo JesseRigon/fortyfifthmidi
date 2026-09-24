@@ -1526,6 +1526,9 @@ protected:
             fSingleNotes = ! fSingleNotes;
             std::snprintf(buf, sizeof(buf), "%d", fSingleNotes ? 1 : 0);
             setState("singleNotes", buf);
+            /* The next log line is formatted differently now, so the cached
+             * one must not suppress it as a duplicate. */
+            fLastChord.clear();
             repaint();
             return true;
         }
@@ -1770,11 +1773,25 @@ protected:
                 std::strcat(notes, one);
         }
 
-        char name[32] = {0};
-        nameChord(fSounding, name, sizeof(name));
-
         char line[128];
-        std::snprintf(line, sizeof(line), "CHORD    %-9s %s", name, notes);
+
+        /*
+         * In single-note mode the plugin emits one note per press, so there is
+         * no chord to name. Naming one anyway would invent harmony the user
+         * did not play: two single notes held together are still two notes,
+         * and calling them "C5" misreports what the wheel actually did.
+         *
+         * The notes are still listed - the monitor's job is to say what is
+         * sounding, and several single notes genuinely can sound at once.
+         */
+        if (fSingleNotes) {
+            std::snprintf(line, sizeof(line), "NOTES    %-9s %s",
+                          fSoundingCount == 1 ? "" : "(held)", notes);
+        } else {
+            char name[32] = {0};
+            nameChord(fSounding, name, sizeof(name));
+            std::snprintf(line, sizeof(line), "CHORD    %-9s %s", name, notes);
+        }
 
         /* Only report a genuine change, or a chord would reprint every time a
          * voice is re-sent. */
