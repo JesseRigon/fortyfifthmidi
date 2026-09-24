@@ -692,26 +692,97 @@ inline const SlideDef* slidesForScale(Scale scale)
  * exactly so the two input methods agree, and it leaves all five black keys
  * free for later assignment.
  */
-struct KeyMapEntry {
-    int    semitone;   /* pitch class within the octave, 0 = C */
-    Degree degree;
-    bool   mapped;
+/*
+ * What a physical key does.
+ *
+ * The white keys play degrees; the black keys are free for real-time control,
+ * so a player can change the chord quality or toggle glide mid-phrase without
+ * reaching for the mouse. Every binding repeats in every octave, so the whole
+ * scheme is playable with one hand wherever it happens to be.
+ *
+ * Nothing is passed through: an unbound key is SILENT rather than forwarded.
+ * Forwarding it would sound the raw note under the chords, which is exactly
+ * what the black keys were doing before they had jobs.
+ */
+enum KeyAction {
+    kKeyNone = 0,     /* silent - bound to nothing */
+    kKeyDegree,       /* play a scale degree */
+    kKeyExtension,    /* select a chord extension for the NEXT chord */
+    kKeyGlideToggle,  /* flip glide between off and its last on-state */
+    kKeyLatchToggle,
+    kKeySingleToggle, /* chords <-> single notes */
+    kKeyPanic,
+    kKeyActionCount
 };
 
-static constexpr KeyMapEntry kKeyMap[12] = {
-    /* C  */ { 0,  kDegreeI,   true  },
-    /* C# */ { 1,  kDegreeI,   false },
-    /* D  */ { 2,  kDegreeII,  true  },
-    /* D# */ { 3,  kDegreeI,   false },
-    /* E  */ { 4,  kDegreeIII, true  },
-    /* F  */ { 5,  kDegreeIV,  true  },
-    /* F# */ { 6,  kDegreeI,   false },
-    /* G  */ { 7,  kDegreeV,   true  },
-    /* G# */ { 8,  kDegreeI,   false },
-    /* A  */ { 9,  kDegreeVI,  true  },
-    /* A# */ { 10, kDegreeI,   false },
-    /* B  */ { 11, kDegreeVII, true  },
+static constexpr const char* kKeyActionName[kKeyActionCount] = {
+    "(silent)", "Degree", "Chord type", "Glide toggle",
+    "Latch toggle", "Single notes", "Panic"
 };
+
+struct KeyMapEntry {
+    KeyAction action;
+    /* Which degree, or which extension, depending on the action. Unused by
+     * the toggles, which need no argument. */
+    int       value;
+};
+
+/*
+ * The factory map. Every binding is editable from the Keyboard Setup tab, so
+ * this is a starting point rather than a fixed scheme.
+ *
+ *   white   C D E F G A B  ->  I ii iii IV V vi vii
+ *   black   C#             ->  glide toggle
+ *           D# F# G# A#    ->  triad, 7th, 9th, sus4
+ *
+ * The four chord types are the ones a progression reaches for most; the other
+ * three extensions remain available from the wheel, and any black key can be
+ * rebound to them.
+ */
+static constexpr KeyMapEntry kDefaultKeyMap[12] = {
+    /* C  */ { kKeyDegree,      kDegreeI   },
+    /* C# */ { kKeyGlideToggle, 0          },
+    /* D  */ { kKeyDegree,      kDegreeII  },
+    /* D# */ { kKeyExtension,   kExtNone   },
+    /* E  */ { kKeyDegree,      kDegreeIII },
+    /* F  */ { kKeyDegree,      kDegreeIV  },
+    /* F# */ { kKeyExtension,   kExt7      },
+    /* G  */ { kKeyDegree,      kDegreeV   },
+    /* G# */ { kKeyExtension,   kExt9      },
+    /* A  */ { kKeyDegree,      kDegreeVI  },
+    /* A# */ { kKeyExtension,   kExtSus4   },
+    /* B  */ { kKeyDegree,      kDegreeVII },
+};
+
+/* Pedal bindings, so a player with a sustain pedal can spend it on something
+ * other than sustain - and free C# for another use. */
+enum PedalAction {
+    kPedalSustain = 0,   /* the default: defer releases while held */
+    kPedalGlide,         /* glide on while held */
+    kPedalLatch,
+    kPedalSingle,
+    kPedalPanic,
+    kPedalNone,
+    kPedalActionCount
+};
+
+static constexpr const char* kPedalActionName[kPedalActionCount] = {
+    "Sustain", "Glide while held", "Latch toggle",
+    "Single notes", "Panic", "(nothing)"
+};
+
+static constexpr const char* kPitchName[12] = {
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+};
+
+/* Black keys, for drawing and for deciding what a default rebind should be. */
+inline bool isBlackKey(int pitchClass)
+{
+    switch (((pitchClass % 12) + 12) % 12) {
+        case 1: case 3: case 6: case 8: case 10: return true;
+        default: return false;
+    }
+}
 
 /*
  * Resolve an incoming MIDI note to a wheel cell in the given key.
@@ -719,17 +790,17 @@ static constexpr KeyMapEntry kKeyMap[12] = {
  * Returns false for the unmapped pitch classes, which the caller should ignore
  * entirely. outPosition is a cell index in outRing's own numbering.
  */
-inline bool cellForMidiNote(int midiNote, int keyIndex,
+inline bool cellForMidiNote(const KeyMapEntry* map, int midiNote, int keyIndex,
                             int& outPosition, Ring& outRing)
 {
     const int pc = ((midiNote % 12) + 12) % 12;
-    const KeyMapEntry& e = kKeyMap[pc];
+    const KeyMapEntry& e = map[pc];
 
-    if (! e.mapped)
+    if (e.action != kKeyDegree)
         return false;
 
     /* Shared with Slide Mode, so a key and a strip cannot disagree. */
-    cellForDegree(e.degree, keyIndex, outPosition, outRing);
+    cellForDegree(static_cast<Degree>(e.value), keyIndex, outPosition, outRing);
     return true;
 }
 

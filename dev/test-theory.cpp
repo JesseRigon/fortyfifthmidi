@@ -181,7 +181,7 @@ int main()
         for (int key = 0; key < 12 && allKeys; ++key) {
             int  pos;
             Ring ring;
-            if (! cellForMidiNote(m.note, key, pos, ring)) {
+            if (! cellForMidiNote(kDefaultKeyMap, m.note, key, pos, ring)) {
                 allKeys = false;
                 break;
             }
@@ -199,20 +199,75 @@ int main()
         }
     }
 
-    /* The black keys are deliberately free, so they stay silent. */
-    std::printf("\n=== black keys stay silent ===\n");
+    /*
+     * Black keys are controls, not notes. The important property is that none
+     * of them plays a degree - if one did it would sound a chord where the
+     * player expected a setting change.
+     */
+    std::printf("\n=== black keys are controls, never degrees ===\n");
     {
         static const int kBlack[5] = { 1, 3, 6, 8, 10 };
         for (int i = 0; i < 5; ++i) {
             const int pc = kBlack[i];
             int  pos;
             Ring ring;
-            if (! cellForMidiNote(pc, 0, pos, ring)) {
-                std::printf("  ok    %-30s ignored\n", kPitch[pc]);
+            const bool playsChord =
+                cellForMidiNote(kDefaultKeyMap, pc, 0, pos, ring);
+            const KeyAction a = kDefaultKeyMap[pc].action;
+
+            if (! playsChord && a != kKeyDegree) {
+                std::printf("  ok    %-6s %-24s\n", kPitch[pc],
+                            kKeyActionName[a]);
             } else {
-                std::printf("  FAIL  %-30s should be unmapped\n", kPitch[pc]);
+                std::printf("  FAIL  %-6s plays a chord\n", kPitch[pc]);
                 ++failures;
             }
+        }
+    }
+
+    /* And the white keys must all still play, or the keyboard is broken. */
+    std::printf("\n=== white keys all play a degree ===\n");
+    {
+        static const int kWhite[7] = { 0, 2, 4, 5, 7, 9, 11 };
+        bool allPlay = true;
+        for (int i = 0; i < 7; ++i) {
+            int  pos;
+            Ring ring;
+            if (! cellForMidiNote(kDefaultKeyMap, kWhite[i], 0, pos, ring))
+                allPlay = false;
+        }
+        if (allPlay) {
+            std::printf("  ok    %-30s all 7 play\n", "C D E F G A B");
+        } else {
+            std::printf("  FAIL  %-30s one is unbound\n", "C D E F G A B");
+            ++failures;
+        }
+    }
+
+    /*
+     * The four chord-type keys must select DIFFERENT extensions. Binding two
+     * of them to the same thing would waste a key and look like a bug under
+     * the fingers.
+     */
+    std::printf("\n=== the four chord keys are distinct ===\n");
+    {
+        int seen[kExtCount] = {0};
+        int count = 0;
+        bool dup = false;
+        for (int pc = 0; pc < 12; ++pc) {
+            if (kDefaultKeyMap[pc].action != kKeyExtension)
+                continue;
+            ++count;
+            const int v = kDefaultKeyMap[pc].value;
+            if (v < 0 || v >= kExtCount) { dup = true; break; }
+            if (seen[v]++) dup = true;
+        }
+        if (count == 4 && ! dup) {
+            std::printf("  ok    %-30s 4 distinct extensions\n", "D# F# G# A#");
+        } else {
+            std::printf("  FAIL  %-30s %d keys, duplicates=%s\n",
+                        "D# F# G# A#", count, dup ? "yes" : "no");
+            ++failures;
         }
     }
 

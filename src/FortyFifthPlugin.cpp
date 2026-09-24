@@ -72,6 +72,7 @@ public:
                  kStateCount)
     {
         std::memset(fHeld, 0, sizeof(fHeld));
+        std::memcpy(fKeyMap, kDefaultKeyMap, sizeof(fKeyMap));
         registerMonitorRing(this, &fMonitor);
     }
 
@@ -125,6 +126,8 @@ protected:
         kStateSelectedKey,
         kStateSingleNotes,
         kStateVoiceLeading,
+        kStateKeyMap,
+        kStatePedalAction,
         kStateCount
     };
 
@@ -236,11 +239,69 @@ protected:
                 state.label = "Voice Leading";
                 state.defaultValue = "1";
                 break;
+            case kStateKeyMap:
+                /* All twelve bindings in one value, "action:value" per key,
+                 * comma separated - twelve separate state keys would bloat the
+                 * host's saved state for no benefit. */
+                state.key = "keyMap";
+                state.label = "Keyboard Map";
+                state.defaultValue = defaultKeyMapString();
+                break;
+            case kStatePedalAction:
+                state.key = "pedalAction";
+                state.label = "Sustain Pedal";
+                state.defaultValue = "0";
+                break;
         }
+    }
+
+    /* "action:value" per key, comma separated, twelve entries. Plain text so a
+     * saved session stays readable and diffable. */
+    static String defaultKeyMapString()
+    {
+        char buf[128] = {0};
+        for (int i = 0; i < 12; ++i) {
+            char one[16];
+            std::snprintf(one, sizeof(one), "%s%d:%d", i ? "," : "",
+                          static_cast<int>(kDefaultKeyMap[i].action),
+                          kDefaultKeyMap[i].value);
+            std::strncat(buf, one, sizeof(buf) - std::strlen(buf) - 1);
+        }
+        return String(buf);
+    }
+
+    void parseKeyMap(const char* value)
+    {
+        /* Anything malformed leaves that key at its factory binding rather
+         * than silently unbinding it - a keyboard that stops responding is a
+         * worse failure than one that ignores a bad setting. */
+        KeyMapEntry parsed[12];
+        std::memcpy(parsed, kDefaultKeyMap, sizeof(parsed));
+
+        const char* p = value;
+        for (int i = 0; i < 12 && p != nullptr && *p != '\0'; ++i) {
+            int a = 0, v = 0;
+            if (std::sscanf(p, "%d:%d", &a, &v) == 2) {
+                if (a >= 0 && a < kKeyActionCount) {
+                    parsed[i].action = static_cast<KeyAction>(a);
+                    parsed[i].value  = v;
+                }
+            }
+            p = std::strchr(p, ',');
+            if (p != nullptr) ++p;
+        }
+        std::memcpy(fKeyMap, parsed, sizeof(fKeyMap));
     }
 
     void setState(const char* key, const char* value) override
     {
+        /* Before the numeric parse: this one is a structured string, and
+         * atoi would read only its first field. */
+        if (std::strcmp(key, "keyMap") == 0) {
+            parseKeyMap(value);
+            return;
+        }
+
         const int v = std::atoi(value);
 
         /* Per-ring keys: extN and voiceN, where N is the ring index. */
@@ -297,6 +358,9 @@ protected:
             fSelectedKey.store(((v % 12) + 12) % 12, std::memory_order_release);
         else if (std::strcmp(key, "singleNotes") == 0)
             fSingleNotes = (v != 0);
+        else if (std::strcmp(key, "pedalAction") == 0)
+            fPedalAction = static_cast<PedalAction>(
+                ((v % kPedalActionCount) + kPedalActionCount) % kPedalActionCount);
         else if (std::strcmp(key, "voiceLeading") == 0) {
             fVoiceLeading = (v != 0);
             /* Turning it off must not leave the next chord leading from a
@@ -350,6 +414,19 @@ protected:
 
     String getState(const char* key) const override
     {
+        /* Structured, not numeric - handled before the integer path below. */
+        if (std::strcmp(key, "keyMap") == 0) {
+            char out[128] = {0};
+            for (int i = 0; i < 12; ++i) {
+                char one[16];
+                std::snprintf(one, sizeof(one), "%s%d:%d", i ? "," : "",
+                              static_cast<int>(fKeyMap[i].action),
+                              fKeyMap[i].value);
+                std::strncat(out, one, sizeof(out) - std::strlen(out) - 1);
+            }
+            return String(out);
+        }
+
         char buf[16];
         int  v = 0;
 
@@ -369,6 +446,8 @@ protected:
         else if (std::strcmp(key, "selectedKey") == 0)
             v = fSelectedKey.load(std::memory_order_acquire);
         else if (std::strcmp(key, "singleNotes") == 0)  v = fSingleNotes ? 1 : 0;
+        else if (std::strcmp(key, "pedalAction") == 0)
+            v = static_cast<int>(fPedalAction);
         else if (std::strcmp(key, "voiceLeading") == 0) v = fVoiceLeading ? 1 : 0;
 
         std::snprintf(buf, sizeof(buf), "%d", v);
@@ -1122,13 +1201,60 @@ private:
          * playing legato rather than merely latched. */
         if (status == 0xB0 && d1 == 64) {
             const bool down = (d2 >= 64);
-            if (fPedalDown && ! down) {
-                fPedalDown = false;
-                releaseDeferred(ev.frame);
-            } else {
-                fPedalDown = down;
+            const bool wasDown = fPedalDown;
+            fPedalDown = down;
+
+            switch (fPedalAction) {
+                case kPedalSustain:
+                    /* Defer releases while held, rather than blocking them -
+                     * that is what makes the playing legato, not latched. */
+                    if (wasDown && ! down)
+                        releaseDeferred(ev.frame);
+                    /* Downstream instruments may want the pedal too. */
+                    writeMidiEvent(ev);
+                    break;
+
+                case kPedalGlide:
+                    /* Momentary: glide for as long as the foot is down. */
+                    if (down && ! wasDown) {
+                        fGlideWasOn = (fGlideMode != kGlideOff)
+                            ? fGlideMode : fGlideWasOn;
+                        fGlideMode = fGlideWasOn;
+                        if (fGlideMode == kGlideMpe)
+                            fNeedsRpn = true;
+                    } else if (! down && wasDown) {
+                        fGlideMode = kGlideOff;
+                    }
+                    fLastChordCount = 0;
+                    fSettingsEcho.store(true, std::memory_order_release);
+                    break;
+
+                case kPedalLatch:
+                    if (down && ! wasDown) {
+                        fLatchEnabled = ! fLatchEnabled;
+                        if (! fLatchEnabled)
+                            stopAllGroups(ev.frame);
+                        fSettingsEcho.store(true, std::memory_order_release);
+                    }
+                    break;
+
+                case kPedalSingle:
+                    if (down && ! wasDown) {
+                        fSingleNotes = ! fSingleNotes;
+                        fLastChordCount = 0;
+                        fSettingsEcho.store(true, std::memory_order_release);
+                    }
+                    break;
+
+                case kPedalPanic:
+                    if (down && ! wasDown)
+                        fPanic.store(true, std::memory_order_release);
+                    break;
+
+                case kPedalNone:
+                default:
+                    break;
             }
-            writeMidiEvent(ev);   /* downstream instruments may want it too */
             return;
         }
 
@@ -1152,19 +1278,93 @@ private:
             return;
         }
 
-        int  position;
-        Ring ring;
-        if (! cellForMidiNote(d1, fSelectedKey.load(std::memory_order_acquire),
-                              position, ring)) {
-            /* Unmapped pitch class: not ours, so leave it alone. */
-            writeMidiEvent(ev);
-            return;
-        }
+        /*
+         * Every key on the controller belongs to this plugin now: white keys
+         * play degrees, black keys are real-time controls, and anything bound
+         * to nothing is SILENT rather than forwarded. Passing an unbound key
+         * through would sound the raw note underneath the chords, which is
+         * exactly what the black keys used to do before they had jobs.
+         */
+        const int pc = ((d1 % 12) + 12) % 12;
+        const KeyMapEntry& e = fKeyMap[pc];
 
-        if (isNoteOn)
-            noteOnCell(ev.frame, d1, position, ring, d2);
-        else
-            noteOffCell(ev.frame, d1);
+        switch (e.action) {
+            case kKeyDegree: {
+                int  position;
+                Ring ring;
+                if (! cellForMidiNote(fKeyMap, d1,
+                                      fSelectedKey.load(std::memory_order_acquire),
+                                      position, ring))
+                    return;
+
+                if (isNoteOn)
+                    noteOnCell(ev.frame, d1, position, ring, d2);
+                else
+                    noteOffCell(ev.frame, d1);
+                return;
+            }
+
+            /*
+             * Controls act on press only. They change settings for the NEXT
+             * chord and never rewrite one already sounding - spec section 5's
+             * rule, which is what keeps a control press from editing MIDI that
+             * has already gone out.
+             */
+            case kKeyExtension:
+                if (isNoteOn) {
+                    const Extension x = static_cast<Extension>(
+                        ((e.value % kExtCount) + kExtCount) % kExtCount);
+                    for (int r = 0; r < kRingCount; ++r)
+                        fRingExtension[r] = x;
+                    fSettingsEcho.store(true, std::memory_order_release);
+                }
+                return;
+
+            case kKeyGlideToggle:
+                if (isNoteOn) {
+                    /* Remember what "on" meant, so a player using MPE gets MPE
+                     * back rather than being demoted to plain glide. */
+                    if (fGlideMode == kGlideOff) {
+                        fGlideMode = fGlideWasOn;
+                        if (fGlideMode == kGlideMpe)
+                            fNeedsRpn = true;
+                    } else {
+                        fGlideWasOn = fGlideMode;
+                        fGlideMode  = kGlideOff;
+                    }
+                    fLastChordCount = 0;
+                    fSettingsEcho.store(true, std::memory_order_release);
+                }
+                return;
+
+            case kKeyLatchToggle:
+                if (isNoteOn) {
+                    fLatchEnabled = ! fLatchEnabled;
+                    /* Leaving latch with chords held would strand them. */
+                    if (! fLatchEnabled)
+                        stopAllGroups(ev.frame);
+                    fSettingsEcho.store(true, std::memory_order_release);
+                }
+                return;
+
+            case kKeySingleToggle:
+                if (isNoteOn) {
+                    fSingleNotes = ! fSingleNotes;
+                    fLastChordCount = 0;
+                    fSettingsEcho.store(true, std::memory_order_release);
+                }
+                return;
+
+            case kKeyPanic:
+                if (isNoteOn)
+                    fPanic.store(true, std::memory_order_release);
+                return;
+
+            case kKeyNone:
+            default:
+                /* Bound to nothing: swallow it. Silence is the point. */
+                return;
+        }
     }
 
     /*
@@ -1524,6 +1724,19 @@ private:
     /* Sustain pedal (CC 64). While down, releases are deferred rather than
      * ignored, so the phrase sustains without the notes losing their identity. */
     bool fPedalDown = false;
+
+    /* What the pedal does, and what each key does. Both are editable from the
+     * Keyboard Setup tab; these are the factory defaults. */
+    PedalAction fPedalAction = kPedalSustain;
+    KeyMapEntry fKeyMap[12];
+
+    /* Glide's last on-state, so a toggle restores MPE rather than demoting a
+     * player to plain glide. */
+    GlideMode fGlideWasOn = kGlideOn;
+
+    /* Set when a key or pedal changed a setting, so the UI can re-read it and
+     * keep its buttons honest. */
+    std::atomic<bool> fSettingsEcho { false };
 
     /*
      * Keys physically down, in the order they were pressed.

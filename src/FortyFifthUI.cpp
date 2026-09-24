@@ -50,6 +50,10 @@ public:
         if (! loadSharedResources())
             createFontFromFile(NANOVG_DEJAVU_SANS_TTF,
                                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+
+        /* Same factory bindings the DSP starts with, so the editor shows the
+         * truth before anything has been changed. */
+        std::memcpy(fKeyMap, kDefaultKeyMap, sizeof(fKeyMap));
     }
 
 protected:
@@ -70,11 +74,17 @@ protected:
          * monitor are shared. */
         if (fScreen == kScreenCircle)
             drawWheel();
-        else
+        else if (fScreen == kScreenSlide)
             drawSlides();
+        else
+            drawKeyboardSetup();
 
-        drawOctaveSlider();
-        drawControls();
+        /* The setup screen edits bindings rather than playing, so the
+         * performance controls would only be noise there. */
+        if (fScreen != kScreenKeys) {
+            drawOctaveSlider();
+            drawControls();
+        }
 
         drawMonitor();
 
@@ -107,7 +117,7 @@ protected:
      * shared chrome below it never moves when the screen changes.
      */
 
-    enum Screen { kScreenCircle = 0, kScreenSlide };
+    enum Screen { kScreenCircle = 0, kScreenSlide, kScreenKeys, kScreenCount };
 
     static constexpr float kTabH = 28.0f;
 
@@ -119,9 +129,11 @@ protected:
 
     void drawTabBar()
     {
-        static const char* const kNames[2] = { "Circle Mode", "Slide Mode" };
+        static const char* const kNames[kScreenCount] = {
+            "Circle Mode", "Slide Mode", "Keyboard Setup"
+        };
 
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < kScreenCount; ++i) {
             const Button b  = tabButton(i);
             const bool   on = (static_cast<int>(fScreen) == i);
 
@@ -295,6 +307,23 @@ protected:
         std::snprintf(value, sizeof(value), "%s:%d:%d",
                       verb, position, static_cast<int>(ring));
         setState("gesture", value);
+    }
+
+    /* Send the whole map as one encoded value - "action:value" per key, comma
+     * separated. Twelve separate state keys would bloat the host's saved state
+     * for no benefit, and a partial update could leave the two copies
+     * disagreeing about what a key does. */
+    void pushKeyMap()
+    {
+        char out[128] = {0};
+        for (int i = 0; i < 12; ++i) {
+            char one[16];
+            std::snprintf(one, sizeof(one), "%s%d:%d", i ? "," : "",
+                          static_cast<int>(fKeyMap[i].action),
+                          fKeyMap[i].value);
+            std::strncat(out, one, sizeof(out) - std::strlen(out) - 1);
+        }
+        setState("keyMap", out);
     }
 
     /* Which key's wedge is drawn as the diatonic set. Locked, it stays where
@@ -1046,6 +1075,200 @@ protected:
         }
     }
 
+    /* ---- keyboard setup ----------------------------------------------------
+     *
+     * One octave of piano, drawn to scale, with every key clickable. Bindings
+     * repeat in every octave, so editing one key here changes it everywhere on
+     * the controller - which is what makes the scheme playable with one hand
+     * wherever it happens to be.
+     */
+
+    /* White-key index for each pitch class, and -1 for the black keys. */
+    static int whiteIndexFor(int pc)
+    {
+        static const int kIdx[12] = { 0,-1, 1,-1, 2, 3,-1, 4,-1, 5,-1, 6 };
+        return kIdx[((pc % 12) + 12) % 12];
+    }
+
+    Button keyboardArea() const
+    {
+        const float top = chromeTop();
+        return { chromeLeft(), top + 10.0f,
+                 getWidth() - chromeLeft() - 16.0f, 190.0f };
+    }
+
+    Button whiteKeyRect(int pc) const
+    {
+        const Button a = keyboardArea();
+        const float  w = a.w / 7.0f;
+        return { a.x + whiteIndexFor(pc) * w, a.y, w - 2.0f, a.h };
+    }
+
+    /*
+     * Black keys sit between their neighbours, narrower and shorter, as on a
+     * real keyboard. Drawn and hit-tested from the same rect so a click can
+     * never land on a key other than the one under the cursor.
+     */
+    Button blackKeyRect(int pc) const
+    {
+        const Button a = keyboardArea();
+        const float  w = a.w / 7.0f;
+
+        /* Which white key each black one sits after. */
+        int after;
+        switch (((pc % 12) + 12) % 12) {
+            case 1:  after = 0; break;   /* C# */
+            case 3:  after = 1; break;   /* D# */
+            case 6:  after = 3; break;   /* F# */
+            case 8:  after = 4; break;   /* G# */
+            default: after = 5; break;   /* A# */
+        }
+
+        const float bw = w * 0.62f;
+        return { a.x + (after + 1) * w - bw * 0.5f, a.y, bw, a.h * 0.62f };
+    }
+
+    Button keyRect(int pc) const
+    {
+        return isBlackKey(pc) ? blackKeyRect(pc) : whiteKeyRect(pc);
+    }
+
+    /* Black keys first: they overlap the whites, so they must win a hit. */
+    int hitKey(double px, double py) const
+    {
+        for (int pc = 0; pc < 12; ++pc)
+            if (isBlackKey(pc) && hit(blackKeyRect(pc), px, py))
+                return pc;
+        for (int pc = 0; pc < 12; ++pc)
+            if (! isBlackKey(pc) && hit(whiteKeyRect(pc), px, py))
+                return pc;
+        return -1;
+    }
+
+    /* Short label for what a key does, sized for the key it sits on. */
+    void keyBindingLabel(int pc, char* out, size_t outSize) const
+    {
+        const KeyMapEntry& e = fKeyMap[pc];
+        switch (e.action) {
+            case kKeyDegree:
+                std::snprintf(out, outSize, "%s",
+                              kDegreeCell[e.value % kDegreeCount].numeral);
+                break;
+            case kKeyExtension: {
+                static const char* const kShort[kExtCount] = {
+                    "triad", "6th", "7th", "9th", "add9", "sus2", "sus4"
+                };
+                std::snprintf(out, outSize, "%s",
+                              kShort[((e.value % kExtCount) + kExtCount) % kExtCount]);
+                break;
+            }
+            case kKeyGlideToggle:  std::snprintf(out, outSize, "glide");  break;
+            case kKeyLatchToggle:  std::snprintf(out, outSize, "latch");  break;
+            case kKeySingleToggle: std::snprintf(out, outSize, "single"); break;
+            case kKeyPanic:        std::snprintf(out, outSize, "panic");  break;
+            default:               std::snprintf(out, outSize, "—");      break;
+        }
+    }
+
+    void drawKeyboardSetup()
+    {
+        const Button a = keyboardArea();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(11.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.62f, 0.66f, 0.72f));
+        text(a.x, a.y - 14.0f,
+             "Click a key to change what it does. Bindings repeat in every octave.",
+             nullptr);
+
+        /* Whites first, then blacks on top - the same order the hit test uses
+         * in reverse, so what is drawn and what is clickable agree. */
+        for (int pc = 0; pc < 12; ++pc) {
+            if (isBlackKey(pc))
+                continue;
+            drawOneKey(pc, whiteKeyRect(pc), false);
+        }
+        for (int pc = 0; pc < 12; ++pc) {
+            if (! isBlackKey(pc))
+                continue;
+            drawOneKey(pc, blackKeyRect(pc), true);
+        }
+
+        drawPedalRow(a.y + a.h + 24.0f);
+    }
+
+    void drawOneKey(int pc, const Button& r, bool black)
+    {
+        const bool sel = (fEditKey == pc);
+        const KeyMapEntry& e = fKeyMap[pc];
+
+        beginPath();
+        roundedRect(r.x, r.y, r.w, r.h, 3.0f);
+
+        if (sel)                             fillColor(Color(0.98f, 0.72f, 0.24f));
+        else if (black)                      fillColor(Color(0.13f, 0.14f, 0.18f));
+        else if (e.action == kKeyDegree)     fillColor(Color(0.90f, 0.92f, 0.95f));
+        else                                 fillColor(Color(0.72f, 0.75f, 0.80f));
+        fill();
+
+        strokeColor(Color(0.07f, 0.08f, 0.10f));
+        strokeWidth(1.0f);
+        stroke();
+
+        /* An unbound key reads as silent, which is a real state worth seeing. */
+        const bool silent = (e.action == kKeyNone);
+
+        char lbl[24];
+        keyBindingLabel(pc, lbl, sizeof(lbl));
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        textAlign(ALIGN_CENTER | ALIGN_BOTTOM);
+
+        fontSize(black ? 9.5f : 11.0f);
+        if (sel)          fillColor(Color(0.10f, 0.09f, 0.06f));
+        else if (silent)  fillColor(Color(0.45f, 0.30f, 0.30f));
+        else if (black)   fillColor(Color(0.80f, 0.84f, 0.90f));
+        else              fillColor(Color(0.15f, 0.17f, 0.22f));
+        text(r.x + r.w * 0.5f, r.y + r.h - 8.0f, lbl, nullptr);
+
+        /* Note name underneath, so the key is identifiable at a glance. */
+        fontSize(black ? 8.5f : 10.0f);
+        if (sel)        fillColor(Color(0.30f, 0.26f, 0.14f));
+        else if (black) fillColor(Color(0.48f, 0.52f, 0.60f));
+        else            fillColor(Color(0.45f, 0.49f, 0.56f));
+        text(r.x + r.w * 0.5f, r.y + r.h - 22.0f, kPitchName[pc], nullptr);
+    }
+
+    Button pedalButton() const
+    {
+        const Button a = keyboardArea();
+        return { a.x, a.y + a.h + 34.0f, 210.0f, 24.0f };
+    }
+
+    void drawPedalRow(float labelY)
+    {
+        const Button a = keyboardArea();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(11.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.62f, 0.66f, 0.72f));
+        text(a.x, labelY, "Sustain pedal (CC 64):", nullptr);
+
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%s", kPedalActionName[fPedalAction]);
+        drawDropdown(pedalButton(), buf, fOpenMenu == kMenuPedal);
+
+        /* Say why rebinding the pedal is worth doing. */
+        fontSize(10.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.45f, 0.48f, 0.55f));
+        text(a.x + 220.0f, pedalButton().y + 12.0f,
+             "Rebinding the pedal frees a black key for something else.",
+             nullptr);
+    }
+
     /*
      * A slide press is a wheel press.
      *
@@ -1358,6 +1581,18 @@ protected:
                 anchor = slideKeyButton();
                 cur    = fSelectedKey;
                 break;
+            case kMenuBinding:
+                rows   = kBindingRows;
+                /* Hangs off the key being edited, so the list points at what
+                 * it will change. */
+                anchor = keyRect(fEditKey);
+                cur    = bindingRowFor(fEditKey);
+                break;
+            case kMenuPedal:
+                rows   = static_cast<int>(kPedalActionCount);
+                anchor = pedalButton();
+                cur    = static_cast<int>(fPedalAction);
+                break;
             default:   /* kMenuExt */
                 rows   = static_cast<int>(kExtCount);
                 anchor = extButton(fOpenMenuRing);
@@ -1372,6 +1607,8 @@ protected:
             case kMenuVoicing: return kVoicingName[i];
             case kMenuScale:   return kScaleName[i];
             case kMenuKey:     return kMajorLabel[i];
+            case kMenuBinding: return bindingRowLabel(i);
+            case kMenuPedal:   return kPedalActionName[i];
             default:           return kExtensionName[i];
         }
     }
@@ -1411,6 +1648,19 @@ protected:
                         case kMenuKey:
                             selectKey(i);
                             break;
+                        case kMenuBinding: {
+                            KeyAction a;
+                            int       v;
+                            bindingForRow(i, a, v);
+                            fKeyMap[fEditKey].action = a;
+                            fKeyMap[fEditKey].value  = v;
+                            pushKeyMap();
+                            break;
+                        }
+                        case kMenuPedal:
+                            fPedalAction = static_cast<PedalAction>(i);
+                            setState("pedalAction", buf);
+                            break;
                         default: {   /* kMenuExt */
                             fRingExt[fOpenMenuRing] = static_cast<Extension>(i);
                             char key[8];
@@ -1444,6 +1694,21 @@ protected:
             }
         }
 
+        if (fScreen == kScreenKeys) {
+            if (hit(pedalButton(), px, py)) {
+                fOpenMenu = kMenuPedal;
+                repaint();
+                return true;
+            }
+            const int pc = hitKey(px, py);
+            if (pc >= 0) {
+                fEditKey  = pc;
+                fOpenMenu = kMenuBinding;
+                repaint();
+                return true;
+            }
+        }
+
         if (fScreen == kScreenSlide) {
             if (hit(sectionModeButton(), px, py)) {
                 fSectionMode = (fSectionMode == kSectionOctave)
@@ -1466,7 +1731,7 @@ protected:
 
         /* Octave slider: takes the press and keeps receiving motion, so it can
          * be dragged through the octaves while notes sound. */
-        if (hit(octaveSlider(), px, py)) {
+        if (fScreen != kScreenKeys && hit(octaveSlider(), px, py)) {
             fSliderDrag = true;
             sliderTo(py);
             repaint();
@@ -1492,6 +1757,12 @@ protected:
             repaint();
             return true;
         }
+
+        /* Row 1 is not drawn on the setup screen, so it must not be clickable
+         * there either - the monitor and panic above stay live, since those
+         * are useful from any screen. */
+        if (fScreen == kScreenKeys)
+            return false;
 
         if (hit(latchButton(), px, py)) {
             fLatchEnabled = ! fLatchEnabled;
@@ -1982,7 +2253,90 @@ private:
     };
 
     /* Which dropdown is open, if any. */
-    enum OpenMenu { kMenuNone = 0, kMenuExt, kMenuVoicing, kMenuScale, kMenuKey };
+    enum OpenMenu {
+        kMenuNone = 0, kMenuExt, kMenuVoicing, kMenuScale, kMenuKey,
+        kMenuBinding,   /* what a keyboard key does */
+        kMenuPedal
+    };
+
+    /*
+     * The binding menu is one flat list covering every action a key can take,
+     * because a player thinks "what should this key do?" rather than "which
+     * category, then which member". Degrees and extensions are enumerated
+     * inline; the toggles need no argument.
+     */
+    static constexpr int kBindingRows =
+        1 +                                  /* silent */
+        static_cast<int>(kDegreeCount) +     /* I..vii */
+        static_cast<int>(kExtCount) +        /* triad..sus4 */
+        4;                                   /* glide, latch, single, panic */
+
+    /* Decode a row into the binding it sets. */
+    static void bindingForRow(int row, KeyAction& outAction, int& outValue)
+    {
+        if (row == 0) { outAction = kKeyNone; outValue = 0; return; }
+        --row;
+
+        if (row < static_cast<int>(kDegreeCount)) {
+            outAction = kKeyDegree; outValue = row; return;
+        }
+        row -= static_cast<int>(kDegreeCount);
+
+        if (row < static_cast<int>(kExtCount)) {
+            outAction = kKeyExtension; outValue = row; return;
+        }
+        row -= static_cast<int>(kExtCount);
+
+        switch (row) {
+            case 0:  outAction = kKeyGlideToggle;  break;
+            case 1:  outAction = kKeyLatchToggle;  break;
+            case 2:  outAction = kKeySingleToggle; break;
+            default: outAction = kKeyPanic;        break;
+        }
+        outValue = 0;
+    }
+
+    static const char* bindingRowLabel(int row)
+    {
+        static char buf[48];
+        KeyAction a;
+        int       v;
+        bindingForRow(row, a, v);
+
+        switch (a) {
+            case kKeyDegree:
+                std::snprintf(buf, sizeof(buf), "Degree  %s",
+                              kDegreeCell[v].numeral);
+                break;
+            case kKeyExtension:
+                std::snprintf(buf, sizeof(buf), "Chord   %s",
+                              kExtensionName[v]);
+                break;
+            default:
+                std::snprintf(buf, sizeof(buf), "%s", kKeyActionName[a]);
+                break;
+        }
+        return buf;
+    }
+
+    /* Which row a key's current binding corresponds to, for the highlight. */
+    int bindingRowFor(int pc) const
+    {
+        const KeyMapEntry& e = fKeyMap[pc];
+        for (int r = 0; r < kBindingRows; ++r) {
+            KeyAction a;
+            int       v;
+            bindingForRow(r, a, v);
+            if (a != e.action)
+                continue;
+            if (a == kKeyDegree || a == kKeyExtension) {
+                if (v == e.value) return r;
+            } else {
+                return r;
+            }
+        }
+        return 0;
+    }
     OpenMenu fOpenMenu     = kMenuNone;
     int      fOpenMenuRing = 0;
 
@@ -2026,6 +2380,16 @@ private:
     /* Last octave pushed to the DSP, so a drag across strips does not resend
      * an unchanged value on every cell. */
     int fPushedOctave = 4;
+
+    /* ---- keyboard setup state ---------------------------------------------- */
+
+    /* The UI's copy of the bindings. The DSP holds its own, kept in step by
+     * pushKeyMap(); this one exists so the editor can draw without asking. */
+    KeyMapEntry fKeyMap[12];
+    PedalAction fPedalAction = kPedalSustain;
+
+    /* Which key the binding menu is editing. */
+    int fEditKey = 1;   /* C# */
 
     DISTRHO_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FortyFifthUI)
 };
