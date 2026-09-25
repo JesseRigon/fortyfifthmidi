@@ -3,7 +3,7 @@
 # note output, and no audio buses.
 set -uo pipefail
 
-cd /workspaces/fortyfifthmidi 2>/dev/null || cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 echo "=== artifacts ==="
 find bin -maxdepth 4 -type f \( -name '*.clap' -o -name '*.so' \) -exec ls -la {} \;

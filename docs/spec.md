@@ -267,7 +267,7 @@ DAW-specific code for any of this, since correct bus/category declaration
 
 Scaffold stage. What exists:
 
-- Devcontainer, toolchain, DPF vendoring, build scripts.
+- Toolchain, DPF vendoring, per-platform build scripts in scripts/.
 - Correct MIDI-only bus declaration (§3) in `src/DistrhoPluginInfo.h`.
 - Parameter architecture (§5) enforced as described in §5.1.
 - Theory core (§4.1, §6.1) in `src/CircleTheory.hpp`.

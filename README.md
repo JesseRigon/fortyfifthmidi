@@ -8,10 +8,8 @@ Saved state is not guaranteed to survive between versions.
 
 # FortyFifthMidi
 
-A MIDI-generating Circle of Fifths plugin (CLAP + VST3). Click a position on a
-nested wheel to fire a chord; drag between positions to glide between roots.
-
-It emits **MIDI only** — no audio. A downstream instrument makes the sound.
+A MIDI generator (CLAP + VST3). It emits **MIDI only** — no audio. A downstream
+instrument makes the sound.
 
 ## Read this before you install it
 
@@ -49,35 +47,69 @@ was written because something was actually broken.
 The name means nothing. See [docs/lore.md](docs/lore.md) for three invented
 explanations, none of which are true.
 
-## Quick start
+## Building
 
-Open the folder in DevPod (from WSL, not from a remote repo URL):
+Clone it, then run the script for your platform. Each one builds the plugin and
+copies the result into `dist/<platform>/`, ready to move wherever your host
+scans for plugins. Nothing is installed system-wide unless you ask.
 
 ```bash
-devpod up ~/src/fortyfifthmidi --ide vscode
+git clone --recursive https://github.com/JesseRigon/fortyfifthmidi.git
+cd fortyfifthmidi
+
+bash scripts/build-linux.sh      # -> dist/linux/
+bash scripts/build-windows.sh    # -> dist/windows/
+bash scripts/build-macos.sh      # -> dist/macos/
 ```
 
-Then, inside the container:
+`--recursive` matters: DPF is a submodule, and without it the build stops
+immediately. If you already cloned without it, run
+`git submodule update --init --recursive`.
+
+Common flags, where they apply:
+
+| Flag | Effect |
+|---|---|
+| `--clean` | Wipe build artifacts first |
+| `--install` | Also copy into your user plugin folders (Linux, macOS) |
+| `--universal` | arm64 + x86_64 in one bundle (macOS only) |
+
+Each script checks for its own toolchain before starting and tells you what to
+install if something is missing. Where plugins go on each platform is printed
+when the build finishes.
+
+The Windows script works two ways and picks automatically: natively under MSYS2
+or Git Bash with MinGW on `PATH`, or cross-compiled from Linux/WSL with
+`mingw-w64`. macOS must be built on a Mac — Apple's SDK is not redistributable,
+so there is no cross-compile path.
+
+**The macOS script is untested.** Nobody has run it on a Mac. See
+[docs/BUILDING.md](docs/BUILDING.md) for what to expect, including the
+Gatekeeper complaint an unsigned bundle will provoke.
+
+Before believing a build does what it should:
 
 ```bash
-make                          # build into bin/
-bash dev/build.sh --install   # build and install for local Linux hosts
+bash dev/run-tests.sh            # six suites
 ```
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `.devcontainer/` | Container image, lifecycle scripts, numbered installers |
 | `src/CircleTheory.hpp` | Wheel geometry and chord spelling — no plugin types, unit-testable |
 | `src/FortyFifthPlugin.cpp` | MIDI generation, glide state machine |
 | `src/FortyFifthUI.cpp` | Nested-ring wheel, hit-testing, visual feedback |
-| `dev/build.sh` | Build + install helper |
+| `scripts/build-*.sh` | Per-platform build + export to `dist/` |
 | `dev/run-tests.sh` | All six test suites; run this before believing anything |
+| `dev/` | Test sources and local development helpers |
 | `docs/spec.md` | Full development specification |
-| `docs/BUILDING.md` | Cross-compiling for Windows |
+| `docs/BUILDING.md` | Toolchain detail, platform notes, verifying a build |
 | `docs/lore.md` | Invented backstory for the name |
 | `docs/db-plan.md` | Plan for saved progressions; not built yet |
+
+`build/` is the compiler's scratch directory and `bin/` is where the build system
+drops its immediate output. Neither is the thing to copy — take `dist/`.
 
 ## What it does
 
@@ -110,9 +142,16 @@ genuine instrument-level value, such as a future preview synth's filter cutoff.
 
 ## Platform note
 
-The devcontainer is Linux, so `make` produces Linux binaries. They load in Linux
-hosts (Reaper, Bitwig, Carla) and **will not** load in a Windows DAW. To test on
-Windows, see [docs/BUILDING.md](docs/BUILDING.md).
+A plugin only loads on the platform it was built for. A Linux build will not load
+in a Windows DAW and vice versa, even though the file extensions match. If a host
+silently fails to see the plugin, check what you actually built:
+
+```bash
+file dist/*/FortyFifthMidi.clap
+# ELF 64-bit ... => Linux
+# PE32+ ...      => Windows
+# Mach-O ...     => macOS
+```
 
 ## Host notes
 

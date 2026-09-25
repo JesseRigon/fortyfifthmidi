@@ -3,7 +3,7 @@
 # but not to build.
 set -uo pipefail
 
-cd /workspaces/fortyfifthmidi 2>/dev/null || cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 make -C src monitor 2>&1 | tail -40
 status=${PIPESTATUS[0]}

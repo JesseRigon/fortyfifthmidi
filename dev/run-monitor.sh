@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and launch the standalone test rig from WSL, where WSLg supplies a display.
 #
-# Run this from WSL, NOT from inside the devcontainer: the container has no X
+# Run this from a host with a display: a headless shell or container has no X
 # socket mounted. Build artifacts land in bin/ either way, so building here does
 # not disturb anything in the container.
 set -uo pipefail
