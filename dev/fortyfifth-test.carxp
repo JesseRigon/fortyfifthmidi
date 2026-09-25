@@ -1,0 +1,83 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE CARLA-PROJECT>
+<!--
+  FortyFifthMidi test rig.
+
+  A keyboard, the plugin, and a synth - the shortest chain that lets a chord be
+  heard without opening a DAW:
+
+      V49  ->  FortyFifthMidi  ->  Helm  ->  speakers
+               (MIDI in/out)       (synth)
+
+  FortyFifthMidi emits MIDI only, so something has to make the sound. Helm is
+  the synth here because it was already installed; any VST2 or VST3 synth can
+  replace it by swapping the second plugin.
+
+  Carla's rack routes each plugin's output into the next, so the MIDI link is
+  implied by the order and needs no patchbay wiring.
+
+  Open with:  bash dev/carla.sh
+  or on Windows:  dev\carla.bat
+-->
+<CARLA-PROJECT VERSION='2.5'>
+ <EngineSettings>
+  <ForceStereo>false</ForceStereo>
+  <PreferPluginBridges>false</PreferPluginBridges>
+  <PreferUiBridges>true</PreferUiBridges>
+  <UIsAlwaysOnTop>false</UIsAlwaysOnTop>
+  <MaxParameters>200</MaxParameters>
+  <UIBridgesTimeout>4000</UIBridgesTimeout>
+ </EngineSettings>
+
+ <Transport>
+  <BeatsPerMinute>120</BeatsPerMinute>
+ </Transport>
+
+ <!--
+   The plugin under test. Carla wants the binary INSIDE the .vst3 bundle, not
+   the bundle directory - pointing at the directory fails discovery with an
+   assertion about the file type.
+ -->
+ <Plugin>
+  <Info>
+   <Type>VST3</Type>
+   <Name>FortyFifthMidi</Name>
+   <URI></URI>
+   <Label>FortyFifthMidi</Label>
+   <Binary>J:\My Drive\Life\5 Media\Music\VSTs\fortyfifthmidi\FortyFifthMidi.vst3\Contents\x86_64-win\FortyFifthMidi.vst3</Binary>
+  </Info>
+  <Data>
+   <Active>Yes</Active>
+   <Volume>1</Volume>
+   <DryWet>1</DryWet>
+   <Balance-Left>-1</Balance-Left>
+   <Balance-Right>1</Balance-Right>
+   <Panning>0</Panning>
+   <ControlChannel>N</ControlChannel>
+   <Options>0x0</Options>
+  </Data>
+ </Plugin>
+
+ <!--
+   The synth. Second in the rack, so it receives the plugin's MIDI output.
+ -->
+ <Plugin>
+  <Info>
+   <Type>VST2</Type>
+   <Name>Helm</Name>
+   <URI></URI>
+   <Label>helm64</Label>
+   <Binary>J:\My Drive\Life\5 Media\Music\VSTs\Helm\helm64.dll</Binary>
+  </Info>
+  <Data>
+   <Active>Yes</Active>
+   <Volume>1</Volume>
+   <DryWet>1</DryWet>
+   <Balance-Left>-1</Balance-Left>
+   <Balance-Right>1</Balance-Right>
+   <Panning>0</Panning>
+   <ControlChannel>N</ControlChannel>
+   <Options>0x0</Options>
+  </Data>
+ </Plugin>
+</CARLA-PROJECT>
