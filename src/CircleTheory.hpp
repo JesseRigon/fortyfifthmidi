@@ -1384,15 +1384,33 @@ struct ActiveCells {
             ring[i].store(0, std::memory_order_relaxed);
     }
 
-    /* Audio thread. */
+    /*
+     * Audio thread.
+     *
+     * The ring is RANGE-CHECKED, not trusted. Callers derive it from a group's
+     * source word, and two sources are sentinels rather than packed cells -
+     * kProgSource (0xF000) and kMergedSource (-2) decode to ring 240 and ring
+     * 255. Those indexed kRingSegments[] and ring[] straight past the end of
+     * both three-element arrays, reading a garbage segment count and writing
+     * over whatever followed. The visible symptom was cells lighting up that
+     * nothing had played.
+     *
+     * A sentinel has no cell to light, so it is dropped here. Silently: it is
+     * not an error for the sequencer to have no wheel cell, it simply has
+     * none.
+     */
     void set(Ring r, int position, bool on)
     {
-        const int n = kRingSegments[r];
+        const int idx = static_cast<int>(r);
+        if (idx < 0 || idx >= kRingCount)
+            return;
+
+        const int n = kRingSegments[idx];
         const uint32_t bit = 1u << (((position % n) + n) % n);
 
-        uint32_t cur = ring[r].load(std::memory_order_relaxed);
-        ring[r].store(on ? (cur | bit) : (cur & ~bit),
-                      std::memory_order_release);
+        uint32_t cur = ring[idx].load(std::memory_order_relaxed);
+        ring[idx].store(on ? (cur | bit) : (cur & ~bit),
+                        std::memory_order_release);
     }
 
     void clear()
@@ -1401,12 +1419,16 @@ struct ActiveCells {
             ring[i].store(0, std::memory_order_release);
     }
 
-    /* UI thread. */
+    /* UI thread. Range-checked for the same reason set() is. */
     bool isOn(Ring r, int position) const
     {
-        const int n = kRingSegments[r];
+        const int idx = static_cast<int>(r);
+        if (idx < 0 || idx >= kRingCount)
+            return false;
+
+        const int n = kRingSegments[idx];
         const uint32_t bit = 1u << (((position % n) + n) % n);
-        return (ring[r].load(std::memory_order_acquire) & bit) != 0;
+        return (ring[idx].load(std::memory_order_acquire) & bit) != 0;
     }
 
     bool any() const

@@ -998,6 +998,18 @@ private:
     struct VoiceGroup {
         bool      active    = false;
         int       source    = -1;   /* packed position|ring that started it */
+        /*
+         * The cell this group LIT, kept apart from source.
+         *
+         * source is reassigned while the group is still sounding: a merge sets
+         * it to kMergedSource so a later move does not try to move the group
+         * again. That destroyed the only record of which cell had been lit, so
+         * stopGroup() could not turn it off and the highlight stayed on
+         * forever with nothing playing.
+         *
+         * -1 when this group has no cell, which is the sequencer's case.
+         */
+        int       litCell   = -1;
         int       root      = 0;
         ChordType type      = kChordMajor;
         Ring      ring      = kRingKey;
@@ -1041,6 +1053,27 @@ private:
     static Ring ring_from_source(int source)
     {
         return static_cast<Ring>((source >> 8) & 0xFF);
+    }
+
+    /*
+     * Whether a source is a real wheel cell rather than a sentinel.
+     *
+     * kProgSource and kMergedSource are NOT packed cells - they decode to ring
+     * 240 and ring 255, well past the three that exist. Feeding either to the
+     * highlight indexed both kRingSegments[] and the ring array out of bounds,
+     * which is how cells lit up that nothing had played.
+     *
+     * The sequencer and a merged group have no wheel cell to light, which is
+     * a fact about them rather than an error.
+     */
+    static bool sourceIsCell(int source)
+    {
+        if (source < 0)
+            return false;
+        const int ring = (source >> 8) & 0xFF;
+        if (ring < 0 || ring >= kRingCount)
+            return false;
+        return position_from_source(source) < segmentsInRing(static_cast<Ring>(ring));
     }
 
     VoiceGroup* findGroup(int source)
@@ -1181,10 +1214,27 @@ private:
             return;
         }
 
-        /* Light the cell. Driven from the group rather than from the gesture,
+        /*
+         * Light the cell. Driven from the group rather than from the gesture,
          * so the UI shows what is actually SOUNDING - including notes played
-         * from a MIDI keyboard, which never pass through the UI at all. */
-        fCells.set(ring, position_from_source(source), true);
+         * from a MIDI keyboard, which never pass through the UI at all.
+         *
+         * Lit from the SOURCE, and only when the source is a real cell.
+         *
+         * This used to take the ring from the parameter but the position from
+         * the source, which for a sentinel is a real ring paired with position
+         * 0. So the sequencer lit cell 0 of whichever ring its chord landed on,
+         * while stopGroup() went to clear ring 240 and missed - leaving a cell
+         * lit that nothing was playing, with no way to turn it off. That is the
+         * errant highlight: chords sounded correctly throughout, because the
+         * audio path never consulted any of this.
+         */
+        if (sourceIsCell(source)) {
+            g->litCell = source;
+            fCells.set(ring_from_source(source), position_from_source(source), true);
+        } else {
+            g->litCell = -1;
+        }
 
         /* Remember this chord as the reference the next one leads from. Kept
          * even after the chord stops, so a gap between chords still leads
@@ -1242,18 +1292,28 @@ private:
          * and clearing unconditionally would darken a cell that is still
          * sounding, which is the highlight telling a lie.
          */
-        const int  src  = g->source;
-        const Ring r    = ring_from_source(src);
-        const int  pos  = position_from_source(src);
+        /*
+         * Unlight by litCell, not by source.
+         *
+         * source can have been reassigned since this group started - a merge
+         * sets it to kMergedSource - so it no longer says which cell was lit.
+         * litCell is written once, when the cell is lit, and never changes.
+         */
+        const int  cell = g->litCell;
+        const Ring r    = ring_from_source(cell);
+        const int  pos  = position_from_source(cell);
 
-        g->active = false;
-        g->count  = 0;
-        g->source = -1;
+        g->active  = false;
+        g->count   = 0;
+        g->source  = -1;
+        g->litCell = -1;
 
-        if (src >= 0) {
+        /* Only a group that lit a cell has one to clear. The sequencer lights
+         * none, and neither does a group whose voices were all refused. */
+        if (sourceIsCell(cell)) {
             bool stillHeld = false;
             for (int i = 0; i < kMaxGroups && ! stillHeld; ++i)
-                stillHeld = (fGroup[i].active && fGroup[i].source == src);
+                stillHeld = (fGroup[i].active && fGroup[i].litCell == cell);
             if (! stillHeld)
                 fCells.set(r, pos, false);
         }
