@@ -199,6 +199,81 @@ int main()
            readSettings(word, seen, glide, latch, single), "wrapped to 0");
     }
 
+
+    /* --- the pinned wedge -------------------------------------------- */
+    /*
+     * Pinning the wedge pins the KEY, not merely the drawing.
+     *
+     * It used to pin only the highlight, on the reasoning that the wedge is a
+     * reading aid while the keyboard's mapping is a separate question. That
+     * split the plugin against itself: clicking F on the key ring with the
+     * wedge pinned to C left the screen showing C's diatonic set, with F
+     * labelled IV, while the keyboard remapped to F - so pressing C played F
+     * major. Every label said one key and the keys played another.
+     */
+    std::printf("\n=== a pinned wedge pins the key ===\n");
+    {
+        /* Mirrors FortyFifthUI: selectKey() refuses while pinned, setKey()
+         * does not. Both keep fSelectedKey and fLockedKey in step. */
+        struct Wheel {
+            int  selected = 0;      /* C */
+            int  locked   = 0;
+            bool pinned   = false;
+
+            void setKey(int k) {
+                k = ((k % 12) + 12) % 12;
+                if (k == selected) return;
+                selected = k;
+                locked   = k;
+            }
+            void selectKey(int k) { if (! pinned) setKey(k); }
+            int  highlightKey() const { return pinned ? locked : selected; }
+        };
+
+        Wheel w;
+
+        /* Unpinned, a wheel click still picks the key - that must not regress. */
+        w.selectKey(5);                       /* click F on the key ring */
+        ok("unpinned: a wheel click picks the key", w.selected == 5, "F");
+        ok("and the wedge follows it", w.highlightKey() == 5, "F");
+
+        /* Pin on C, then click F. */
+        w.setKey(0);
+        w.pinned = true;
+        w.selectKey(5);                       /* the reported gesture */
+        ok("pinned: clicking F leaves the key alone", w.selected == 0, "still C");
+        ok("and the wedge stays put",  w.highlightKey() == 0, "still C");
+
+        /* The exact disagreement that was reported: the keyboard maps against
+         * fSelectedKey, the labels against highlightKey(). Pinned, they must
+         * never differ, or pressing C plays a chord the screen calls IV. */
+        bool diverged = false;
+        for (int click = 0; click < 12; ++click) {
+            w.selectKey(click);
+            if (w.selected != w.highlightKey()) { diverged = true; break; }
+        }
+        ok("12 clicks never split label from mapping", ! diverged,
+           "one key everywhere");
+
+        /* What the keyboard actually resolves to has to stay in the pinned
+         * key. C is bound to I, so it must keep sounding C major. */
+        int  pos; Ring ring;
+        cellForMidiNote(kDefaultKeyMap, 0, w.selected, pos, ring);
+        ok("pressing C still plays the pinned key's I",
+           rootForPosition(pos, ring) == 0, "C major");
+
+        /* The dropdown is a deliberate statement, so it overrides the pin -
+         * otherwise the only way to change key would be to unpin first. */
+        w.setKey(7);
+        ok("the KEY dropdown still works while pinned", w.selected == 7, "G");
+        ok("and the wedge moves with it", w.highlightKey() == 7, "G");
+
+        /* Unpinning must not snap back to some older key. */
+        w.pinned = false;
+        ok("unpinning keeps the key it was on", w.selected == 7, "G");
+        ok("and the wedge agrees", w.highlightKey() == 7, "G");
+    }
+
     std::printf("\n%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

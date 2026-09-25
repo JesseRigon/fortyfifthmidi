@@ -261,9 +261,10 @@ protected:
          * glance; the diminished ring is dimmest, matching its lighter use. */
         /* A cell belonging to the highlighted key's wedge is lifted, so the
          * seven diatonic chords read as one shape - the whole point of the
-         * wheel. This is the ONLY thing key lock governs: it pins the wedge so
-         * the reference stays put while you play outside it. What the keyboard
-         * maps to is a separate question, answered by fSelectedKey. */
+         * wheel. Pinning holds this wedge in place while you play outside it,
+         * and holds the key with it: the highlight is how the player knows
+         * which key they are in, so it cannot disagree with what the keyboard
+         * plays. See selectKey(). */
         const CellRole role    = roleInKey(index, ring, highlightKey());
         const bool     inWedge = (role != kCellOutside);
 
@@ -770,25 +771,49 @@ protected:
     /*
      * Choose the key, and tell the DSP.
      *
-     * Key lock and the keyboard's key are two different questions, and
-     * conflating them was wrong. Lock governs only which wedge stays
-     * HIGHLIGHTED - a reading aid, so the diatonic set can stay put while you
-     * play a chord outside it. The keyboard's mapping is a different matter:
-     * whatever cell is selected and in focus is the key you are playing in, so
-     * pressing C should sound that key's I whether or not the highlight is
-     * pinned. Gating this on the lock meant a locked wheel left the keyboard
-     * stuck in whatever key was last unlocked.
+     * A PINNED WEDGE PINS THE KEY, for everything and not merely for the
+     * drawing.
      *
-     * fSelectedKey therefore always tracks the selection; only the wedge
-     * drawing consults fKeyLocked.
+     * It used to pin only the highlight, on the reasoning that the wedge is a
+     * reading aid and the keyboard's mapping is a separate question. That
+     * split the plugin against itself. Clicking F on the key ring with the
+     * wedge pinned to C left the screen showing C's diatonic set, with F
+     * labelled IV - while the keyboard silently remapped to F, so pressing C
+     * played F major. Every label on screen said one key and the keys in your
+     * hands played another.
+     *
+     * Pinning is the gesture for "stay in this key while I play outside it".
+     * Honouring that for the highlight but not for the mapping is the one
+     * reading that cannot be right, because the highlight is precisely how the
+     * player knows which key they are in.
+     *
+     * So the pin is now refused here, and a click on a pinned wheel still
+     * SOUNDS the chord - it just does not move the key out from under it.
+     * Unpin to change key, which is what the button is for.
      */
     void selectKey(int keyIndex)
+    {
+        if (fKeyLocked)
+            return;
+        setKey(keyIndex);
+    }
+
+    /*
+     * Set the key outright, pin or no pin.
+     *
+     * For the KEY dropdown and for restored state, which are unambiguous
+     * statements of intent rather than a side effect of playing a chord. The
+     * pin exists to stop a stray click moving the key; it must not make the
+     * key unchangeable, or the only way out would be to unpin first.
+     */
+    void setKey(int keyIndex)
     {
         const int k = ((keyIndex % 12) + 12) % 12;
         if (k == fSelectedKey)
             return;
 
         fSelectedKey = k;
+        fLockedKey   = k;   /* the pin follows a deliberate change */
 
         /* The DSP resolves an incoming MIDI note to a cell by degree, so it
          * cannot map anything without knowing the key. */
@@ -856,9 +881,9 @@ protected:
             if (pos < 0)
                 return false;
 
-            /* Clicking the key ring picks the key. Key lock governs only the
-             * highlighted wedge - see selectKey() for why the keyboard follows
-             * the selection regardless. */
+            /* Clicking the key ring picks the key, unless the wedge is pinned -
+             * then the chord still sounds, but the key stays put. That is what
+             * pinning is for. See selectKey(). */
             if (ring == kRingKey)
                 selectKey(pos);
 
@@ -4096,7 +4121,9 @@ protected:
                             fPointerSlide = -1;
                             break;
                         case kMenuKey:
-                            selectKey(i);
+                            /* Deliberate, so it overrides the pin - see
+                             * setKey(). */
+                            setKey(i);
                             break;
                         case kMenuBinding: {
                             KeyAction a;
@@ -4368,10 +4395,9 @@ protected:
             return true;
         }
 
-        /* Key lock pins the highlighted wedge, and nothing else. Engaging it
-         * captures whatever key is selected now, so the wedge freezes where the
-         * user is looking rather than at some earlier key. The keyboard keeps
-         * following the selection either way. */
+        /* Pinning freezes the wedge AND the key at whatever is selected now, so
+         * both stay where the user is looking. Wheel clicks then sound chords
+         * without moving the key; the KEY dropdown still changes it. */
         /* Only where it is drawn: an invisible hit box would swallow clicks
          * meant for whatever moved into its place. */
         if (screenUsesWedge() && hit(keyLockButton(), px, py)) {
@@ -5062,11 +5088,12 @@ protected:
         else if (std::strcmp(key, "glideMode") == 0)
             fGlideMode = clampEnum<GlideMode>(v, kGlideModeCount);
         else if (std::strcmp(key, "selectedKey") == 0) {
+            /* A restored key is the key that was in use, so the pinned wedge
+             * moves with it unconditionally. Leaving fLockedKey behind would
+             * reopen the project showing one key's wedge over another key's
+             * chords - the very disagreement the pin is meant to prevent. */
             fSelectedKey = ((v % 12) + 12) % 12;
-            /* The pinned wedge follows a restored key, or the highlight would
-             * point at whatever key the editor happened to start on. */
-            if (! fKeyLocked)
-                fLockedKey = fSelectedKey;
+            fLockedKey   = fSelectedKey;
         }
         else if (std::strcmp(key, "singleNotes") == 0)
             fSingleNotes = (v != 0);
@@ -5619,8 +5646,9 @@ private:
     OpenMenu fOpenMenu     = kMenuNone;
     int      fOpenMenuRing = 0;
 
-    /* When locked, the highlighted wedge stays where it was pinned - the
-     * chord still sounds and the keyboard still follows the selection. */
+    /* When pinned, the wedge AND the key stay where they were - a click on the
+     * wheel still sounds its chord, but does not move the key out from under
+     * the labels. The KEY dropdown overrides it, being deliberate. */
     bool fKeyLocked = false;
     int  fLockedKey = 0;
 
