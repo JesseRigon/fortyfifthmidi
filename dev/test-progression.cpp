@@ -399,7 +399,7 @@ int main()
 
         /* Rebind a few, including to actions with no argument. */
         map[0]  = { kKeyLatchToggle, 0 };
-        map[3]  = { kKeyExtension,   kExtSus2 };
+        map[3]  = { kKeyDegree,      kDegreeSecII };
         map[7]  = { kKeyPanic,       0 };
         map[11] = { kKeyNone,        0 };
 

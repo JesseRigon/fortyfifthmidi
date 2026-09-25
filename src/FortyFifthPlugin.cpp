@@ -864,6 +864,25 @@ private:
         return "gesture";
     }
 
+    /*
+     * Tell the editor about a settings change the keyboard or pedal just made.
+     *
+     * These controls act on the DSP directly, because they must take effect on
+     * the next chord rather than after a round trip through the host. That left
+     * the editor showing stale values: pressing C# toggled glide in the engine
+     * while the button on screen went on claiming the old mode, and the two
+     * only agreed again once the mouse touched something.
+     *
+     * The sequence number is what makes this safe to poll. Without it the UI
+     * cannot tell a genuine change from its own value coming back - the same
+     * trap the octave state key fell into.
+     */
+    void publishSettings()
+    {
+        fCells.publishSettings(++fSettingsSeq, static_cast<int>(fGlideMode),
+                               fLatchEnabled, fSingleNotes);
+    }
+
     void logLine(const char* fmt, ...)
     {
         if (! fLogEnabled.load(std::memory_order_relaxed))
@@ -1685,18 +1704,29 @@ private:
         }
 
         /*
-         * The sequencer screen takes the keyboard out of circuit entirely.
+         * THE KEYBOARD PLAYS ON THE CIRCLE SCREEN AND NOWHERE ELSE.
          *
-         * There, chords come from the grid and the transport; a key press
-         * would sound a chord the grid did not ask for and, worse, would fight
-         * the sequencer for the same voices. Nothing is passed through either:
-         * the plugin is a generator, and forwarding raw notes would put the
-         * played key into the output alongside the sequenced chord.
+         * It resolves a key to a degree, and a degree to a cell on the wheel -
+         * so the wheel is the only screen whose contents it can actually
+         * address. On the others it was playing chords that had nothing to do
+         * with what was on screen:
          *
-         * The pedal is included. Its actions - glide, legato, panic - all act
-         * on hand playing that cannot happen here.
+         *   Slide         strips carry their own extensions and octave shifts,
+         *                 pushed per press. A key press took whatever the last
+         *                 strip happened to leave behind, so it sounded a
+         *                 chord no strip was showing, and lit cells the player
+         *                 had not touched.
+         *   Progressions  chords come from the grid and the transport; a key
+         *                 press fought the sequencer for the same voices.
+         *
+         * Nothing is passed through either: the plugin is a generator, and
+         * forwarding raw notes would put the played key into the output
+         * underneath whatever the screen is producing.
+         *
+         * The pedal is included. Its actions - glide, latch, panic - all act
+         * on hand playing, which only happens here.
          */
-        if (fUiScreen.load(std::memory_order_acquire) == kUiScreenProgressions)
+        if (fUiScreen.load(std::memory_order_acquire) != kUiScreenCircle)
             return;
 
         const uint8_t status = ev.data[0] & 0xF0;
@@ -1734,7 +1764,7 @@ private:
                         fGlideMode = kGlideOff;
                     }
                     fLastChordCount = 0;
-                    fSettingsEcho.store(true, std::memory_order_release);
+                    publishSettings();
                     break;
 
                 case kPedalLatch:
@@ -1742,7 +1772,7 @@ private:
                         fLatchEnabled = ! fLatchEnabled;
                         if (! fLatchEnabled)
                             stopAllGroups(ev.frame);
-                        fSettingsEcho.store(true, std::memory_order_release);
+                        publishSettings();
                     }
                     break;
 
@@ -1750,7 +1780,7 @@ private:
                     if (down && ! wasDown) {
                         fSingleNotes = ! fSingleNotes;
                         fLastChordCount = 0;
-                        fSettingsEcho.store(true, std::memory_order_release);
+                        publishSettings();
                     }
                     break;
 
@@ -1818,14 +1848,14 @@ private:
              * rule, which is what keeps a control press from editing MIDI that
              * has already gone out.
              */
-            case kKeyExtension:
-                if (isNoteOn) {
-                    const Extension x = static_cast<Extension>(
-                        ((e.value % kExtCount) + kExtCount) % kExtCount);
-                    for (int r = 0; r < kRingCount; ++r)
-                        fRingExtension[r] = x;
-                    fSettingsEcho.store(true, std::memory_order_release);
-                }
+            case kKeyRetiredExt:
+                /*
+                 * Was "chord type". It set the extension on every ring at
+                 * once, fighting the wheel for the same state: the circle's
+                 * cells were silently rewritten and the circle never redrew to
+                 * say so. Chord type comes from the cell now. A key still bound
+                 * to this by an old saved map is silent.
+                 */
                 return;
 
             case kKeyGlideToggle:
@@ -1841,7 +1871,7 @@ private:
                         fGlideMode  = kGlideOff;
                     }
                     fLastChordCount = 0;
-                    fSettingsEcho.store(true, std::memory_order_release);
+                    publishSettings();
                 }
                 return;
 
@@ -1851,7 +1881,7 @@ private:
                     /* Leaving latch with chords held would strand them. */
                     if (! fLatchEnabled)
                         stopAllGroups(ev.frame);
-                    fSettingsEcho.store(true, std::memory_order_release);
+                    publishSettings();
                 }
                 return;
 
@@ -1859,7 +1889,7 @@ private:
                 if (isNoteOn) {
                     fSingleNotes = ! fSingleNotes;
                     fLastChordCount = 0;
-                    fSettingsEcho.store(true, std::memory_order_release);
+                    publishSettings();
                 }
                 return;
 
@@ -2404,12 +2434,12 @@ private:
      * Which screen the editor is showing.
      *
      * The DSP is otherwise screen-agnostic by design - a strip and a wedge
-     * send the same gesture - but the sequencer screen genuinely changes what
-     * incoming MIDI means, so this one fact has to cross. Only the value the
-     * gate needs is defined, rather than mirroring the UI's whole enum.
+     * send the same gesture - but which screen is showing genuinely changes
+     * what incoming MIDI means, so this one fact has to cross. Only the value
+     * the gate needs is defined, rather than mirroring the UI's whole enum.
      */
-    static constexpr int kUiScreenProgressions = 3;
-    std::atomic<int32_t> fUiScreen { 1 };   /* circle, as the UI starts */
+    static constexpr int kUiScreenCircle = 1;
+    std::atomic<int32_t> fUiScreen { kUiScreenCircle };  /* as the UI starts */
 
     /* The chord most recently started, as the reference the next one leads
      * from. Kept after it stops, so a gap between chords still leads smoothly
@@ -2485,7 +2515,12 @@ private:
 
     /* Set when a key or pedal changed a setting, so the UI can re-read it and
      * keep its buttons honest. */
-    std::atomic<bool> fSettingsEcho { false };
+    /*
+     * Bumped on every keyboard- or pedal-driven settings change, so the editor
+     * can tell a real change from its own value coming back. Only the audio
+     * thread writes it, and only through publishSettings().
+     */
+    uint32_t fSettingsSeq = 0;
 
     /*
      * Keys physically down, in the order they were pressed.

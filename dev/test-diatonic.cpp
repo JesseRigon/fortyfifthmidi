@@ -153,10 +153,17 @@ int main()
         }
     }
 
-    /* The whole diatonic set, in C, printed - this is the table a reader
-     * wants to see when asking "what does this plugin actually build?". */
+    /*
+     * The whole diatonic set, in C, printed - this is the table a reader
+     * wants to see when asking "what does this plugin actually build?".
+     *
+     * kDegreeDiatonicCount, not kDegreeCount: the two secondary dominants live
+     * past it and are DELIBERATELY out of key. II in C is D-F#-A, and the F# is
+     * the whole point - it is what makes V-of-V pull towards G. They get their
+     * own checks below, which assert the opposite property.
+     */
     std::printf("\n=== every degree, every extension, in C ===\n");
-    for (int d = 0; d < kDegreeCount; ++d)
+    for (int d = 0; d < kDegreeDiatonicCount; ++d)
         for (int e = 0; e < kExtCount; ++e)
             checkDegree(static_cast<Degree>(d), static_cast<Extension>(e),
                         0, true);
@@ -165,13 +172,13 @@ int main()
      * be invisible in C alone. */
     std::printf("\n=== the same, across all twelve keys ===\n");
     for (int k = 0; k < 12; ++k)
-        for (int d = 0; d < kDegreeCount; ++d)
+        for (int d = 0; d < kDegreeDiatonicCount; ++d)
             for (int e = 0; e < kExtCount; ++e)
                 checkDegree(static_cast<Degree>(d), static_cast<Extension>(e),
                             k, false);
     if (failures == 0)
         std::printf("  ok    %-30s %d combinations\n",
-                    "all keys clean", 12 * kDegreeCount * kExtCount);
+                    "all keys clean", 12 * kDegreeDiatonicCount * kExtCount);
 
     /*
      * Secondary dominants. II and III on the key ring are V-of-V and V-of-vi:

@@ -200,26 +200,50 @@ int main()
     }
 
     /*
-     * Black keys are controls, not notes. The important property is that none
-     * of them plays a degree - if one did it would sound a chord where the
-     * player expected a setting change.
+     * What each black key does now.
+     *
+     * They used to be controls uniformly, and the property tested here was
+     * that none of them played a chord. That is no longer the contract: D# and
+     * F# play the two secondary dominants, which is the point of them. What
+     * still holds is that a black key either plays a degree or changes a
+     * setting - never both, and never a chord type.
+     *
+     *   C#  glide toggle
+     *   D#  II   secondary dominant
+     *   F#  III  secondary dominant
+     *   G#  silent, rebindable
+     *   A#  silent, rebindable
      */
-    std::printf("\n=== black keys are controls, never degrees ===\n");
+    std::printf("\n=== black keys ===\n");
     {
-        static const int kBlack[5] = { 1, 3, 6, 8, 10 };
+        struct Expect { int pc; KeyAction action; int value; const char* what; };
+        static const Expect kBlack[5] = {
+            { 1,  kKeyGlideToggle, 0,              "glide toggle"   },
+            { 3,  kKeyDegree,      kDegreeSecII,   "II  (secondary)"},
+            { 6,  kKeyDegree,      kDegreeSecIII,  "III (secondary)"},
+            { 8,  kKeyNone,        0,              "silent"         },
+            { 10, kKeyNone,        0,              "silent"         },
+        };
+
         for (int i = 0; i < 5; ++i) {
-            const int pc = kBlack[i];
+            const Expect&      x = kBlack[i];
+            const KeyMapEntry& e = kDefaultKeyMap[x.pc];
+
             int  pos;
             Ring ring;
             const bool playsChord =
-                cellForMidiNote(kDefaultKeyMap, pc, 0, pos, ring);
-            const KeyAction a = kDefaultKeyMap[pc].action;
+                cellForMidiNote(kDefaultKeyMap, x.pc, 0, pos, ring);
 
-            if (! playsChord && a != kKeyDegree) {
-                std::printf("  ok    %-6s %-24s\n", kPitch[pc],
-                            kKeyActionName[a]);
+            const bool okAction = (e.action == x.action) &&
+                                  (x.action != kKeyDegree || e.value == x.value);
+            /* Plays a chord exactly when it is bound to a degree - no key may
+             * both sound something and change a setting. */
+            const bool okSound  = (playsChord == (x.action == kKeyDegree));
+
+            if (okAction && okSound) {
+                std::printf("  ok    %-6s %s\n", kPitch[x.pc], x.what);
             } else {
-                std::printf("  FAIL  %-6s plays a chord\n", kPitch[pc]);
+                std::printf("  FAIL  %-6s expected %s\n", kPitch[x.pc], x.what);
                 ++failures;
             }
         }
@@ -249,24 +273,51 @@ int main()
      * of them to the same thing would waste a key and look like a bug under
      * the fingers.
      */
-    std::printf("\n=== the four chord keys are distinct ===\n");
+    /*
+     * No black key selects a chord type any more.
+     *
+     * They used to, and the binding set the extension on every ring at once -
+     * the same per-ring state the wheel's cells drive. A key press silently
+     * rewrote what the circle was showing, and the circle never redrew to say
+     * so. Chord type comes from the cell now, so the keyboard cannot
+     * contradict what is on screen.
+     *
+     * D# and F# carry the two secondary dominants instead; G# and A# are
+     * silent and rebindable.
+     */
+    std::printf("\n=== no key selects a chord type ===\n");
     {
-        int seen[kExtCount] = {0};
-        int count = 0;
-        bool dup = false;
-        for (int pc = 0; pc < 12; ++pc) {
-            if (kDefaultKeyMap[pc].action != kKeyExtension)
-                continue;
-            ++count;
-            const int v = kDefaultKeyMap[pc].value;
-            if (v < 0 || v >= kExtCount) { dup = true; break; }
-            if (seen[v]++) dup = true;
-        }
-        if (count == 4 && ! dup) {
-            std::printf("  ok    %-30s 4 distinct extensions\n", "D# F# G# A#");
+        int extKeys = 0;
+        for (int pc = 0; pc < 12; ++pc)
+            if (kDefaultKeyMap[pc].action == kKeyRetiredExt)
+                ++extKeys;
+
+        if (extKeys == 0) {
+            std::printf("  ok    %-30s chord type comes from the cell\n",
+                        "no chord-type bindings");
         } else {
-            std::printf("  FAIL  %-30s %d keys, duplicates=%s\n",
-                        "D# F# G# A#", count, dup ? "yes" : "no");
+            std::printf("  FAIL  %-30s %d keys still bound to it\n",
+                        "no chord-type bindings", extKeys);
+            ++failures;
+        }
+
+        const bool secs = kDefaultKeyMap[3].action  == kKeyDegree &&
+                          kDefaultKeyMap[3].value   == kDegreeSecII &&
+                          kDefaultKeyMap[6].action  == kKeyDegree &&
+                          kDefaultKeyMap[6].value   == kDegreeSecIII;
+        if (secs) {
+            std::printf("  ok    %-30s D#=II  F#=III\n", "secondary dominants");
+        } else {
+            std::printf("  FAIL  %-30s not on D# and F#\n", "secondary dominants");
+            ++failures;
+        }
+
+        const bool quiet = kDefaultKeyMap[8].action  == kKeyNone &&
+                           kDefaultKeyMap[10].action == kKeyNone;
+        if (quiet) {
+            std::printf("  ok    %-30s G# and A# are silent\n", "freed keys");
+        } else {
+            std::printf("  FAIL  %-30s G#/A# are bound\n", "freed keys");
             ++failures;
         }
     }

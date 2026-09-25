@@ -1072,32 +1072,67 @@ protected:
     /* Height of the piano-roll body when open. */
     static constexpr float kRollH = 86.0f;
 
+    /* The keyboard settings panel: one octave of piano plus its caption. */
+    static constexpr float kKeysPanelH = 132.0f;
+
     /*
-     * Two independent panels stacked at the bottom, each with its own header
-     * and its own collapsed state: the keyboard is useful on its own, and
-     * having to open the text stream to see it would defeat the point.
+     * Three independent panels stacked at the bottom, each with its own header
+     * and its own collapsed state.
      *
-     *   [ log body    ]  optional
-     *   [ MIDI Monitor ] header
-     *   [ roll body    ]  optional
-     *   [ Notes        ] header
+     *   [ Keyboard  ]  header    circle screen only
+     *   [ body      ]  optional
+     *   [ Event log ]  header
+     *   [ body      ]  optional
+     *   [ Notes     ]  header
+     *   [ body      ]  optional
+     *
+     * Keyboard leads because it is a SETTING; the log and the roll are
+     * readouts, and a readout belongs beneath what it reports on.
+     *
+     * It appears only on the circle screen, because that is the only screen the
+     * keyboard plays on - see the gate in handleMidiIn(). Showing keyboard
+     * settings on a screen where the keyboard is inert would be the same lie
+     * the old chord-type keys told.
      */
+    float keysBodyH() const { return kKeysPanelH; }
+    float logBodyH()  const { return kLogLines * 14.0f + 10.0f; }
+
+    /* The keyboard panel appears only where the keyboard plays. */
+    bool hasKeysPanel() const { return fScreen == kScreenCircle; }
+
     float chromeBottom() const
     {
-        return kHeaderH * 2.0f
-             + (fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f)
-             + (fRollOpen    ? kRollH : 0.0f);
+        return kHeaderH * (hasKeysPanel() ? 3.0f : 2.0f)
+             + (hasKeysPanel() && fKeysOpen ? keysBodyH() : 0.0f)
+             + (fMonitorOpen ? logBodyH() : 0.0f)
+             + (fRollOpen    ? kRollH    : 0.0f);
     }
 
-    /* Bottom-up stacking: the roll sits under the log, so opening one does not
-     * move the other's header out from under the pointer. */
-    float rollHeaderY() const { return getHeight() - kHeaderH; }
-    float rollBodyY()   const { return rollHeaderY() - (fRollOpen ? kRollH : 0.0f); }
-    float logHeaderY()  const { return rollBodyY() - kHeaderH; }
-    float logBodyY()    const
+    /*
+     * TOP-DOWN: every header sits ABOVE its own body.
+     *
+     * A toggle underneath the thing it toggles reads backwards - you look at a
+     * panel, then hunt below it for the control that closes it. Worse, with the
+     * old bottom-up stacking, opening a panel pushed the headers below it
+     * downward, so the row under the pointer was no longer the row that had
+     * just been clicked.
+     */
+    float keysHeaderY() const { return getHeight() - chromeBottom(); }
+    float keysBodyY()   const { return keysHeaderY() + kHeaderH; }
+
+    float logHeaderY() const
     {
-        return logHeaderY() - (fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f);
+        return keysHeaderY()
+             + (hasKeysPanel() ? kHeaderH + (fKeysOpen ? keysBodyH() : 0.0f)
+                               : 0.0f);
     }
+    float logBodyY() const { return logHeaderY() + kHeaderH; }
+
+    float rollHeaderY() const
+    {
+        return logBodyY() + (fMonitorOpen ? logBodyH() : 0.0f);
+    }
+    float rollBodyY() const { return rollHeaderY() + kHeaderH; }
 
     /* Centred in the space left of the slider, not of the window. */
     float wheelCentreX() const
@@ -1473,9 +1508,16 @@ protected:
         const float left = (fScreen == kScreenProgressions)
                          ? 10.0f : chromeLeft();
 
+        /*
+         * The bottom margin has to clear the degree numeral drawn UNDER each
+         * strip, not just leave a gap. At 8px the numerals were sliding behind
+         * the first panel header - present in the layout, invisible on screen.
+         */
+        const float belowStrips = (fScreen == kScreenSlide) ? 18.0f : 8.0f;
+
         return { left, top,
                  getWidth() - left - 10.0f,
-                 getHeight() - top - chromeBottom() - 8.0f };
+                 getHeight() - top - chromeBottom() - belowStrips };
     }
 
     /*
@@ -1755,8 +1797,25 @@ protected:
         return kIdx[((pc % 12) + 12) % 12];
     }
 
+    /*
+     * Where the one-octave piano is drawn.
+     *
+     * Two homes, because the keyboard settings appear in two places and the
+     * drawing and hit-testing below are expressed entirely in terms of this
+     * rect. Returning the right rect here moves both at once, which is why
+     * there is no second copy of the key geometry.
+     *
+     *   Setup screen   the full-size editor, as before.
+     *   Circle screen  the collapsible panel at the bottom, where the settings
+     *                  sit beside the screen they actually affect.
+     */
     Button keyboardArea() const
     {
+        if (hasKeysPanel()) {
+            return { chromeLeft() + 8.0f, keysBodyY() + 22.0f,
+                     getWidth() - chromeLeft() - 24.0f, kKeysPanelH - 32.0f };
+        }
+
         const float top = chromeTop();
         return { chromeLeft(), top + 10.0f,
                  getWidth() - chromeLeft() - 16.0f, 190.0f };
@@ -1819,14 +1878,6 @@ protected:
                 std::snprintf(out, outSize, "%s",
                               kDegreeCell[e.value % kDegreeCount].numeral);
                 break;
-            case kKeyExtension: {
-                static const char* const kShort[kExtCount] = {
-                    "triad", "6th", "7th", "9th", "add9", "sus2", "sus4"
-                };
-                std::snprintf(out, outSize, "%s",
-                              kShort[((e.value % kExtCount) + kExtCount) % kExtCount]);
-                break;
-            }
             case kKeyGlideToggle:  std::snprintf(out, outSize, "glide");  break;
             case kKeyLatchToggle:  std::snprintf(out, outSize, "latch");  break;
             case kKeySingleToggle: std::snprintf(out, outSize, "single"); break;
@@ -4237,6 +4288,35 @@ protected:
             return true;
         }
 
+        /*
+         * The keyboard panel's header, and the keys inside it.
+         *
+         * Tested before the log and the roll because it is the topmost of the
+         * three, and before the wheel because it overlaps the space the wheel
+         * would otherwise claim.
+         */
+        if (hasKeysPanel()) {
+            if (hit(keysHeader(), px, py)) {
+                fKeysOpen = ! fKeysOpen;
+                repaint();
+                return true;
+            }
+
+            if (fKeysOpen) {
+                const int pc = hitKey(px, py);
+                if (pc >= 0) {
+                    fEditKey  = pc;
+                    fOpenMenu = kMenuBinding;
+                    repaint();
+                    return true;
+                }
+                /* Swallow presses anywhere else in the panel, so a miss does
+                 * not fall through and sound a chord from the wheel behind. */
+                if (py >= keysBodyY() && py < keysBodyY() + kKeysPanelH)
+                    return true;
+            }
+        }
+
         if (hit(monitorHeader(), px, py)) {
             fMonitorOpen = ! fMonitorOpen;
             repaint();
@@ -4725,6 +4805,11 @@ protected:
     }
 
     /* The header bar is always present; the log below it only when expanded. */
+    Button keysHeader() const
+    {
+        return { 0.0f, keysHeaderY(), static_cast<float>(getWidth()), kHeaderH };
+    }
+
     Button monitorHeader() const
     {
         return { 0.0f, logHeaderY(), static_cast<float>(getWidth()), kHeaderH };
@@ -4771,13 +4856,63 @@ protected:
         text(10.0f, hdr.y + hdr.h * 0.5f, text_, nullptr);
     }
 
+    /*
+     * The keyboard settings, in the circle screen's bottom panel.
+     *
+     * The same piano and the same bindings as the Setup screen - keyboardArea()
+     * returns the panel's rect here, so the key geometry, the drawing and the
+     * hit test are all the single copy that already existed. Only the caption
+     * differs, because this one has room for a shorter line.
+     */
+    void drawKeysPanel()
+    {
+        const float top = keysBodyY();
+
+        beginPath();
+        rect(0.0f, top, static_cast<float>(getWidth()), kKeysPanelH);
+        fillColor(Color(0.07f, 0.08f, 0.10f));
+        fill();
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(10.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.55f, 0.59f, 0.66f));
+        text(chromeLeft() + 8.0f, top + 11.0f,
+             "Click a key to rebind. Chord type comes from the cell, not the keyboard.",
+             nullptr);
+
+        for (int pc = 0; pc < 12; ++pc)
+            if (! isBlackKey(pc))
+                drawOneKey(pc, whiteKeyRect(pc), false);
+        for (int pc = 0; pc < 12; ++pc)
+            if (isBlackKey(pc))
+                drawOneKey(pc, blackKeyRect(pc), true);
+    }
+
     void drawMonitor()
     {
         const float w = getWidth();
-        const float logH = fMonitorOpen ? kLogLines * 14.0f + 10.0f : 0.0f;
+        const float logH = fMonitorOpen ? logBodyH() : 0.0f;
         const float top  = logBodyY();
 
-        /* Expanded log body. */
+        /*
+         * The keyboard settings, where the keyboard actually plays.
+         *
+         * Header first, then body, so the toggle sits above the thing it
+         * toggles. Drawn before the log because a setting belongs above the
+         * readouts that report on it.
+         */
+        if (hasKeysPanel()) {
+            drawPanelHeader(keysHeader(), "Keyboard", fKeysOpen,
+                            "  (click to expand)");
+            if (fKeysOpen)
+                drawKeysPanel();
+        }
+
+        drawPanelHeader(monitorHeader(), "Event log", fMonitorOpen,
+                        "  (click to expand)");
+
+        /* Expanded log body, under its own header. */
         if (fMonitorOpen) {
             beginPath();
             rect(0, top, w, logH);
@@ -4802,21 +4937,19 @@ protected:
             }
         }
 
-        drawPanelHeader(monitorHeader(), "Event log", fMonitorOpen,
-                        "  (click to expand)");
-
         /*
-         * The keyboard sits below the log, and opens independently - seeing
-         * what the chords produced should not require the text stream.
+         * The note roll, last, and opening independently - seeing what the
+         * chords produced should not require the text stream.
          *
-         * Not on the Setup screen, which sounds nothing: a piano roll that can
-         * only ever be empty is just a band of dead space, and this screen
-         * needs the room for its settings.
+         * Not on the Setup screen, which sounds nothing: a roll that can only
+         * ever be empty is a band of dead space, and that screen needs the room
+         * for its settings.
          */
         if (fScreen != kScreenKeys) {
-            drawPianoRoll();
             drawPanelHeader(rollHeader(), "Notes", fRollOpen,
                             "  (click to expand)");
+            if (fRollOpen)
+                drawPianoRoll();
         }
 
         const Button pb = panicButton();
@@ -5100,6 +5233,29 @@ protected:
                 repaint();
             }
 
+            /*
+             * Settings the keyboard or pedal changed, on the same terms.
+             *
+             * These act on the DSP directly - they have to take effect on the
+             * next chord, not after a round trip - so the editor has to be told
+             * rather than being the one who decided. Without this, pressing C#
+             * toggled glide in the engine while the button on screen went on
+             * claiming the old mode.
+             *
+             * Adopted into the same fields the buttons write, so there is one
+             * source of truth whichever way the change arrived.
+             */
+            {
+                int  glide = 0;
+                bool latch = false, single = false;
+                if (fCells->readSettings(fSettingsSeen, glide, latch, single)) {
+                    fGlideMode    = clampEnum<GlideMode>(glide, kGlideModeCount);
+                    fLatchEnabled = latch;
+                    fSingleNotes  = single;
+                    repaint();
+                }
+            }
+
             /* The dropped-message count, on the same terms. */
             const uint32_t drops =
                 fCells->dropped.load(std::memory_order_acquire);
@@ -5155,6 +5311,10 @@ protected:
     std::deque<std::string> fLog;
     /* Collapsed by default: the wheel is the point, the log is for debugging. */
     bool         fMonitorOpen = false;
+
+    /* The keyboard settings panel on the circle screen. Closed by default: it
+     * is a setting, and settings should not cost wheel space until asked for. */
+    bool         fKeysOpen    = false;
     /* The keyboard opens by default: it answers "what did the chord produce?"
      * at a glance, which is the question the monitor is usually opened for. */
     bool         fRollOpen    = true;
@@ -5351,6 +5511,11 @@ private:
     /* Messages the host refused, mirrored from the DSP for the warning line. */
     uint32_t    fDroppedEvents = 0;
 
+    /* Last settings change adopted from the DSP. Compared rather than trusted,
+     * so the editor can tell a keyboard-driven change from its own value
+     * coming back around. */
+    uint32_t    fSettingsSeen = 0;
+
     /* How many beats the grid shows. Not the loop length - a section plays its
      * own length, which is free to be shorter. */
     int fGridBeats = 16;
@@ -5379,11 +5544,17 @@ private:
      */
     static constexpr int kBindingRows =
         1 +                                  /* silent */
-        static_cast<int>(kDegreeCount) +     /* I..vii */
-        static_cast<int>(kExtCount) +        /* triad..sus4 */
+        static_cast<int>(kDegreeCount) +     /* I..vii, plus II and III */
         4;                                   /* glide, latch, single, panic */
 
-    /* Decode a row into the binding it sets. */
+    /*
+     * Decode a row into the binding it sets.
+     *
+     * Chord type is NOT offered. It used to be, and it set the extension on
+     * every ring at once - the same state the wheel's cells drive - so a key
+     * press silently rewrote what the circle showed. Chord type belongs to the
+     * cell now, and a key cannot contradict it.
+     */
     static void bindingForRow(int row, KeyAction& outAction, int& outValue)
     {
         if (row == 0) { outAction = kKeyNone; outValue = 0; return; }
@@ -5393,11 +5564,6 @@ private:
             outAction = kKeyDegree; outValue = row; return;
         }
         row -= static_cast<int>(kDegreeCount);
-
-        if (row < static_cast<int>(kExtCount)) {
-            outAction = kKeyExtension; outValue = row; return;
-        }
-        row -= static_cast<int>(kExtCount);
 
         switch (row) {
             case 0:  outAction = kKeyGlideToggle;  break;
@@ -5417,12 +5583,13 @@ private:
 
         switch (a) {
             case kKeyDegree:
-                std::snprintf(buf, sizeof(buf), "Degree  %s",
-                              kDegreeCell[v].numeral);
-                break;
-            case kKeyExtension:
-                std::snprintf(buf, sizeof(buf), "Chord   %s",
-                              kExtensionName[v]);
+                /* The two secondary dominants are marked, since "II" and "ii"
+                 * differ by one letter's case and are easy to misread in a
+                 * list. */
+                std::snprintf(buf, sizeof(buf), "Degree  %-4s%s",
+                              kDegreeCell[v].numeral,
+                              (v == kDegreeSecII || v == kDegreeSecIII)
+                                  ? "(secondary dominant)" : "");
                 break;
             default:
                 std::snprintf(buf, sizeof(buf), "%s", kKeyActionName[a]);
@@ -5441,7 +5608,7 @@ private:
             bindingForRow(r, a, v);
             if (a != e.action)
                 continue;
-            if (a == kKeyDegree || a == kKeyExtension) {
+            if (a == kKeyDegree) {
                 if (v == e.value) return r;
             } else {
                 return r;

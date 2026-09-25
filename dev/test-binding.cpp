@@ -13,7 +13,7 @@
 using namespace fortyfifth;
 
 static constexpr int kBindingRows =
-    1 + (int)kDegreeCount + (int)kExtCount + 4;
+    1 + (int)kDegreeCount + 4;
 
 static void bindingForRow(int row, KeyAction& a, int& v)
 {
@@ -21,8 +21,6 @@ static void bindingForRow(int row, KeyAction& a, int& v)
     --row;
     if (row < (int)kDegreeCount) { a = kKeyDegree; v = row; return; }
     row -= (int)kDegreeCount;
-    if (row < (int)kExtCount) { a = kKeyExtension; v = row; return; }
-    row -= (int)kExtCount;
     switch (row) {
         case 0:  a = kKeyGlideToggle;  break;
         case 1:  a = kKeyLatchToggle;  break;
@@ -38,7 +36,7 @@ static int bindingRowFor(const KeyMapEntry& e)
         KeyAction a; int v;
         bindingForRow(r, a, v);
         if (a != e.action) continue;
-        if (a == kKeyDegree || a == kKeyExtension) { if (v == e.value) return r; }
+        if (a == kKeyDegree) { if (v == e.value) return r; }
         else return r;
     }
     return 0;
@@ -70,26 +68,33 @@ int main()
     std::snprintf(d, sizeof d, "%d rows", kBindingRows);
     ok("every row round-trips", roundTrip, d);
 
-    /* Each of the 7 degrees must be reachable exactly once. */
+    /*
+     * Every degree must be reachable exactly once - the seven diatonic ones
+     * plus the two secondary dominants.
+     *
+     * NO EXTENSION ROW MAY EXIST. A "chord type" binding used to set the
+     * extension on every ring at once, which is the same state the wheel's
+     * cells drive, so a key press silently rewrote what the circle showed.
+     * Chord type belongs to the cell; if a row ever offers it again this
+     * fails.
+     */
     int degSeen[kDegreeCount] = {0};
-    int extSeen[kExtCount] = {0};
-    int toggles = 0, silent = 0;
+    int toggles = 0, silent = 0, extRows = 0;
     for (int r = 0; r < kBindingRows; ++r) {
         KeyAction a; int v;
         bindingForRow(r, a, v);
         switch (a) {
-            case kKeyNone:      ++silent; break;
-            case kKeyDegree:    if (v >= 0 && v < (int)kDegreeCount) ++degSeen[v]; break;
-            case kKeyExtension: if (v >= 0 && v < (int)kExtCount)    ++extSeen[v]; break;
-            default:            ++toggles; break;
+            case kKeyNone:       ++silent; break;
+            case kKeyDegree:     if (v >= 0 && v < (int)kDegreeCount) ++degSeen[v]; break;
+            case kKeyRetiredExt: ++extRows; break;
+            default:             ++toggles; break;
         }
     }
-    bool allDeg = true, allExt = true;
+    bool allDeg = true;
     for (int i = 0; i < (int)kDegreeCount; ++i) if (degSeen[i] != 1) allDeg = false;
-    for (int i = 0; i < (int)kExtCount; ++i)    if (extSeen[i] != 1) allExt = false;
 
-    ok("all 7 degrees reachable, once each", allDeg, "I..vii");
-    ok("all 7 extensions reachable, once each", allExt, "triad..sus4");
+    ok("all 9 degrees reachable, once each", allDeg, "I..vii, II, III");
+    ok("no chord-type row is offered", extRows == 0, "cell owns chord type");
 
     std::snprintf(d, sizeof d, "%d found", toggles);
     ok("4 toggles present", toggles == 4, d);
@@ -105,7 +110,7 @@ int main()
         KeyAction a; int v;
         bindingForRow(r, a, v);
         const bool match = (a == kDefaultKeyMap[pc].action) &&
-            ((a != kKeyDegree && a != kKeyExtension) || v == kDefaultKeyMap[pc].value);
+            (a != kKeyDegree || v == kDefaultKeyMap[pc].value);
         if (!match) { std::printf("     %s mismatched\n", kPitchName[pc]); factoryOk = false; }
     }
     ok("all 12 keys", factoryOk, "map to their own row");

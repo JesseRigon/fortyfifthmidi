@@ -367,9 +367,21 @@ inline ChordType extendChordOrTriad(ChordType base, Extension ext,
     return chordExists(t) ? t : base;
 }
 
-/* Semitones above the tonic for each scale degree, for the key check in
- * extendChord(). kDegreeCount entries, in Degree order. */
-static constexpr int kDegreeSemitone[7] = { 0, 2, 4, 5, 7, 9, 11 };
+/*
+ * Semitones above the tonic for each scale degree, for the key check in
+ * extendChord().
+ *
+ * Indexed by Degree, but declared before that enum exists - extendChord() is
+ * defined above and needs it. The two secondary dominants sit on the same roots
+ * as ii and iii (in C, D and E), because only the chord's QUALITY differs, not
+ * where it is built: II is a major chord on the second degree, ii a minor one.
+ * A static_assert below this file's Degree enum keeps the two in step.
+ */
+static constexpr int kDegreeSemitone[9] = {
+    /* I ii iii IV V vi vii */ 0, 2, 4, 5, 7, 9, 11,
+    /* II  */ 2,
+    /* III */ 4,
+};
 
 /*
  * Voicing modifiers - how the chord tones are arranged once the notes are
@@ -736,8 +748,27 @@ enum Degree {
     kDegreeV,
     kDegreeVI,     /* vi  - minor */
     kDegreeVII,    /* vii - diminished */
+    /*
+     * The two secondary dominants, major where the diatonic degree is minor:
+     * II is V-of-V and III is V-of-vi. Not in the key, which is the point -
+     * they are the chords most often borrowed into it.
+     *
+     * Listed after kDegreeVII deliberately. Everything that walks the diatonic
+     * degrees stops at kDegreeDiatonicCount, so adding these cannot lengthen a
+     * scale, a slide strip or a sequencer row by accident.
+     */
+    kDegreeDiatonicCount,
+    kDegreeSecII = kDegreeDiatonicCount,
+    kDegreeSecIII,
     kDegreeCount
 };
+
+/* kDegreeSemitone is declared above this enum, because extendChord() needs it
+ * there. This keeps the two from drifting apart. */
+static_assert(sizeof(kDegreeSemitone) / sizeof(kDegreeSemitone[0]) == kDegreeCount,
+              "kDegreeSemitone must have one entry per Degree");
+static_assert(kDegreeDiatonicCount == 7,
+              "the seven diatonic degrees must come first, and stay seven");
 
 struct DegreeCell {
     Ring        ring;
@@ -753,12 +784,24 @@ static constexpr DegreeCell kDegreeCell[kDegreeCount] = {
     /* V   */ { kRingKey,    1, "V"    },
     /* vi  */ { kRingMinor,  1, "vi"   },
     /* vii */ { kRingDim,    0, "vii°" },
+    /* II  */ { kRingKey,    2, "II"   },
+    /* III */ { kRingKey,    4, "III"  },
 };
 
-/* Whether a degree functions as a dominant, for the sequencer and the
- * keyboard, which hold a degree rather than a cell. Only V does: its seventh
- * is the flat seventh, which is what makes it resolve. See extendChord(). */
-inline bool degreeIsDominant(Degree d) { return d == kDegreeV; }
+/*
+ * Whether a degree functions as a dominant, for the sequencer and the
+ * keyboard, which hold a degree rather than a cell.
+ *
+ * V does: its seventh is the flat seventh, which is what makes it resolve.
+ * So do the two secondary dominants - being a dominant is the whole reason
+ * they exist, since II is V-of-V and III is V-of-vi. Spelling either with a
+ * major seventh would sound a note outside the key and destroy the pull that
+ * makes them worth borrowing. See extendChord().
+ */
+inline bool degreeIsDominant(Degree d)
+{
+    return d == kDegreeV || d == kDegreeSecII || d == kDegreeSecIII;
+}
 
 /* A degree's distance above the tonic, for extendChord()'s key check. */
 inline int semitoneForDegree(Degree d)
@@ -905,10 +948,23 @@ inline const SlideDef* slidesForScale(Scale scale)
  * Forwarding it would sound the raw note under the chords, which is exactly
  * what the black keys were doing before they had jobs.
  */
+/*
+ * There is deliberately NO "chord type" action.
+ *
+ * One existed, and it set the extension on every ring at once - the same
+ * per-ring state the wheel's cells drive. So a keyboard press silently
+ * rewrote what the circle was set to, the circle never redrew to show it, and
+ * the two disagreed until the next mouse press re-asserted. Chord type belongs
+ * to the cell, which is the one place that can answer "what is this chord?".
+ *
+ * The slot is kept rather than renumbered, so a saved key map from an older
+ * session still decodes to the right actions either side of it. Anything bound
+ * to it is treated as silent.
+ */
 enum KeyAction {
     kKeyNone = 0,     /* silent - bound to nothing */
     kKeyDegree,       /* play a scale degree */
-    kKeyExtension,    /* select a chord extension for the NEXT chord */
+    kKeyRetiredExt,   /* was "chord type"; now silent. See above. */
     kKeyGlideToggle,  /* flip glide between off and its last on-state */
     kKeyLatchToggle,
     kKeySingleToggle, /* chords <-> single notes */
@@ -917,9 +973,13 @@ enum KeyAction {
 };
 
 static constexpr const char* kKeyActionName[kKeyActionCount] = {
-    "(silent)", "Degree", "Chord type", "Glide toggle",
+    "(silent)", "Degree", "(retired)", "Glide toggle",
     "Latch toggle", "Single notes", "Panic"
 };
+
+/* Whether an action can be chosen in Keyboard Setup. The retired slot exists
+ * only so old saved maps decode correctly; it must not be offerable. */
+inline bool keyActionSelectable(KeyAction a) { return a != kKeyRetiredExt; }
 
 struct KeyMapEntry {
     KeyAction action;
@@ -929,30 +989,42 @@ struct KeyMapEntry {
 };
 
 /*
- * The factory map. Every binding is editable from the Keyboard Setup tab, so
- * this is a starting point rather than a fixed scheme.
+ * The factory map. Every binding is editable from Keyboard Setup, so this is a
+ * starting point rather than a fixed scheme.
  *
  *   white   C D E F G A B  ->  I ii iii IV V vi vii
  *   black   C#             ->  glide toggle
- *           D# F# G# A#    ->  triad, 7th, 9th, sus4
+ *           D# F#          ->  II and III, the secondary dominants
+ *           G# A#          ->  silent, and rebindable
  *
- * The four chord types are the ones a progression reaches for most; the other
- * three extensions remain available from the wheel, and any black key can be
- * rebound to them.
+ * NO BLACK KEY SELECTS A CHORD TYPE ANY MORE.
+ *
+ * They used to set the extension on every ring at once, which fought the wheel
+ * for the same per-ring state: a keyboard press silently rewrote what the
+ * circle's cells were set to, and the circle never redrew to show it. Chord
+ * type now comes from the cell and nowhere else, so there is one source of
+ * truth and the keyboard cannot contradict what is on screen.
+ *
+ * D# and F# were the natural home for II and III: each sits just above the
+ * natural whose degree it makes major, as closely as a keyboard allows. (There
+ * is no key between E and F - E# IS F - so III takes F#.)
+ *
+ * G# and A# are left silent rather than removed. An unbound key sounding
+ * nothing is the existing rule, and they remain available to bind.
  */
 static constexpr KeyMapEntry kDefaultKeyMap[12] = {
-    /* C  */ { kKeyDegree,      kDegreeI   },
-    /* C# */ { kKeyGlideToggle, 0          },
-    /* D  */ { kKeyDegree,      kDegreeII  },
-    /* D# */ { kKeyExtension,   kExtNone   },
-    /* E  */ { kKeyDegree,      kDegreeIII },
-    /* F  */ { kKeyDegree,      kDegreeIV  },
-    /* F# */ { kKeyExtension,   kExt7      },
-    /* G  */ { kKeyDegree,      kDegreeV   },
-    /* G# */ { kKeyExtension,   kExt9      },
-    /* A  */ { kKeyDegree,      kDegreeVI  },
-    /* A# */ { kKeyExtension,   kExtSus4   },
-    /* B  */ { kKeyDegree,      kDegreeVII },
+    /* C  */ { kKeyDegree,      kDegreeI     },
+    /* C# */ { kKeyGlideToggle, 0            },
+    /* D  */ { kKeyDegree,      kDegreeII    },
+    /* D# */ { kKeyDegree,      kDegreeSecII },
+    /* E  */ { kKeyDegree,      kDegreeIII   },
+    /* F  */ { kKeyDegree,      kDegreeIV    },
+    /* F# */ { kKeyDegree,      kDegreeSecIII},
+    /* G  */ { kKeyDegree,      kDegreeV     },
+    /* G# */ { kKeyNone,        0            },
+    /* A  */ { kKeyDegree,      kDegreeVI    },
+    /* A# */ { kKeyNone,        0            },
+    /* B  */ { kKeyDegree,      kDegreeVII   },
 };
 
 /*
@@ -1365,6 +1437,54 @@ struct ActiveCells {
      * was correct.
      */
     std::atomic<uint32_t> dropped { 0 };
+
+    /*
+     * Settings the KEYBOARD or the PEDAL changed, for the editor to adopt.
+     *
+     * These controls act on the DSP directly, on the audio thread, because
+     * they must take effect on the next chord rather than after a round trip.
+     * That left the editor showing stale values: pressing C# toggled glide in
+     * the engine while the button on screen went on claiming the old mode, and
+     * the two only agreed again when the mouse touched something.
+     *
+     * One word, bumped whenever any of them changes, so the UI can tell "this
+     * differs from what I last saw" from "nothing has happened". Without the
+     * counter the UI cannot distinguish a genuine change from its own value
+     * coming back, which is the same trap the octave key fell into.
+     *
+     * Packed rather than one atomic each so the UI reads a consistent set:
+     * reading three separate words could catch a half-applied change.
+     */
+    std::atomic<uint32_t> settingsWord { 0 };
+
+    static uint32_t packSettings(uint32_t seq, int glide, bool latch, bool single)
+    {
+        return ((seq & 0xFFFFu) << 16)
+             | ((static_cast<uint32_t>(glide) & 0xFFu) << 8)
+             | (latch  ? 0x2u : 0u)
+             | (single ? 0x1u : 0u);
+    }
+
+    /* Audio thread. seq must be supplied by the caller, which owns it. */
+    void publishSettings(uint32_t seq, int glide, bool latch, bool single)
+    {
+        settingsWord.store(packSettings(seq, glide, latch, single),
+                           std::memory_order_release);
+    }
+
+    /* UI thread. Returns false when nothing has changed since lastSeq. */
+    bool readSettings(uint32_t& lastSeq, int& glide, bool& latch, bool& single) const
+    {
+        const uint32_t w   = settingsWord.load(std::memory_order_acquire);
+        const uint32_t seq = (w >> 16) & 0xFFFFu;
+        if (seq == lastSeq)
+            return false;
+        lastSeq = seq;
+        glide   = static_cast<int>((w >> 8) & 0xFFu);
+        latch   = (w & 0x2u) != 0;
+        single  = (w & 0x1u) != 0;
+        return true;
+    }
 
     void setPlayhead(int section, int step)
     {
