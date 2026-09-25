@@ -274,6 +274,66 @@ int main()
         ok("and the wedge agrees", w.highlightKey() == 7, "G");
     }
 
+
+    /* --- the keyboard's own octave ----------------------------------- */
+    /*
+     * The keyboard decides its OCTAVE for itself. It does not decide the key.
+     *
+     * These are different axes, and it is worth being explicit because they
+     * are easy to confuse. The key is one value shared by the wheel, the
+     * labels and the keyboard - pinning holds it. The octave is per-note:
+     * octaveForMidiNote() reads it from the played note, so the mapped G an
+     * octave up sounds the chord an octave up, and the controller behaves like
+     * an instrument rather than a switch.
+     *
+     * Nothing about pinning the key may disturb that.
+     */
+    std::printf("\n=== the keyboard takes its octave from the note ===\n");
+    {
+        /* Middle C is 60, and C4 by the convention used here. */
+        ok("MIDI 60 is octave 4",  octaveForMidiNote(60) == 4, "C4");
+        ok("an octave up is 5",    octaveForMidiNote(72) == 5, "C5");
+        ok("an octave down is 3",  octaveForMidiNote(48) == 3, "C3");
+
+        /* Every pitch class inside one octave reports that octave - the
+         * boundary is at C, as on a keyboard. */
+        bool sameOctave = true;
+        for (int n = 60; n < 72; ++n)
+            if (octaveForMidiNote(n) != 4) sameOctave = false;
+        ok("B3 to B4 all report one octave", sameOctave, "boundary at C");
+
+        /*
+         * The same binding, played in three octaves, must give the same CELL
+         * at three different octaves. Cell from the key, octave from the note:
+         * that is the separation.
+         */
+        int  p1, p2, p3;
+        Ring r1, r2, r3;
+        const bool a = cellForMidiNote(kDefaultKeyMap, 55, 0, p1, r1); /* G3 */
+        const bool b = cellForMidiNote(kDefaultKeyMap, 67, 0, p2, r2); /* G4 */
+        const bool c = cellForMidiNote(kDefaultKeyMap, 79, 0, p3, r3); /* G5 */
+        ok("G in three octaves hits one cell",
+           a && b && c && p1 == p2 && p2 == p3 && r1 == r2 && r2 == r3,
+           "the V chord");
+        ok("but reports three octaves",
+           octaveForMidiNote(55) == 3 && octaveForMidiNote(67) == 4 &&
+           octaveForMidiNote(79) == 5,
+           "3, 4, 5");
+
+        /*
+         * And the key still decides WHICH cell, independently. The same note
+         * in two keys addresses two different cells, while reporting the same
+         * octave - the two axes crossing without interfering.
+         */
+        int  pc1, pc2; Ring rc1, rc2;
+        cellForMidiNote(kDefaultKeyMap, 67, 0, pc1, rc1);   /* G in C */
+        cellForMidiNote(kDefaultKeyMap, 67, 5, pc2, rc2);   /* G in F */
+        ok("the key still chooses the cell", ! (pc1 == pc2 && rc1 == rc2),
+           "V of C is not V of F");
+        ok("and the octave is unaffected by the key",
+           octaveForMidiNote(67) == 4, "still 4");
+    }
+
     std::printf("\n%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

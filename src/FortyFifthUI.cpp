@@ -790,6 +790,15 @@ protected:
      * So the pin is now refused here, and a click on a pinned wheel still
      * SOUNDS the chord - it just does not move the key out from under it.
      * Unpin to change key, which is what the button is for.
+     *
+     * WHAT THE KEYBOARD *DOES* DECIDE FOR ITSELF IS THE OCTAVE, not the key.
+     * octaveForMidiNote() takes it from the played note, so the mapped G an
+     * octave up sounds the chord an octave up and the controller behaves like
+     * an instrument rather than a switch. That independence is real and is
+     * deliberately untouched here - it is a different axis from this one. The
+     * key is one value shared by the wheel, the labels and the keyboard; the
+     * octave is per-note. Conflating those two was the mistake, not keeping
+     * either of them.
      */
     void selectKey(int keyIndex)
     {
