@@ -303,7 +303,7 @@ int main()
             static const char* const kNeeded[] = {
                 "progression", "progRunning", "progLegato",
                 "uiScreen", "storageMode", "mergeWindowMs",
-                "keyMap", "pedalAction", "bassNote", "voiceLeading",
+                "keyMap", "pedalAction",
             };
 
             for (const char* k : kNeeded) {
@@ -459,7 +459,7 @@ int main()
             if (sc != nullptr) {
                 static const char* const kSettings[] = {
                     "keyMap", "progression", "octave", "latch", "glideMode",
-                    "selectedKey", "singleNotes", "voiceLeading", "bassNote",
+                    "selectedKey", "singleNotes",
                     "pedalAction", "storageMode", "progLegato", "progRunning",
                     "mergeWindowMs",
                     "uiScreen",

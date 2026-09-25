@@ -69,9 +69,9 @@ public:
         loadPreset(fProg, 0, 0);
         pushProgression();
 
-        /* Every wheel cell opens as a plain triad in root position. */
+        /* Every wheel cell opens as a plain triad, root position, no spread. */
         std::memset(fCellExt, kExtDefault, sizeof(fCellExt));
-        std::memset(fCellBass, kBassFirst, sizeof(fCellBass));
+        std::memset(fCellVoicing, kVoicingRegular, sizeof(fCellVoicing));
     }
 
     /* Closing the editor must close the log, or the last lines never reach
@@ -410,18 +410,6 @@ protected:
         setState("progression", out);
     }
 
-    /* Voice leading and the bass note are one control to the user, so they go
-     * across together - sending one without the other leaves the DSP briefly
-     * in a combination the button never showed. */
-    void pushRootChoice()
-    {
-        char buf[8];
-        std::snprintf(buf, sizeof buf, "%d", fVoiceLeading ? 1 : 0);
-        setState("voiceLeading", buf);
-        std::snprintf(buf, sizeof buf, "%d", static_cast<int>(fBassNote));
-        setState("bassNote", buf);
-    }
-
     void pushProgRunning()
     {
         char buf[8];
@@ -494,15 +482,18 @@ protected:
          * per cell means leading is off. That is the same rule the ROOT button
          * already followed; it is now decided per cell rather than globally.
          */
-        const int8_t bass = fCellBass[ring][position % 24];
+        /* And the voicing - inversion and spacing in one axis. */
+        const int8_t voi = fCellVoicing[ring][position % 24];
 
-        if (bass != fPushedBass) {
-            fPushedBass = bass;
+        if (fPushedVoiceRing != static_cast<int>(ring) ||
+            fPushedVoicing != voi) {
+            fPushedVoiceRing = static_cast<int>(ring);
+            fPushedVoicing   = voi;
 
-            char buf[16];
-            std::snprintf(buf, sizeof buf, "%d", static_cast<int>(bass));
-            setState("bassNote", buf);
-            setState("voiceLeading", "0");
+            char key[8], buf[16];
+            std::snprintf(key, sizeof key, "voice%d", static_cast<int>(ring));
+            std::snprintf(buf, sizeof buf, "%d", static_cast<int>(voi));
+            setState(key, buf);
         }
     }
 
@@ -513,27 +504,60 @@ protected:
      * the ring" entry, which is what a cell does until it is changed.
      */
 
-    static constexpr float kWheelEditW = 176.0f;
+    /*
+     * Three columns side by side - CHORD, BASS, SPACING - rather than one
+     * stacked list.
+     *
+     * They are independent axes, so presenting them in a column each says so:
+     * the eye reads three choices, not one long list whose sections happen to
+     * mean different things. It is also far shorter, which matters on a panel
+     * that floats over the wheel.
+     */
+    static constexpr int   kWheelCols  = 2;   /* CHORD, VOICING */
+    static constexpr float kWheelColW  = 136.0f;
+    static constexpr float kWheelColGap = 6.0f;
+    static constexpr float kWheelEditW =
+        kWheelColW * kWheelCols + kWheelColGap * (kWheelCols - 1) + 16.0f;
+
+    /* The tallest column decides the panel height. */
+    int wheelEditTallest() const
+    {
+        const int chord   = wheelEditRows();
+        const int voicing = static_cast<int>(kVoicingCount);
+        return (chord > voicing) ? chord : voicing;
+    }
 
     Button wheelEditRect() const
     {
         /* Centred on the wheel, not on the cell: the cells are wedges, and a
          * panel hanging off one would cover its neighbours. */
         const float w = kWheelEditW;
-
-        /* Two labelled sections - chord type, then bass - each with a heading
-         * row above its options. */
-        const float rows = static_cast<float>(wheelEditRows() +
-                                              kBassNoteCount);
-        const float h = 34.0f + rows * kMenuRowH + 2.0f * kMenuRowH + 10.0f;
+        const float h = 34.0f + wheelEditTallest() * kMenuRowH + 12.0f;
 
         float x = wheelCentreX() - w * 0.5f;
         float y = wheelCentreY() - h * 0.5f;
 
         if (x < 6.0f) x = 6.0f;
+        if (x + w > getWidth() - 6.0f) x = getWidth() - 6.0f - w;
         if (y < chromeTop()) y = chromeTop();
 
         return { x, y, w, h };
+    }
+
+    /* One column's rectangle: 0 chord, 1 bass, 2 spacing. */
+    Button wheelColRect(int col) const
+    {
+        const Button p = wheelEditRect();
+        return { p.x + 8.0f + col * (kWheelColW + kWheelColGap),
+                 p.y + 30.0f, kWheelColW,
+                 p.h - 38.0f };
+    }
+
+    /* One option row within a column. */
+    Button wheelColRowRect(int col, int row) const
+    {
+        const Button c = wheelColRect(col);
+        return { c.x, c.y + row * kMenuRowH, c.w, kMenuRowH };
     }
 
     /* Follow-the-ring, then every extension that exists on this cell. */
@@ -574,11 +598,39 @@ protected:
         return kExtDefault;
     }
 
-    Button wheelEditRowRect(int row) const
+    /* How many options a column offers, and what the current one is. */
+    int wheelColCount(int col) const
     {
-        const Button p = wheelEditRect();
-        return { p.x + 6.0f, p.y + 30.0f + row * kMenuRowH,
-                 p.w - 12.0f, kMenuRowH };
+        return (col == 0) ? wheelEditRows()
+                          : static_cast<int>(kVoicingCount);
+    }
+
+    int wheelColCurrent(int col) const
+    {
+        const int i = fEditCellPos % 24;
+
+        switch (col) {
+            case 0: {
+                /* The chord column lists follow-default first, then the
+                 * extensions that exist here, so the current row is found by
+                 * walking the same list the drawing walks. */
+                const int8_t own = fCellExt[fEditCellRing][i];
+                for (int row = 0; row < wheelEditRows(); ++row)
+                    if (wheelEditValueAt(row) == own)
+                        return row;
+                return 0;
+            }
+            default: return fCellVoicing[fEditCellRing][i];
+        }
+    }
+
+    const char* wheelColLabel(int col, int row) const
+    {
+        if (col == 0) {
+            const int v = wheelEditValueAt(row);
+            return (v == kExtDefault) ? "Triad" : kExtensionName[v];
+        }
+        return kVoicingName[row];
     }
 
     void drawWheelEditor()
@@ -603,113 +655,90 @@ protected:
 
         /* Which cell, by the name the wheel shows. */
         fontFace(NANOVG_DEJAVU_SANS_TTF);
-        fontSize(11.0f);
+        fontSize(11.5f);
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        fillColor(Color(0.82f, 0.88f, 0.95f));
-        text(p.x + 10.0f, p.y + 16.0f,
+        fillColor(Color(0.86f, 0.90f, 0.96f));
+        text(p.x + 10.0f, p.y + 15.0f,
              labelForPosition(fEditCellPos, fEditCellRing), nullptr);
 
-        const int8_t own  = fCellExt[fEditCellRing][fEditCellPos % 24];
-        const int8_t bass = fCellBass[fEditCellRing][fEditCellPos % 24];
+        static const char* const kColName[kWheelCols] = { "CHORD", "VOICING" };
 
-        int row = 0;
+        for (int col = 0; col < kWheelCols; ++col) {
+            const Button c = wheelColRect(col);
 
-        /* ---- chord type ---- */
-        drawWheelEditHeading(row++, "CHORD");
+            /* The heading sits on the panel's title line, above its column. */
+            fontSize(9.0f);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(Color(0.48f, 0.53f, 0.62f));
+            text(c.x + 2.0f, p.y + 15.0f, kColName[col], nullptr);
 
-        for (int i = 0; i < wheelEditRows(); ++i, ++row) {
-            const int  v   = wheelEditValueAt(i);
-            const bool cur = (v == own);
+            const int cur = wheelColCurrent(col);
 
-            drawWheelEditRow(row, cur,
-                             (v == kExtDefault) ? "Triad (default)"
-                                                : kExtensionName[v]);
-        }
+            for (int row = 0; row < wheelColCount(col); ++row) {
+                const Button r = wheelColRowRect(col, row);
+                const bool   on = (row == cur);
 
-        /* ---- bass note, the third axis ---- */
-        drawWheelEditHeading(row++, "BASS");
+                if (on) {
+                    beginPath();
+                    roundedRect(r.x, r.y, r.w, r.h, 3.0f);
+                    fillColor(Color(0.24f, 0.40f, 0.56f));
+                    fill();
+                }
 
-        for (int b = 0; b < kBassNoteCount; ++b, ++row) {
-            /* The names without the "ROOT: " prefix the header button needs -
-             * here the heading above already says what these are. */
-            static const char* const kShort[kBassNoteCount] = {
-                "Root position", "1st inversion", "2nd inversion"
-            };
-            drawWheelEditRow(row, b == bass, kShort[b]);
+                fontSize(10.0f);
+                textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+                fillColor(on ? Color(0.96f, 0.98f, 1.00f)
+                             : Color(0.78f, 0.82f, 0.88f));
+                text(r.x + 6.0f, r.y + r.h * 0.5f,
+                     wheelColLabel(col, row), nullptr);
+            }
         }
     }
 
-    void drawWheelEditHeading(int row, const char* text_)
-    {
-        const Button r = wheelEditRowRect(row);
-
-        fontFace(NANOVG_DEJAVU_SANS_TTF);
-        fontSize(9.0f);
-        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        fillColor(Color(0.48f, 0.53f, 0.62f));
-        text(r.x + 2.0f, r.y + r.h * 0.5f, text_, nullptr);
-    }
-
-    void drawWheelEditRow(int row, bool current, const char* label)
-    {
-        const Button r = wheelEditRowRect(row);
-
-        if (current) {
-            beginPath();
-            rect(r.x, r.y, r.w, r.h);
-            fillColor(Color(0.24f, 0.40f, 0.56f));
-            fill();
-        }
-
-        fontFace(NANOVG_DEJAVU_SANS_TTF);
-        fontSize(10.5f);
-        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        fillColor(current ? Color(0.96f, 0.98f, 1.00f)
-                          : Color(0.78f, 0.82f, 0.88f));
-        text(r.x + 8.0f, r.y + r.h * 0.5f, label, nullptr);
-    }
-
+    /*
+     * A click in the editor.
+     *
+     * Choosing from a column does NOT close the panel: the three axes are
+     * usually set together, and a panel that vanished after each choice would
+     * have to be reopened twice to set a chord.
+     */
     bool wheelEditClick(double px, double py)
     {
         const float x = static_cast<float>(px);
         const float y = static_cast<float>(py);
+        const int   i = fEditCellPos % 24;
 
-        /* Row 0 is the CHORD heading; the options follow it. */
-        int row = 1;
+        for (int col = 0; col < kWheelCols; ++col) {
+            for (int row = 0; row < wheelColCount(col); ++row) {
+                if (! hit(wheelColRowRect(col, row), x, y))
+                    continue;
 
-        for (int i = 0; i < wheelEditRows(); ++i, ++row) {
-            if (! hit(wheelEditRowRect(row), x, y))
-                continue;
+                switch (col) {
+                    case 0:
+                        fCellExt[fEditCellRing][i] =
+                            static_cast<int8_t>(wheelEditValueAt(row));
+                        /* The pushed value is stale, so the next press
+                         * re-sends it. */
+                        fPushedExtRing = -1;
+                        break;
+                    default:
+                        fCellVoicing[fEditCellRing][i] =
+                            static_cast<int8_t>(row);
+                        fPushedVoiceRing = -1;
+                        break;
+                }
 
-            fCellExt[fEditCellRing][fEditCellPos % 24] =
-                static_cast<int8_t>(wheelEditValueAt(i));
-
-            /* The pushed value is now stale, so the next press re-sends. */
-            fPushedExtRing = -1;
-
-            fWheelEditOpen = false;
-            repaint();
-            return true;
+                repaint();
+                return true;
+            }
         }
 
-        ++row;   /* the BASS heading */
-
-        for (int b = 0; b < kBassNoteCount; ++b, ++row) {
-            if (! hit(wheelEditRowRect(row), x, y))
-                continue;
-
-            fCellBass[fEditCellRing][fEditCellPos % 24] =
-                static_cast<int8_t>(b);
-
-            /* Bass is pushed per press, like the extension, so nothing needs
-             * sending now - but the wheel must redraw its marker. */
-            fWheelEditOpen = false;
-            repaint();
+        /* Inside the panel but not on a row: swallow it, so a miss does not
+         * fall through and play a cell underneath. */
+        if (hit(wheelEditRect(), x, y))
             return true;
-        }
 
-        /* Anywhere else dismisses, and that click does nothing else - a
-         * dismissing click must not also play a cell. */
+        /* Anywhere else dismisses, and that click does nothing else. */
         fWheelEditOpen = false;
         repaint();
         return true;
@@ -3799,41 +3828,29 @@ protected:
         }
 
         /*
-         * Per-ring VOICINGS only. The extension dropdowns are gone: chord type
-         * is per cell now, and a ring-wide control that a cell could silently
-         * override was two ways to set one thing.
+         * ROW 2 IS EMPTY ON THE WHEEL NOW, but for the key.
          *
-         * Voicing stays per-ring because it is not yet per-cell. When it moves,
-         * this row goes with it.
+         * It carried per-ring extension and voicing dropdowns. Both are per
+         * cell, so a ring-wide control could only be a second way to set the
+         * same thing - and the one that lost would be whichever was touched
+         * last.
          */
-        static const char* const kRingTag[kRingCount] = { "MAJ", "MIN", "DIM" };
+        {
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "KEY: %s",
+                          kMajorLabel[fSelectedKey]);
+            drawDropdown(slideKeyButton(), buf, fOpenMenu == kMenuKey);
 
-        for (int r = 0; r < kRingCount; ++r) {
-            char voi[48];
-            std::snprintf(voi, sizeof(voi), "%s: %s",
-                          kRingTag[r], kVoicingName[fRingVoice[r]]);
-            /* Uppercased to match the row; the menu keeps the full names,
-             * where there is room for them. */
-            for (char* p = voi; *p != '\0'; ++p)
-                if (*p >= 'a' && *p <= 'z') *p = static_cast<char>(*p - 32);
-
-            drawDropdown(voiceButton(r), voi,
-                         fOpenMenu == kMenuVoicing && fOpenMenuRing == r);
+            fontFace(NANOVG_DEJAVU_SANS_TTF);
+            fontSize(9.0f);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(Color(0.45f, 0.49f, 0.57f));
+            text(slideKeyButton().x + slideKeyButton().w + 12.0f,
+                 kDropY + kDropH * 0.5f,
+                 "right-click a cell to set its chord and voicing", nullptr);
         }
-
-        /* Say where chord type lives now, since the control that used to be
-         * here has gone. */
-        fontFace(NANOVG_DEJAVU_SANS_TTF);
-        fontSize(9.0f);
-        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        fillColor(Color(0.45f, 0.49f, 0.57f));
-        text(voiceButton(kRingCount - 1).x + voiceButton(0).w + 12.0f,
-             kDropY + kDropH * 0.5f,
-             "right-click a cell for its chord type", nullptr);
     }
 
-    /* Unused now that the chord selector is per-ring, but kept because the
-     * toggle buttons still use it. */
     /* Drawn last so an open list sits above the wheel. */
     void drawOpenMenu()
     {
@@ -4276,17 +4293,13 @@ protected:
         }
 
 
-        /* Only on the wheel screen: these buttons are not drawn in Slide Mode,
-         * and an invisible hit box would swallow clicks meant for the strips. */
-        if (fScreen == kScreenCircle) {
-            for (int r = 0; r < kRingCount; ++r) {
-                if (hit(voiceButton(r), px, py)) {
-                    fOpenMenu = kMenuVoicing;
-                    fOpenMenuRing = r;
-                    repaint();
-                    return true;
-                }
-            }
+        /* The key, which the wheel shows on row 2 now that the per-ring
+         * dropdowns have gone. Only where it is drawn - an invisible hit box
+         * would swallow clicks meant for the wheel. */
+        if (fScreen == kScreenCircle && hit(slideKeyButton(), px, py)) {
+            fOpenMenu = kMenuKey;
+            repaint();
+            return true;
         }
 
         return false;
@@ -4902,10 +4915,6 @@ protected:
         }
         else if (std::strcmp(key, "singleNotes") == 0)
             fSingleNotes = (v != 0);
-        else if (std::strcmp(key, "voiceLeading") == 0)
-            fVoiceLeading = (v != 0);
-        else if (std::strcmp(key, "bassNote") == 0)
-            fBassNote = clampEnum<BassNote>(v, kBassNoteCount);
         else if (std::strcmp(key, "pedalAction") == 0)
             fPedalAction = clampEnum<PedalAction>(v, kPedalActionCount);
         else if (std::strcmp(key, "storageMode") == 0)
@@ -5182,18 +5191,20 @@ private:
     int8_t fCellExt[kRingCount][24];
 
     /*
-     * And each cell's INVERSION - which chord tone sits lowest.
+     * And each cell's VOICING - how its tones are arranged.
      *
-     * The third axis. A chord is a degree (which scale note it is built on), a
-     * quality (what stacks above that root), and an inversion (which of those
-     * tones is in the bass). They are independent in standard theory: G7 and
-     * G7/B are the same chord, differently voiced, so the bass cannot be
-     * folded into the chord type without losing the distinction.
+     * The second axis, and the only one for arrangement. It covers both which
+     * chord tone is in the bass (root position, 1st, 2nd inversion) and how
+     * the rest are spaced (drop 2, spread, doubling), because in standard
+     * theory those are the same kind of decision: neither changes WHICH notes
+     * sound, only how they are stacked.
      *
-     * Root position is the default, which is what BassNote's first entry
-     * already means.
+     * There used to be a separate bass-note control offering exactly the first
+     * three of these. Two controls for one property meant whichever was set
+     * last won, and a cell could claim an inversion that the other setting had
+     * already overridden.
      */
-    int8_t fCellBass[kRingCount][24];
+    int8_t fCellVoicing[kRingCount][24];
 
     /* The wheel cell being edited, and whether its panel is open. */
     bool fWheelEditOpen = false;
@@ -5429,8 +5440,6 @@ private:
 
     /* On by default: without it a progression leaps about, because every chord
      * stacks upward from its own root. */
-    bool     fVoiceLeading = true;
-    BassNote fBassNote     = kBassFirst;
 
 
     /* Octave for pointer and touch input. Mirrors the DSP's setting; a played
@@ -5481,9 +5490,10 @@ private:
     int fPushedVoiceRing = -1;
     Extension fPushedExt = kExtNone;
 
-    /* Likewise for the inversion, which is per cell and so changes as often
-     * as the chord type does. -1 forces the first push. */
-    int fPushedBass      = -1;
+    /* The voicing last sent, which is per cell and so changes as often as the
+     * chord type does. -1 forces the first push. */
+    int fPushedVoicing   = -1;
+
 
     /* ---- keyboard setup state ---------------------------------------------- */
 

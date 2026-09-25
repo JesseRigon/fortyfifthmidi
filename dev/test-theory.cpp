@@ -469,29 +469,31 @@ int main()
     }
 
     /*
-     * Bass note. Two properties matter: the requested tone really is lowest,
-     * and the chord is still ascending afterwards. The second caught a real
-     * bug - applyVoicing shifted octaves without re-sorting, so "1st
-     * inversion" on A-C-E gave A3 C3 E3: neither ascending nor inverted, with
-     * whatever happened to be lowest in the bass rather than the named note.
+     * Inversion, through the voicing axis - the only route now that the
+     * separate bass-note control is gone. Two properties matter: the requested
+     * tone really is lowest, and the chord is still ascending afterwards. The
+     * second caught a real bug - the inversion cases shifted octaves without
+     * re-sorting, so "1st inversion" on A-C-E gave A3 C3 E3: neither ascending
+     * nor inverted, with whatever happened to be lowest in the bass rather
+     * than the named note.
      */
-    std::printf("\n=== bass note puts the right tone lowest ===\n");
+    std::printf("\n=== inversion puts the right tone lowest ===\n");
     {
-        struct { int root; ChordType type; BassNote bass; int wantPc;
+        struct { int root; ChordType type; int nth; int wantPc;
                  const char* what; } kBass[] = {
-            { 0, kChordMajor,  kBassFirst,  0, "C major, first  -> C" },
-            { 0, kChordMajor,  kBassSecond, 4, "C major, second -> E" },
-            { 0, kChordMajor,  kBassThird,  7, "C major, third  -> G" },
-            { 9, kChordMinor,  kBassFirst,  9, "A minor, first  -> A" },
-            { 9, kChordMinor,  kBassSecond, 0, "A minor, second -> C" },
-            { 9, kChordMinor,  kBassThird,  4, "A minor, third  -> E" },
-            { 0, kChordMajor7, kBassThird,  7, "Cmaj7,   third  -> G" },
+            { 0, kChordMajor,  0, 0, "C major, root -> C" },
+            { 0, kChordMajor,  1, 4, "C major, 1st  -> E" },
+            { 0, kChordMajor,  2, 7, "C major, 2nd  -> G" },
+            { 9, kChordMinor,  0, 9, "A minor, root -> A" },
+            { 9, kChordMinor,  1, 0, "A minor, 1st  -> C" },
+            { 9, kChordMinor,  2, 4, "A minor, 2nd  -> E" },
+            { 0, kChordMajor7, 2, 7, "Cmaj7,   2nd  -> G" },
         };
 
         for (const auto& b : kBass) {
             uint8_t n[8];
             const int c = buildChord(b.root, b.type, 4 * 12, n, kMaxChordTones);
-            applyBassNote(n, c, b.bass);
+            invertChord(n, c, b.nth);
 
             bool ascending = true;
             for (int i = 1; i < c; ++i)

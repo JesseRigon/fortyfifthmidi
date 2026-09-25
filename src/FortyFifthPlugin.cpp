@@ -162,10 +162,8 @@ protected:
         kStatePanic,
         kStateSelectedKey,
         kStateSingleNotes,
-        kStateVoiceLeading,
         kStateKeyMap,
         kStatePedalAction,
-        kStateBassNote,
         /*
          * The sequencer.
          *
@@ -287,13 +285,6 @@ protected:
                 state.label = "Single Notes";
                 state.defaultValue = "0";
                 break;
-            case kStateVoiceLeading:
-                /* On by default: without it a progression leaps about, because
-                 * every chord stacks upward from its own root. */
-                state.key = "voiceLeading";
-                state.label = "Voice Leading";
-                state.defaultValue = "1";
-                break;
             case kStateKeyMap:
                 /* All twelve bindings in one value, "action:value" per key,
                  * comma separated - twelve separate state keys would bloat the
@@ -305,12 +296,6 @@ protected:
             case kStatePedalAction:
                 state.key = "pedalAction";
                 state.label = "Sustain Pedal";
-                state.defaultValue = "0";
-                break;
-            case kStateBassNote:
-                /* Which chord tone is lowest: first (root), second, third. */
-                state.key = "bassNote";
-                state.label = "Bass Note";
                 state.defaultValue = "0";
                 break;
             case kStateProgression:
@@ -469,9 +454,6 @@ protected:
         else if (std::strcmp(key, "pedalAction") == 0)
             fPedalAction = static_cast<PedalAction>(
                 ((v % kPedalActionCount) + kPedalActionCount) % kPedalActionCount);
-        else if (std::strcmp(key, "bassNote") == 0)
-            fBassNote = static_cast<BassNote>(
-                ((v % kBassNoteCount) + kBassNoteCount) % kBassNoteCount);
         else if (std::strcmp(key, "progLegato") == 0)
             fProgLegato = (v != 0);
         else if (std::strcmp(key, "uiScreen") == 0)
@@ -495,13 +477,6 @@ protected:
                 if (! want)
                     fProgStopping.store(true, std::memory_order_release);
             }
-        }
-        else if (std::strcmp(key, "voiceLeading") == 0) {
-            fVoiceLeading = (v != 0);
-            /* Turning it off must not leave the next chord leading from a
-             * reference the user can no longer see the effect of. */
-            if (! fVoiceLeading)
-                fLastChordCount = 0;
         }
         else if (std::strcmp(key, "panic") == 0)
             fPanic.store(true, std::memory_order_release);
@@ -585,8 +560,6 @@ protected:
         else if (std::strcmp(key, "singleNotes") == 0)  v = fSingleNotes ? 1 : 0;
         else if (std::strcmp(key, "pedalAction") == 0)
             v = static_cast<int>(fPedalAction);
-        else if (std::strcmp(key, "voiceLeading") == 0) v = fVoiceLeading ? 1 : 0;
-        else if (std::strcmp(key, "bassNote") == 0)     v = static_cast<int>(fBassNote);
         else if (std::strcmp(key, "progLegato") == 0)   v = fProgLegato ? 1 : 0;
         else if (std::strcmp(key, "progRunning") == 0)
             v = fProgRunning.load(std::memory_order_acquire) ? 1 : 0;
@@ -2004,37 +1977,28 @@ private:
     int buildCellChord(int root, ChordType type, Ring ring, int octave,
                        uint8_t* out) const
     {
-        int n = buildChord(root, type, octave * 12, out, kMaxChordTones);
-
-        if (fVoiceLeading && ! fSingleNotes && leadingAppliesNow())
-            applyVoiceLeading(out, n, fLastChord, fLastChordCount,
-                              octave * 12 + 12);
-
-        /* Voicings rearrange chord tones; with a single note there is nothing
-         * to rearrange, and a doubling mode would quietly make it two notes. */
-        if (! fSingleNotes)
-            n = applyVoicing(out, n, fRingVoicing[ring], kMaxGroupNotes);
+        const int n = buildChord(root, type, octave * 12, out, kMaxChordTones);
 
         /*
-         * The bass note has the final say, after voicing, because it is the
-         * one thing the user picked explicitly about which note is lowest.
-         * Applying it earlier would let a voicing silently override it.
+         * Build, then voice. That is the whole chain now.
          *
-         * Not applied under voice leading: leading chooses the inversion
-         * itself, by nearness to the previous chord, and forcing a bass on top
-         * of that would undo the very thing it was asked to do.
+         * It used to be build, LEAD, voice, then apply a separate bass note -
+         * four steps, of which three were arguing about the same thing.
+         * Voice leading chose an inversion automatically, the voicing list
+         * offered inversions of its own, and the bass note forced a third
+         * answer on top, so the code had to suppress two of them to let the
+         * third through.
+         *
+         * Voicing is now the single axis for how a chord is arranged, set per
+         * cell, and nothing overrides it.
+         *
+         * Single-note mode skips it: there is nothing to rearrange, and a
+         * doubling voicing would quietly make it two notes.
          */
-        if (! fSingleNotes && ! usingVoiceLeading())
-            applyBassNote(out, n, fBassNote);
+        if (fSingleNotes)
+            return n;
 
-        return n;
-    }
-
-    /* Voice leading is on AND in force - it is suppressed during plain glide,
-     * where a re-inversion would defeat the single bend. */
-    bool usingVoiceLeading() const
-    {
-        return fVoiceLeading && leadingAppliesNow();
+        return applyVoicing(out, n, fRingVoicing[ring], kMaxGroupNotes);
     }
 
     /*
@@ -2288,11 +2252,6 @@ private:
     bool      fLatchEnabled   = false;
     /* Bypass chord generation and sound the root alone. */
     bool      fSingleNotes    = false;
-    /* Settle each chord near the previous one instead of always stacking
-     * upward from its own root. See applyVoiceLeading(). */
-    bool      fVoiceLeading   = true;
-    /* Which chord tone sits lowest, when voice leading is not choosing. */
-    BassNote  fBassNote       = kBassFirst;
 
     /*
      * ---- the sequencer ---------------------------------------------------

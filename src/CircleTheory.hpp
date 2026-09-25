@@ -380,6 +380,23 @@ static constexpr int kDegreeSemitone[7] = { 0, 2, 4, 5, 7, 9, 11 };
  * every cell in a ring produces the same interval pattern. That is what keeps
  * within-ring glide valid under spec 6.1.
  */
+/*
+ * ONE axis, not two.
+ *
+ * This list used to sit beside a separate "bass note" control offering root
+ * position, 1st and 2nd inversion - which is exactly what its own first three
+ * entries already did. Two controls for one property meant whichever was
+ * touched last won, and a cell could claim an inversion the other setting had
+ * quietly overridden.
+ *
+ * "Voicing" is the right umbrella term: in standard theory it covers both
+ * which chord tone is in the bass (inversion) and how the rest are spaced
+ * (drop 2, spread, doubling). They are the same kind of decision - how the
+ * chosen pitch classes are arranged - and neither changes WHICH notes sound.
+ *
+ * The order is deliberate: inversions first, since they are what most players
+ * reach for, then the spacings.
+ */
 enum Voicing {
     kVoicingRegular = 0,  /* root position, ascending */
     kVoicingInv1,         /* third in the bass */
@@ -396,7 +413,7 @@ enum Voicing {
 };
 
 static constexpr const char* kVoicingName[kVoicingCount] = {
-    "Regular",
+    "Root position",
     "1st inversion",
     "2nd inversion",
     "High as bass",
@@ -426,6 +443,32 @@ inline void sortAscending(uint8_t* notes, int count)
     }
 }
 
+/*
+ * Rotate a chord so the nth tone is lowest, keeping it ascending.
+ *
+ * Rotating rather than transposing is what makes this an inversion: the notes
+ * below the new bass move UP an octave, so the chord keeps its pitch classes
+ * and stays in roughly the same register instead of dropping.
+ *
+ * This was reachable two ways until recently - through a separate "bass note"
+ * control and through the voicing list's own inversion entries - which meant
+ * whichever was set last silently won. Voicing is the only route now.
+ */
+inline void invertChord(uint8_t* notes, int count, int nth)
+{
+    if (count <= 1 || nth <= 0 || nth >= count)
+        return;
+
+    /* Lift everything below the chosen tone by an octave; it then sits
+     * lowest and the rest stack above it. */
+    for (int i = 0; i < nth; ++i) {
+        if (notes[i] <= 115)
+            notes[i] = static_cast<uint8_t>(notes[i] + 12);
+    }
+
+    sortAscending(notes, count);
+}
+
 inline int applyVoicing(uint8_t* notes, int count, Voicing voicing,
                         size_t capacity)
 {
@@ -443,12 +486,15 @@ inline int applyVoicing(uint8_t* notes, int count, Voicing voicing,
         case kVoicingRegular:
             break;
 
+        /* Through invertChord() so both inversions re-sort. Done inline, they
+         * left the chord unsorted - which is how "1st inversion" on A-C-E once
+         * produced A3 C3 E3: raised, but neither ascending nor inverted. */
         case kVoicingInv1:
-            if (count >= 2) notes[0] = up(notes[0]);
+            invertChord(notes, count, 1);
             break;
 
         case kVoicingInv2:
-            if (count >= 3) { notes[0] = up(notes[0]); notes[1] = up(notes[1]); }
+            invertChord(notes, count, 2);
             break;
 
         case kVoicingHighAsBass:
@@ -625,51 +671,6 @@ inline void applyVoiceLeading(uint8_t* notes, int count,
 
     for (int i = 0; i < count; ++i)
         notes[i] = best[i];
-}
-
-/*
- * ---- bass note ----------------------------------------------------------
- *
- * Which chord tone sits at the bottom. This is the classical inversion
- * choice, stated as "which note is the bass" rather than as an ordinal,
- * because that is what a player actually hears and chooses.
- *
- *   First   the root      C E G   - root position
- *   Second  the third     E G C   - first inversion
- *   Third   the fifth     G C E   - second inversion
- */
-enum BassNote {
-    kBassFirst = 0,
-    kBassSecond,
-    kBassThird,
-    kBassNoteCount
-};
-
-static constexpr const char* kBassNoteName[kBassNoteCount] = {
-    "ROOT: FIRST", "ROOT: SECOND", "ROOT: THIRD"
-};
-
-/*
- * Rotate a chord so the requested tone is lowest, keeping it ascending.
- *
- * Rotating rather than transposing is what makes this an inversion: the notes
- * below the new bass move UP an octave, so the chord keeps its pitch classes
- * and stays in roughly the same register instead of dropping.
- */
-inline void applyBassNote(uint8_t* notes, int count, BassNote bass)
-{
-    const int want = static_cast<int>(bass);
-    if (count <= 1 || want <= 0 || want >= count)
-        return;
-
-    /* Lift everything below the chosen tone by an octave; it then sits
-     * lowest and the rest stack above it. */
-    for (int i = 0; i < want; ++i) {
-        if (notes[i] <= 115)
-            notes[i] = static_cast<uint8_t>(notes[i] + 12);
-    }
-
-    sortAscending(notes, count);
 }
 
 /* Two chords can share a single pitch bend only if their interval patterns are
