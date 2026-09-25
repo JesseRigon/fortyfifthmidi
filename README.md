@@ -1,3 +1,11 @@
+# ALPHA — changing fast, expect breakage
+
+This is early alpha. Things change quickly and often: controls move, settings
+are added and removed, and a build from last week may not behave like today's.
+Saved state is not guaranteed to survive between versions.
+
+---
+
 # FortyFifthMidi
 
 A MIDI-generating Circle of Fifths plugin (CLAP + VST3). Click a position on a
