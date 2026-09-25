@@ -69,8 +69,9 @@ public:
         loadPreset(fProg, 0, 0);
         pushProgression();
 
-        /* Every wheel cell follows its ring until the user says otherwise. */
-        std::memset(fCellExt, kExtFollowRing, sizeof(fCellExt));
+        /* Every wheel cell opens as a plain triad in root position. */
+        std::memset(fCellExt, kExtDefault, sizeof(fCellExt));
+        std::memset(fCellBass, kBassFirst, sizeof(fCellBass));
     }
 
     /* Closing the editor must close the log, or the last lines never reach
@@ -343,7 +344,7 @@ protected:
          * the short form - "7TH", "SUS4" - because which extension it is
          * matters as much as that it differs.
          */
-        if (fCellExt[ring][index % 24] != kExtFollowRing) {
+        if (fCellExt[ring][index % 24] != kExtDefault) {
             const Extension e =
                 static_cast<Extension>(fCellExt[ring][index % 24]);
 
@@ -442,9 +443,15 @@ protected:
      */
     Extension cellExtension(int position, Ring ring) const
     {
+        /*
+         * A cell that has never been set is a plain TRIAD, not "whatever the
+         * ring says". The ring-wide extension control is gone - chord type is
+         * a property of the cell - so a fresh session opens as triads
+         * everywhere, which is the honest starting point for a chord wheel.
+         */
         const int8_t own = fCellExt[ring][position % 24];
-        const Extension e = (own == kExtFollowRing)
-            ? fRingExt[ring]
+        const Extension e = (own == kExtDefault)
+            ? kExtNone
             : static_cast<Extension>(own);
 
         const int deg = semitoneForCell(position, ring, fSelectedKey);
@@ -468,16 +475,35 @@ protected:
     {
         const Extension e = cellExtension(position, ring);
 
-        if (fPushedExtRing == static_cast<int>(ring) && fPushedExt == e)
-            return;
+        if (fPushedExtRing != static_cast<int>(ring) || fPushedExt != e) {
+            fPushedExtRing = static_cast<int>(ring);
+            fPushedExt     = e;
 
-        fPushedExtRing = static_cast<int>(ring);
-        fPushedExt     = e;
+            char key[8], buf[16];
+            std::snprintf(key, sizeof key, "ext%d", static_cast<int>(ring));
+            std::snprintf(buf, sizeof buf, "%d", static_cast<int>(e));
+            setState(key, buf);
+        }
 
-        char key[8], buf[16];
-        std::snprintf(key, sizeof key, "ext%d", static_cast<int>(ring));
-        std::snprintf(buf, sizeof buf, "%d", static_cast<int>(e));
-        setState(key, buf);
+        /*
+         * And this cell's inversion - the third axis, pushed the same way and
+         * for the same reason: the DSP holds one value, and the editor asserts
+         * the right one immediately before the gesture that reads it.
+         *
+         * Voice leading would override a chosen bass, so taking manual control
+         * per cell means leading is off. That is the same rule the ROOT button
+         * already followed; it is now decided per cell rather than globally.
+         */
+        const int8_t bass = fCellBass[ring][position % 24];
+
+        if (bass != fPushedBass) {
+            fPushedBass = bass;
+
+            char buf[16];
+            std::snprintf(buf, sizeof buf, "%d", static_cast<int>(bass));
+            setState("bassNote", buf);
+            setState("voiceLeading", "0");
+        }
     }
 
     /* ---- the wheel's cell editor -------------------------------------------
@@ -494,8 +520,12 @@ protected:
         /* Centred on the wheel, not on the cell: the cells are wedges, and a
          * panel hanging off one would cover its neighbours. */
         const float w = kWheelEditW;
-        const float rows = static_cast<float>(wheelEditRows());
-        const float h = 34.0f + rows * kMenuRowH + 10.0f;
+
+        /* Two labelled sections - chord type, then bass - each with a heading
+         * row above its options. */
+        const float rows = static_cast<float>(wheelEditRows() +
+                                              kBassNoteCount);
+        const float h = 34.0f + rows * kMenuRowH + 2.0f * kMenuRowH + 10.0f;
 
         float x = wheelCentreX() - w * 0.5f;
         float y = wheelCentreY() - h * 0.5f;
@@ -531,7 +561,7 @@ protected:
     int wheelEditValueAt(int row) const
     {
         if (row == 0)
-            return kExtFollowRing;
+            return kExtDefault;
 
         int n = 1;
         for (int e = 0; e < kExtCount; ++e) {
@@ -541,7 +571,7 @@ protected:
                 return e;
             ++n;
         }
-        return kExtFollowRing;
+        return kExtDefault;
     }
 
     Button wheelEditRowRect(int row) const
@@ -579,31 +609,64 @@ protected:
         text(p.x + 10.0f, p.y + 16.0f,
              labelForPosition(fEditCellPos, fEditCellRing), nullptr);
 
-        const int8_t own = fCellExt[fEditCellRing][fEditCellPos % 24];
+        const int8_t own  = fCellExt[fEditCellRing][fEditCellPos % 24];
+        const int8_t bass = fCellBass[fEditCellRing][fEditCellPos % 24];
 
-        for (int row = 0; row < wheelEditRows(); ++row) {
-            const Button r = wheelEditRowRect(row);
-            const int    v = wheelEditValueAt(row);
-            const bool   cur = (v == own);
+        int row = 0;
 
-            if (cur) {
-                beginPath();
-                rect(r.x, r.y, r.w, r.h);
-                fillColor(Color(0.24f, 0.40f, 0.56f));
-                fill();
-            }
+        /* ---- chord type ---- */
+        drawWheelEditHeading(row++, "CHORD");
 
-            fontSize(10.5f);
-            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-            fillColor(cur ? Color(0.96f, 0.98f, 1.00f)
-                          : Color(0.78f, 0.82f, 0.88f));
+        for (int i = 0; i < wheelEditRows(); ++i, ++row) {
+            const int  v   = wheelEditValueAt(i);
+            const bool cur = (v == own);
 
-            const char* label = (v == kExtFollowRing)
-                ? "Follow the ring"
-                : kExtensionName[v];
-
-            text(r.x + 6.0f, r.y + r.h * 0.5f, label, nullptr);
+            drawWheelEditRow(row, cur,
+                             (v == kExtDefault) ? "Triad (default)"
+                                                : kExtensionName[v]);
         }
+
+        /* ---- bass note, the third axis ---- */
+        drawWheelEditHeading(row++, "BASS");
+
+        for (int b = 0; b < kBassNoteCount; ++b, ++row) {
+            /* The names without the "ROOT: " prefix the header button needs -
+             * here the heading above already says what these are. */
+            static const char* const kShort[kBassNoteCount] = {
+                "Root position", "1st inversion", "2nd inversion"
+            };
+            drawWheelEditRow(row, b == bass, kShort[b]);
+        }
+    }
+
+    void drawWheelEditHeading(int row, const char* text_)
+    {
+        const Button r = wheelEditRowRect(row);
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(9.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.48f, 0.53f, 0.62f));
+        text(r.x + 2.0f, r.y + r.h * 0.5f, text_, nullptr);
+    }
+
+    void drawWheelEditRow(int row, bool current, const char* label)
+    {
+        const Button r = wheelEditRowRect(row);
+
+        if (current) {
+            beginPath();
+            rect(r.x, r.y, r.w, r.h);
+            fillColor(Color(0.24f, 0.40f, 0.56f));
+            fill();
+        }
+
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(10.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(current ? Color(0.96f, 0.98f, 1.00f)
+                          : Color(0.78f, 0.82f, 0.88f));
+        text(r.x + 8.0f, r.y + r.h * 0.5f, label, nullptr);
     }
 
     bool wheelEditClick(double px, double py)
@@ -611,16 +674,35 @@ protected:
         const float x = static_cast<float>(px);
         const float y = static_cast<float>(py);
 
-        for (int row = 0; row < wheelEditRows(); ++row) {
+        /* Row 0 is the CHORD heading; the options follow it. */
+        int row = 1;
+
+        for (int i = 0; i < wheelEditRows(); ++i, ++row) {
             if (! hit(wheelEditRowRect(row), x, y))
                 continue;
 
             fCellExt[fEditCellRing][fEditCellPos % 24] =
-                static_cast<int8_t>(wheelEditValueAt(row));
+                static_cast<int8_t>(wheelEditValueAt(i));
 
             /* The pushed value is now stale, so the next press re-sends. */
             fPushedExtRing = -1;
 
+            fWheelEditOpen = false;
+            repaint();
+            return true;
+        }
+
+        ++row;   /* the BASS heading */
+
+        for (int b = 0; b < kBassNoteCount; ++b, ++row) {
+            if (! hit(wheelEditRowRect(row), x, y))
+                continue;
+
+            fCellBass[fEditCellRing][fEditCellPos % 24] =
+                static_cast<int8_t>(b);
+
+            /* Bass is pushed per press, like the extension, so nothing needs
+             * sending now - but the wheel must redraw its marker. */
             fWheelEditOpen = false;
             repaint();
             return true;
@@ -1091,16 +1173,18 @@ protected:
     Button scaleButton()       const { return { 166.0f, kDropY, 150.0f, kDropH }; }
     Button slideKeyButton()    const { return { 322.0f, kDropY, 104.0f, kDropH }; }
 
-    Button extButton(int ring) const
-    {
-        const float w = (getWidth() - 20.0f) / 3.0f;
-        return { 10.0f + ring * w, kDropY, w * 0.48f - 2.0f, kDropH };
-    }
-
+    /*
+     * Voicing, one per ring, across the top third of the window.
+     *
+     * These used to share the row with per-ring extension dropdowns and had
+     * half the width each. Chord type is per cell now, so the voicings have
+     * the row to themselves - and are narrower than a third, so the hint
+     * text about right-clicking has somewhere to go.
+     */
     Button voiceButton(int ring) const
     {
-        const float w = (getWidth() - 20.0f) / 3.0f;
-        return { 10.0f + ring * w + w * 0.50f, kDropY, w * 0.50f - 2.0f, kDropH };
+        const float w = 132.0f;
+        return { 10.0f + ring * (w + 6.0f), kDropY, w, kDropH };
     }
 
     static constexpr float kMenuRowH = 19.0f;
@@ -3651,21 +3735,18 @@ protected:
                      true);
 
         /*
-         * Which chord tone is in the bass: auto, or one the user names.
+         * THE ROOT BUTTON IS GONE.
          *
-         * All four states are always available now. They were not while plain
-         * glide existed - it suspended voice leading, so AUTO was dead for as
-         * long as it was on, and the button carried a "(HELD)" label and a
-         * warning line explaining why. Removing that mode removed the whole
-         * apparatus.
+         * Bass is the third axis of a chord - degree, quality, inversion - and
+         * it is now set per cell alongside the other two, in the same editor.
+         * A global control for one axis of a per-cell property would be a
+         * second way to set the same thing, and the one that lost would be
+         * whichever was touched last.
          *
-         * Lit for a CHOSEN bass, grey for auto: green means "you are holding
-         * this", which is true of first, second and third and not of auto,
-         * where the plugin is deciding.
+         * Voice leading went with it. It chooses inversions automatically,
+         * which is precisely what the per-cell bass is for; leaving both would
+         * mean a cell's stated inversion could be silently overridden.
          */
-        drawButton(voiceLeadButton(),
-                   fVoiceLeading ? "ROOT: AUTO" : kBassNoteName[fBassNote],
-                   ! fVoiceLeading);
 
         /*
          * Row 2 differs by screen: the wheel wants per-ring extensions and
@@ -3717,24 +3798,38 @@ protected:
             return;
         }
 
-        /* Per-ring dropdowns, labelled by ring so the mapping is unambiguous. */
+        /*
+         * Per-ring VOICINGS only. The extension dropdowns are gone: chord type
+         * is per cell now, and a ring-wide control that a cell could silently
+         * override was two ways to set one thing.
+         *
+         * Voicing stays per-ring because it is not yet per-cell. When it moves,
+         * this row goes with it.
+         */
         static const char* const kRingTag[kRingCount] = { "MAJ", "MIN", "DIM" };
 
         for (int r = 0; r < kRingCount; ++r) {
-            char ext[48], voi[48];
-            std::snprintf(ext, sizeof(ext), "%s: %s",
-                          kRingTag[r], kExtShort[fRingExt[r]]);
+            char voi[48];
+            std::snprintf(voi, sizeof(voi), "%s: %s",
+                          kRingTag[r], kVoicingName[fRingVoice[r]]);
             /* Uppercased to match the row; the menu keeps the full names,
              * where there is room for them. */
-            std::snprintf(voi, sizeof(voi), "%s", kVoicingName[fRingVoice[r]]);
             for (char* p = voi; *p != '\0'; ++p)
                 if (*p >= 'a' && *p <= 'z') *p = static_cast<char>(*p - 32);
 
-            drawDropdown(extButton(r), ext,
-                         fOpenMenu == kMenuExt && fOpenMenuRing == r);
             drawDropdown(voiceButton(r), voi,
                          fOpenMenu == kMenuVoicing && fOpenMenuRing == r);
         }
+
+        /* Say where chord type lives now, since the control that used to be
+         * here has gone. */
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(9.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.45f, 0.49f, 0.57f));
+        text(voiceButton(kRingCount - 1).x + voiceButton(0).w + 12.0f,
+             kDropY + kDropH * 0.5f,
+             "right-click a cell for its chord type", nullptr);
     }
 
     /* Unused now that the chord selector is per-ring, but kept because the
@@ -3847,10 +3942,13 @@ protected:
                 anchor = progDupRect(fMenuSection);
                 cur    = -1;   /* an action, not a setting - nothing is current */
                 break;
-            default:   /* kMenuExt */
-                rows   = static_cast<int>(kExtCount);
-                anchor = extButton(fOpenMenuRing);
-                cur    = static_cast<int>(fRingExt[fOpenMenuRing]);
+            default:
+                /* Every menu has an explicit case above. Reaching here means
+                 * one was added without a shape, so draw nothing rather than
+                 * index a table with the wrong count. */
+                rows   = 0;
+                anchor = Button{ 0.0f, 0.0f, 0.0f, 0.0f };
+                cur    = -1;
                 break;
         }
     }
@@ -3942,14 +4040,9 @@ protected:
                             }
                             break;
                         }
-                        default: {   /* kMenuExt */
-                            fRingExt[fOpenMenuRing] = static_cast<Extension>(i);
-                            char key[8];
-                            std::snprintf(key, sizeof(key), "ext%d",
-                                          fOpenMenuRing);
-                            setState(key, buf);
+                        default:
+                            /* Every menu has an explicit case above. */
                             break;
-                        }
                     }
 
                     fOpenMenu = kMenuNone;
@@ -4112,7 +4205,9 @@ protected:
             return true;
         }
 
-        if (hit(rollHeader(), px, py)) {
+        /* Not on the setup screen, where the roll is not drawn - an invisible
+         * header would toggle a panel the user cannot see. */
+        if (fScreen != kScreenKeys && hit(rollHeader(), px, py)) {
             fRollOpen = ! fRollOpen;
             repaint();
             return true;
@@ -4180,55 +4275,11 @@ protected:
             return true;
         }
 
-        if (hit(voiceLeadButton(), px, py)) {
-            /*
-             * Cycles auto -> first -> second -> third -> auto.
-             *
-             * "auto" is voice leading choosing the inversion itself. Taking
-             * manual control has to switch it off, or the chosen bass would be
-             * silently ignored - which is exactly how the old toggle appeared
-             * to do nothing while glide had leading suppressed anyway.
-             */
-            /*
-             * Cycle on the SETTING, not on whether leading is currently in
-             * force. Keying off the latter meant that with glide on - where
-             * leading is suspended - a button reading "FIRST" would advance to
-             * SECOND, so FIRST was unreachable by clicking.
-             */
-            /*
-             * auto -> first -> second -> third -> auto, unconditionally.
-             *
-             * AUTO used to be skipped while plain glide was on, because that
-             * mode suspended voice leading and offering a dead state would
-             * have been another lie. Nothing suspends leading now, so all four
-             * states are always live.
-             */
-            if (fVoiceLeading) {
-                fVoiceLeading = false;
-                fBassNote     = kBassFirst;
-            } else if (fBassNote == kBassNoteCount - 1) {
-                fVoiceLeading = true;          /* wrap back to auto */
-                fBassNote     = kBassFirst;
-            } else {
-                fVoiceLeading = false;
-                fBassNote     = static_cast<BassNote>(fBassNote + 1);
-            }
-
-            pushRootChoice();
-            repaint();
-            return true;
-        }
 
         /* Only on the wheel screen: these buttons are not drawn in Slide Mode,
          * and an invisible hit box would swallow clicks meant for the strips. */
         if (fScreen == kScreenCircle) {
             for (int r = 0; r < kRingCount; ++r) {
-                if (hit(extButton(r), px, py)) {
-                    fOpenMenu = kMenuExt;
-                    fOpenMenuRing = r;
-                    repaint();
-                    return true;
-                }
                 if (hit(voiceButton(r), px, py)) {
                     fOpenMenu = kMenuVoicing;
                     fOpenMenuRing = r;
@@ -4720,11 +4771,19 @@ protected:
         drawPanelHeader(monitorHeader(), "Event log", fMonitorOpen,
                         "  (click to expand)");
 
-        /* The keyboard sits below the log, and opens independently - seeing
-         * what the chords produced should not require the text stream. */
-        drawPianoRoll();
-        drawPanelHeader(rollHeader(), "Notes", fRollOpen,
-                        "  (click to expand)");
+        /*
+         * The keyboard sits below the log, and opens independently - seeing
+         * what the chords produced should not require the text stream.
+         *
+         * Not on the Setup screen, which sounds nothing: a piano roll that can
+         * only ever be empty is just a band of dead space, and this screen
+         * needs the room for its settings.
+         */
+        if (fScreen != kScreenKeys) {
+            drawPianoRoll();
+            drawPanelHeader(rollHeader(), "Notes", fRollOpen,
+                            "  (click to expand)");
+        }
 
         const Button pb = panicButton();
         beginPath();
@@ -5106,10 +5165,9 @@ private:
     /*
      * ---- per-cell extensions on the wheel -----------------------------------
      *
-     * Every cell may carry its own extension. kExtFollowRing means "whatever
-     * the ring is set to", which is the default, so the per-ring dropdowns
-     * keep working as a bulk control and only cells the user has deliberately
-     * changed diverge from them.
+     * Every cell carries its own extension. kExtDefault means the cell has
+     * never been set and plays a plain triad - the honest starting point for
+     * a chord wheel, and what a fresh session opens as.
      *
      * This became possible when single-bend glide was removed. That mode could
      * only move between chords of identical shape, so a ring whose cells had
@@ -5120,8 +5178,22 @@ private:
      * Stored for the largest ring, and indexed by ring, so the minor ring's
      * twenty-four cells fit alongside the key ring's twelve.
      */
-    static constexpr int kExtFollowRing = -1;
+    static constexpr int kExtDefault = -1;
     int8_t fCellExt[kRingCount][24];
+
+    /*
+     * And each cell's INVERSION - which chord tone sits lowest.
+     *
+     * The third axis. A chord is a degree (which scale note it is built on), a
+     * quality (what stacks above that root), and an inversion (which of those
+     * tones is in the bass). They are independent in standard theory: G7 and
+     * G7/B are the same chord, differently voiced, so the bass cannot be
+     * folded into the chord type without losing the distinction.
+     *
+     * Root position is the default, which is what BassNote's first entry
+     * already means.
+     */
+    int8_t fCellBass[kRingCount][24];
 
     /* The wheel cell being edited, and whether its panel is open. */
     bool fWheelEditOpen = false;
@@ -5408,6 +5480,10 @@ private:
     int fPushedExtRing   = -1;
     int fPushedVoiceRing = -1;
     Extension fPushedExt = kExtNone;
+
+    /* Likewise for the inversion, which is per cell and so changes as often
+     * as the chord type does. -1 forces the first push. */
+    int fPushedBass      = -1;
 
     /* ---- keyboard setup state ---------------------------------------------- */
 
