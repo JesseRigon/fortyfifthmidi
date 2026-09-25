@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 cd /home/jesse/src/fortyfifthmidi || exit 1
 rc=0
-for t in test-theory test-chordname test-layout test-binding test-progression test-diatonic; do
+for t in test-theory test-chordname test-layout test-binding test-progression test-diatonic test-octave; do
   printf '%-18s ' "$t"
   if g++ -std=c++17 -I src "dev/$t.cpp" -o "/tmp/$t" 2>/tmp/err.txt; then
     out=$("/tmp/$t" 2>&1 | tail -1)

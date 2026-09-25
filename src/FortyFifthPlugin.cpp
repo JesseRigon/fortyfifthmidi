@@ -409,8 +409,15 @@ protected:
                                      % kVoicingCount);
         }
         else if (std::strcmp(key, "octave") == 0) {
-            if (v != fOctave) {
-                fOctave = v;
+            /* This key is the BASE octave and nothing else. Screens send their
+             * own per-chord shift with the gesture, so nothing may write an
+             * effective octave here - that is what destroyed the base and made
+             * the editor transpose itself down on every click. */
+            const int base = clampOctave(v);
+            if (base != fOctave) {
+                logLine("base octave %d -> %d%s", fOctave, base,
+                        (base != v) ? " (clamped)" : "");
+                fOctave = base;
                 /* Ask the audio thread to move anything already sounding. The
                  * slider is a performance control - dragging it while a chord
                  * is held must carry that chord with it, not merely change
@@ -499,11 +506,32 @@ protected:
         char verb[16] = {0};
         int  position = 0;
         int  ring     = 0;
+        int  octShift = 0;
 
-        if (std::sscanf(value, "%15[^:]:%d:%d", verb, &position, &ring) != 3)
+        /*
+         * The octave shift is optional, so a three-field gesture still parses
+         * and means "play at the base octave".
+         *
+         * It arrives with the gesture rather than through the "octave" state
+         * key because that key is the BASE - one number, owned by the slider.
+         * Slide Mode used to add its strip and section shifts into that key
+         * before sending, which overwrote the base with an effective octave.
+         * The editor read its own overwritten value back as a new base, and
+         * transposed itself down once per click until it was inaudible.
+         */
+        const int fields = std::sscanf(value, "%15[^:]:%d:%d:%d",
+                                       verb, &position, &ring, &octShift);
+        if (fields < 3)
             return;
+        if (fields < 4)
+            octShift = 0;
         if (ring < 0 || ring >= kRingCount)
             return;
+
+        /* Clamped, not rejected: an out-of-range shift should play at the edge
+         * of the range rather than drop the gesture and sound nothing. */
+        if (octShift < kGestureOctMin) octShift = kGestureOctMin;
+        if (octShift > kGestureOctMax) octShift = kGestureOctMax;
 
         /* Validate against the ring's OWN cell count, not a fixed 12. The minor
          * ring has 24, so a hardcoded upper bound silently discarded half of it
@@ -519,6 +547,11 @@ protected:
         else if (std::strcmp(verb, "retrigger") == 0) kind = kGestureRetrigger;
         else return;
 
+        /* The shift is stored FIRST, so the release-store of the gesture word
+         * below publishes it too. run() claims the gesture with an acquire and
+         * therefore sees the shift that belongs to it, never the previous
+         * gesture's. */
+        fPendingGestureOct.store(octShift, std::memory_order_relaxed);
         fPendingGesture.store((kind << 16) | (ring << 8) | position,
                               std::memory_order_release);
     }
@@ -686,7 +719,8 @@ protected:
         const int32_t packed = fPendingGesture.exchange(kNoGesture,
                                                         std::memory_order_acquire);
         if (packed != kNoGesture)
-            handleGesture(packed);
+            handleGesture(packed,
+                          fPendingGestureOct.load(std::memory_order_relaxed));
 
         /* The sequencer, before the glide: a beat that lands this block should
          * be sounding by the time the glide is advanced over it. */
@@ -734,6 +768,29 @@ private:
         kGestureRetrigger
     };
     static constexpr int32_t kNoGesture = -1;
+
+    /* How far a screen may shift one chord from the base octave. Wide enough
+     * for Slide Mode's octave-up tonic and the sequencer's per-cell range,
+     * narrow enough that a corrupt value cannot transpose out of MIDI range. */
+    static constexpr int kGestureOctMin = -4;
+    static constexpr int kGestureOctMax =  4;
+
+    /*
+     * The playable octave range, matching the slider in the editor.
+     *
+     * A base plus a screen's shift can land outside it - Slide Mode's top strip
+     * is the tonic an octave up, so a base of 7 asks for 8. Clamping keeps the
+     * chord audible at the edge of the range instead of building notes above
+     * MIDI 127, where buildChord would silently drop tones and the chord would
+     * sound wrong rather than merely high.
+     */
+    static constexpr int kOctaveLow  = 1;
+    static constexpr int kOctaveHigh = 7;
+
+    static int clampOctave(int oct)
+    {
+        return oct < kOctaveLow ? kOctaveLow : (oct > kOctaveHigh ? kOctaveHigh : oct);
+    }
 
     /* ---- MIDI emission helpers ------------------------------------------- */
 
@@ -797,6 +854,16 @@ private:
      *
      * Costs nothing when logging is off: one atomic load and a return.
      */
+    /* Which generator a group came from, for the log. A bare source number is
+     * a packed ring/position that means nothing to a reader trying to work out
+     * why a chord played where it did. */
+    static const char* sourceName(int source)
+    {
+        if (source == kProgSource)   return "sequencer";
+        if (source == kMergedSource) return "merged";
+        return "gesture";
+    }
+
     void logLine(const char* fmt, ...)
     {
         if (! fLogEnabled.load(std::memory_order_relaxed))
@@ -1020,6 +1087,20 @@ private:
 
         uint8_t notes[kMaxGroupNotes];
         const int n = buildCellChord(root, type, ring, octave, notes);
+
+        /*
+         * What this chord was built from, before any of it reaches the wire.
+         *
+         * The monitor shows the resulting notes and their octaves - noteName()
+         * renders C4, E4 and so on - but not the SETTINGS that produced them.
+         * So a chord in the wrong octave looked identical in the log to a
+         * chord in the right one, and there was no way to tell a bad base from
+         * a bad shift. This line is the missing half: base, the shift this
+         * gesture carried, and the octave they resolved to.
+         */
+        logLine("chord %s oct %d (base %d%+d) root %d type %d ring %d: %d notes",
+                sourceName(source), octave, fOctave, octave - fOctave,
+                root, static_cast<int>(type), static_cast<int>(ring), n);
 
         const bool mpe = (fGlideMode == kGlideMpe);
 
@@ -1308,7 +1389,7 @@ private:
      * moment the gesture arrives - this is the point where spec section 5's rule
      * takes physical effect, because everything downstream is concrete MIDI.
      */
-    void handleGesture(int32_t packed)
+    void handleGesture(int32_t packed, int octShift)
     {
         const int kind     = (packed >> 16) & 0xFF;
         const int ring     = (packed >> 8) & 0xFF;
@@ -1319,6 +1400,11 @@ private:
         const ChordType type = chordTypeForRing(r, position);
 
         const int source = (ring << 8) | position;
+
+        /* The one place a pointer gesture's octave is decided: the instrument's
+         * base, plus whatever shift the screen asked for. Every startGroup
+         * below takes this, so no screen can set an octave by any other route. */
+        const int gestureOct = clampOctave(fOctave + octShift);
 
         switch (kind) {
             case kGesturePress: {
@@ -1343,7 +1429,7 @@ private:
                     stopAllGroups(0);
                     fGestureVelocity = pickVelocity();
                     startGroup(0, source, root, type, r, fGestureVelocity, true,
-                               fOctave);
+                               gestureOct);
                     fDragSource = source;
                     break;
                 }
@@ -1359,7 +1445,7 @@ private:
                  * mid-movement. */
                 startGroup(0, source, root, type, r, fGestureVelocity,
                            /* retriggerDuplicates */ fGlideMode == kGlideOff,
-                           fOctave);
+                           gestureOct);
                 fDragSource = source;
 
                 fNoteOffCountdown = fHoldToSustain
@@ -1471,7 +1557,7 @@ private:
 
                 fGestureVelocity = pickVelocity();
                 startGroup(0, source, root, type, r, fGestureVelocity,
-                           /* retriggerDuplicates */ true, fOctave);
+                           /* retriggerDuplicates */ true, gestureOct);
                 fDragSource = source;
 
                 fNoteOffCountdown = fHoldToSustain
@@ -2125,7 +2211,7 @@ private:
          * the plugin up or down carries the progression with it and a chord
          * written low stays low relative to its neighbours. */
         startGroup(0, kProgSource, root, type, ring, pickVelocity(), true,
-                   fOctave + cell.octave);
+                   clampOctave(fOctave + cell.octave));
     }
 
     /* Silence the sequencer's group, leaving hand-played ones alone. */
@@ -2349,6 +2435,10 @@ private:
     /* Written by setState() on the UI thread, claimed by run() on the audio
      * thread. See queueGesture(). */
     std::atomic<int32_t> fPendingGesture { kNoGesture };
+
+    /* The octave shift belonging to the pending gesture. Published by the
+     * release-store of fPendingGesture, claimed by its acquire-exchange. */
+    std::atomic<int32_t> fPendingGestureOct { 0 };
     uint8_t   fGestureVelocity = 100;
 
     /* DSP -> UI event log. Always built; the UI reads it via direct access. */

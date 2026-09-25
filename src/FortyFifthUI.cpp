@@ -382,11 +382,27 @@ protected:
      * settings at the instant the gesture arrives and bakes concrete MIDI from
      * them (spec section 5). sendNote() cannot express a chord or a glide.
      */
-    void sendGesture(const char* verb, int position, Ring ring)
+    /*
+     * octShift is how far THIS screen wants this one chord moved from the
+     * instrument's base octave. It travels with the gesture rather than being
+     * folded into the "octave" state key, because that key is the base - the
+     * value the slider shows and the editor must remember. Writing an effective
+     * octave into it destroyed the base, and the editor then read its own
+     * overwritten value back as a new base and transposed itself down on every
+     * click until nothing was audible.
+     *
+     * Screens decide their own offsets and the DSP adds them to one base:
+     *
+     *   wheel       0                   plays at the base
+     *   slide       strip + section     the top strip is the tonic an octave up
+     *   sequencer   the cell's own      per-cell, added DSP-side already
+     *   keyboard    from the played note, which carries its own octave
+     */
+    void sendGesture(const char* verb, int position, Ring ring, int octShift = 0)
     {
         char value[32];
-        std::snprintf(value, sizeof(value), "%s:%d:%d",
-                      verb, position, static_cast<int>(ring));
+        std::snprintf(value, sizeof(value), "%s:%d:%d:%d",
+                      verb, position, static_cast<int>(ring), octShift);
         setState("gesture", value);
     }
 
@@ -2944,22 +2960,17 @@ protected:
         Ring ring     = kRingKey;
         cellForDegree(c.degree, fSelectedKey, position, ring);
 
-        /* The cell's own extension, and its octave offset, before the
-         * gesture that reads them. */
+        /* The cell's own extension, before the gesture that reads it. */
         char key[8], buf[16];
         std::snprintf(key, sizeof key, "ext%d", static_cast<int>(ring));
         std::snprintf(buf, sizeof buf, "%d", static_cast<int>(c.ext));
         setState(key, buf);
         fPushedExtRing = -1;          /* next wheel press must re-assert */
 
-        const int oct = fOctave + c.octave;
-        if (oct != fPushedOctave) {
-            fPushedOctave = oct;
-            std::snprintf(buf, sizeof buf, "%d", oct);
-            setState("octave", buf);
-        }
-
-        sendGesture("press", position, ring);
+        /* The cell's octave rides with the gesture, exactly as the sequencer's
+         * own playback adds it DSP-side - so an audition sounds at the pitch
+         * the grid will play, without touching the base octave. */
+        sendGesture("press", position, ring, c.octave);
 
         fAuditionActive = true;
         fActivePosition = position;
@@ -3442,7 +3453,7 @@ protected:
         if (slide < 0)
             return false;
 
-        applySection(slide, section);
+        const int octShift = applySection(slide, section);
 
         const SlideDef* defs = slidesForScale(fScale);
         int  pos;
@@ -3452,7 +3463,7 @@ protected:
         const bool same = (fLatchEnabled &&
                            slide == fActiveSlide && section == fActiveSection);
 
-        sendGesture("press", pos, ring);
+        sendGesture("press", pos, ring, octShift);
 
         if (same) {
             fActiveSlide    = -1;
@@ -3497,7 +3508,7 @@ protected:
          */
         const bool sameColumn = (slide == fActiveSlide);
 
-        applySection(slide, section);
+        const int octShift = applySection(slide, section);
 
         const SlideDef* defs = slidesForScale(fScale);
         int  pos;
@@ -3514,7 +3525,7 @@ protected:
         /* One gesture, not a release followed by a press: the handoff to the
          * audio thread holds a single slot, so the second would overwrite the
          * first and the old chord would never stop. */
-        sendGesture(sameColumn ? "retrigger" : "move", pos, ring);
+        sendGesture(sameColumn ? "retrigger" : "move", pos, ring, octShift);
 
         repaint();
         return true;
@@ -3526,8 +3537,12 @@ protected:
      * The extension is per-ring in the engine, so the ring this slide lands on
      * is the one to set - which is also what keeps a strip's variation from
      * silently changing chords on another ring.
+     *
+     * Returns the octave shift this strip and section want, for the caller to
+     * pass to sendGesture(). See the comment at the return for why it is not
+     * pushed as state.
      */
-    void applySection(int slide, int section)
+    int applySection(int slide, int section)
     {
         const SlideDef* defs = slidesForScale(fScale);
         int  pos;
@@ -3576,14 +3591,18 @@ protected:
             setState(key, "0");
         }
 
-        /* The slide's own octave shift (the last strip is the tonic an octave
-         * up) plus whatever the section asks for. */
-        const int oct = fOctave + defs[slide].octaveShift + octShift;
-        if (oct != fPushedOctave) {
-            fPushedOctave = oct;
-            std::snprintf(buf, sizeof(buf), "%d", oct);
-            setState("octave", buf);
-        }
+        /*
+         * The slide's own octave shift (the last strip is the tonic an octave
+         * up) plus whatever the section asks for.
+         *
+         * RETURNED, not written to the "octave" state key. That key is the
+         * base octave the slider owns; writing an effective octave into it
+         * overwrote the base, and the editor read its own overwritten value
+         * back as a new base and transposed itself down on every click until
+         * nothing was audible. The shift now travels with the gesture, and the
+         * DSP adds it to the base in one place.
+         */
+        return defs[slide].octaveShift + octShift;
     }
 
     /*
@@ -3621,8 +3640,10 @@ protected:
          * changed underneath it. */
         fPushedExtRing   = -1;
         fPushedVoiceRing = -1;
-        fPushedOctave    = -999;
 
+        /* The base octave, which is all this key ever carries now. Recorded as
+         * pushed so the host's echo of it is recognised as our own. */
+        fPushedOctave = fOctave;
         std::snprintf(buf, sizeof(buf), "%d", fOctave);
         setState("octave", buf);
     }
@@ -4886,21 +4907,22 @@ protected:
         }
         else if (std::strcmp(key, "octave") == 0) {
             /*
-             * NOT taken while Slide Mode is playing.
+             * The BASE octave, and only ever that.
              *
-             * applySection() pushes a COMBINED octave - the slider's base plus
-             * the strip's own shift plus the section's - and a host that
-             * echoes state back would land that combined value here, where it
-             * would be read as a new base. The base would then drift by the
-             * shift on every press until every section played the same octave,
-             * which is exactly what was reported.
+             * No screen writes an effective octave here any more: per-chord
+             * shifts travel with the gesture instead. So this value can be
+             * taken at face value, and the editor no longer has to guess
+             * whether it is looking at its own arithmetic coming back.
              *
-             * fPushedOctave holds what this editor last sent, so anything
-             * equal to it is our own echo and is ignored. A genuine change
-             * from elsewhere still lands.
+             * fPushedOctave is still consulted, because DPF replays the whole
+             * state map into stateChanged() whenever the UI is attached. That
+             * replay is our own value returning, and taking it is harmless -
+             * but skipping it avoids a needless repaint on every reopen.
              */
-            if (v != fPushedOctave)
+            if (v != fPushedOctave) {
                 fOctave = (v < 1) ? 1 : (v > 7) ? 7 : v;
+                fPushedOctave = fOctave;
+            }
         }
         else if (std::strcmp(key, "latch") == 0)
             fLatchEnabled = (v != 0);
