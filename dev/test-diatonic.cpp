@@ -394,6 +394,110 @@ int main()
         }
     }
 
+    /*
+     * Per-cell extensions on the wheel resolve through the same key check.
+     *
+     * A cell may carry its own extension or follow its ring, and either way
+     * the result must be diatonic: a ring set to 9th is fine on most of the
+     * key ring and not on iii, so the check has to run on the RESOLVED value,
+     * not only on what the user picked. Transcribed from
+     * FortyFifthUI::cellExtension().
+     */
+    std::printf("\n=== per-cell extensions stay in key ===\n");
+    {
+        const int kFollowRing = -1;
+
+        auto resolve = [&](int position, Ring ring, int own, Extension ringExt,
+                           int keyIndex) -> Extension {
+            const Extension e = (own == kFollowRing)
+                ? ringExt : static_cast<Extension>(own);
+
+            const int deg = semitoneForCell(position, ring, keyIndex);
+            return chordExists(extendChord(defaultChordForRing(ring), e,
+                                           cellIsDominant(position, ring,
+                                                          keyIndex),
+                                           deg))
+                ? e : kExtNone;
+        };
+
+        /* iii in C is the minor-ring cell for degree iii. A ring-wide 9th must
+         * come back as a triad there, and stay a 9th on ii. */
+        int posIII = 0, posII = 0;
+        Ring ringIII = kRingMinor, ringII = kRingMinor;
+        cellForDegree(kDegreeIII, 0, posIII, ringIII);
+        cellForDegree(kDegreeII,  0, posII,  ringII);
+
+        const Extension onIII =
+            resolve(posIII, ringIII, kFollowRing, kExt9, 0);
+        const Extension onII =
+            resolve(posII, ringII, kFollowRing, kExt9, 0);
+
+        char d[96];
+        std::snprintf(d, sizeof d, "iii -> %s, ii -> %s",
+                      kExtensionName[onIII], kExtensionName[onII]);
+        if (onIII == kExtNone && onII == kExt9) {
+            std::printf("  ok    %-34s %s\n", "a ring 9th is filtered per cell", d);
+        } else {
+            std::printf("  FAIL  %-34s %s\n", "a ring 9th is filtered per cell", d);
+            ++failures;
+        }
+
+        /* An explicit per-cell choice overrides the ring, where it is valid. */
+        const Extension own7 = resolve(posII, ringII, kExt7, kExtNone, 0);
+        std::snprintf(d, sizeof d, "%s", kExtensionName[own7]);
+        if (own7 == kExt7) {
+            std::printf("  ok    %-34s %s\n", "a cell overrides its ring", d);
+        } else {
+            std::printf("  FAIL  %-34s %s\n", "a cell overrides its ring", d);
+            ++failures;
+        }
+
+        /* And an invalid per-cell choice is filtered just the same, so a cell
+         * cannot smuggle in a chord the ring would have been denied. */
+        const Extension bad = resolve(posIII, ringIII, kExt9, kExtNone, 0);
+        std::snprintf(d, sizeof d, "%s", kExtensionName[bad]);
+        if (bad == kExtNone) {
+            std::printf("  ok    %-34s %s\n",
+                        "an invalid cell choice is filtered", d);
+        } else {
+            std::printf("  FAIL  %-34s %s\n",
+                        "an invalid cell choice is filtered", d);
+            ++failures;
+        }
+
+        /* Across every key: following the ring must never produce a chord
+         * outside that key, whatever the ring is set to. */
+        bool allClean = true;
+        for (int k = 0; k < 12; ++k)
+            for (int ringExt = 0; ringExt < kExtCount; ++ringExt)
+                for (int dd = 0; dd < kDegreeCount; ++dd) {
+                    int  p = 0;
+                    Ring r = kRingKey;
+                    cellForDegree(static_cast<Degree>(dd), k, p, r);
+
+                    const Extension got =
+                        resolve(p, r, kFollowRing,
+                                static_cast<Extension>(ringExt), k);
+
+                    const ChordType t =
+                        extendChord(defaultChordForRing(r), got,
+                                    cellIsDominant(p, r, k),
+                                    semitoneForCell(p, r, k));
+                    if (! chordExists(t))
+                        allClean = false;
+                }
+
+        std::snprintf(d, sizeof d, "%d combinations",
+                      12 * static_cast<int>(kExtCount) *
+                      static_cast<int>(kDegreeCount));
+        if (allClean) {
+            std::printf("  ok    %-34s %s\n", "every key, every ring setting", d);
+        } else {
+            std::printf("  FAIL  %-34s %s\n", "every key, every ring setting", d);
+            ++failures;
+        }
+    }
+
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "PASS" : "FAIL",
                 failures, failures == 1 ? "" : "s");

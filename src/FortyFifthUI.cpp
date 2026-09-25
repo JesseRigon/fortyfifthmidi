@@ -68,6 +68,9 @@ public:
          * the same one the grid is showing. */
         loadPreset(fProg, 0, 0);
         pushProgression();
+
+        /* Every wheel cell follows its ring until the user says otherwise. */
+        std::memset(fCellExt, kExtFollowRing, sizeof(fCellExt));
     }
 
     /* Closing the editor must close the log, or the last lines never reach
@@ -117,6 +120,7 @@ protected:
 
         /* The cell editor sits above the grid, and an open list above that. */
         drawCellEditor();
+        drawWheelEditor();
 
         /* Last, so an open list overlays everything beneath it. */
         drawOpenMenu();
@@ -332,6 +336,23 @@ protected:
                 fillColor(Color(0.55f, 0.78f, 0.98f));
             text(tx, ty0 + size * 0.80f, deg, nullptr);
         }
+
+        /*
+         * A cell with its own extension is marked, so a per-cell setting is
+         * visible on the wheel rather than only inside its editor. The tag is
+         * the short form - "7TH", "SUS4" - because which extension it is
+         * matters as much as that it differs.
+         */
+        if (fCellExt[ring][index % 24] != kExtFollowRing) {
+            const Extension e =
+                static_cast<Extension>(fCellExt[ring][index % 24]);
+
+            fontSize(size * 0.52f);
+            fillColor(active ? Color(0.20f, 0.18f, 0.10f)
+                             : Color(0.94f, 0.78f, 0.42f));
+            text(tx, inWedge ? ty0 + size * 1.55f : ty + size * 0.85f,
+                 kExtShort[e], nullptr);
+        }
     }
 
     void drawCenterReadout(float cx, float cy, float radius)
@@ -407,6 +428,211 @@ protected:
         setState("progRunning", buf);
     }
 
+    /*
+     * The extension a wheel cell actually plays.
+     *
+     * A cell set to follow its ring takes the ring's value, so the per-ring
+     * dropdowns remain a bulk control. A cell the user changed keeps its own.
+     *
+     * Then the key check: an extension that is not diatonic on this degree
+     * does not exist, and the cell falls back to its plain triad. That is the
+     * same rule the sequencer's cell editor enforces by omitting the option -
+     * here it is enforced on the value, because a cell can inherit a ring
+     * setting that is fine on most of the ring and not on this one.
+     */
+    Extension cellExtension(int position, Ring ring) const
+    {
+        const int8_t own = fCellExt[ring][position % 24];
+        const Extension e = (own == kExtFollowRing)
+            ? fRingExt[ring]
+            : static_cast<Extension>(own);
+
+        const int deg = semitoneForCell(position, ring, fSelectedKey);
+        return chordExists(extendChord(defaultChordForRing(ring), e,
+                                       cellIsDominant(position, ring,
+                                                      fSelectedKey),
+                                       deg))
+            ? e : kExtNone;
+    }
+
+    /*
+     * Push the extension for the cell about to be played.
+     *
+     * The DSP holds one extension per ring, not per cell, and does not need to
+     * know cells can differ: the editor asserts the right value immediately
+     * before the gesture that reads it. This is the same mechanism Slide Mode
+     * already uses, for the same reason - only one cell can be triggered at a
+     * time, so one value is always enough.
+     */
+    void pushCellExtension(int position, Ring ring)
+    {
+        const Extension e = cellExtension(position, ring);
+
+        if (fPushedExtRing == static_cast<int>(ring) && fPushedExt == e)
+            return;
+
+        fPushedExtRing = static_cast<int>(ring);
+        fPushedExt     = e;
+
+        char key[8], buf[16];
+        std::snprintf(key, sizeof key, "ext%d", static_cast<int>(ring));
+        std::snprintf(buf, sizeof buf, "%d", static_cast<int>(e));
+        setState(key, buf);
+    }
+
+    /* ---- the wheel's cell editor -------------------------------------------
+     *
+     * The same idea as the sequencer's: a small panel naming the cell, with
+     * the chord types that exist on that degree in this key - and a "follow
+     * the ring" entry, which is what a cell does until it is changed.
+     */
+
+    static constexpr float kWheelEditW = 176.0f;
+
+    Button wheelEditRect() const
+    {
+        /* Centred on the wheel, not on the cell: the cells are wedges, and a
+         * panel hanging off one would cover its neighbours. */
+        const float w = kWheelEditW;
+        const float rows = static_cast<float>(wheelEditRows());
+        const float h = 34.0f + rows * kMenuRowH + 10.0f;
+
+        float x = wheelCentreX() - w * 0.5f;
+        float y = wheelCentreY() - h * 0.5f;
+
+        if (x < 6.0f) x = 6.0f;
+        if (y < chromeTop()) y = chromeTop();
+
+        return { x, y, w, h };
+    }
+
+    /* Follow-the-ring, then every extension that exists on this cell. */
+    int wheelEditRows() const
+    {
+        int n = 1;
+        for (int e = 0; e < kExtCount; ++e)
+            if (wheelExtAvailable(static_cast<Extension>(e)))
+                ++n;
+        return n;
+    }
+
+    bool wheelExtAvailable(Extension e) const
+    {
+        const int deg = semitoneForCell(fEditCellPos, fEditCellRing,
+                                        fSelectedKey);
+        return chordExists(extendChord(defaultChordForRing(fEditCellRing), e,
+                                       cellIsDominant(fEditCellPos,
+                                                      fEditCellRing,
+                                                      fSelectedKey),
+                                       deg));
+    }
+
+    /* The Extension a row selects; row 0 is follow-the-ring. */
+    int wheelEditValueAt(int row) const
+    {
+        if (row == 0)
+            return kExtFollowRing;
+
+        int n = 1;
+        for (int e = 0; e < kExtCount; ++e) {
+            if (! wheelExtAvailable(static_cast<Extension>(e)))
+                continue;
+            if (n == row)
+                return e;
+            ++n;
+        }
+        return kExtFollowRing;
+    }
+
+    Button wheelEditRowRect(int row) const
+    {
+        const Button p = wheelEditRect();
+        return { p.x + 6.0f, p.y + 30.0f + row * kMenuRowH,
+                 p.w - 12.0f, kMenuRowH };
+    }
+
+    void drawWheelEditor()
+    {
+        if (! fWheelEditOpen)
+            return;
+
+        const Button p = wheelEditRect();
+
+        beginPath();
+        roundedRect(p.x + 2.0f, p.y + 3.0f, p.w, p.h, 6.0f);
+        fillColor(Color(0.0f, 0.0f, 0.0f, 0.35f));
+        fill();
+
+        beginPath();
+        roundedRect(p.x, p.y, p.w, p.h, 6.0f);
+        fillColor(Color(0.11f, 0.12f, 0.16f, 0.99f));
+        fill();
+        strokeColor(Color(0.42f, 0.50f, 0.62f));
+        strokeWidth(1.0f);
+        stroke();
+
+        /* Which cell, by the name the wheel shows. */
+        fontFace(NANOVG_DEJAVU_SANS_TTF);
+        fontSize(11.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(Color(0.82f, 0.88f, 0.95f));
+        text(p.x + 10.0f, p.y + 16.0f,
+             labelForPosition(fEditCellPos, fEditCellRing), nullptr);
+
+        const int8_t own = fCellExt[fEditCellRing][fEditCellPos % 24];
+
+        for (int row = 0; row < wheelEditRows(); ++row) {
+            const Button r = wheelEditRowRect(row);
+            const int    v = wheelEditValueAt(row);
+            const bool   cur = (v == own);
+
+            if (cur) {
+                beginPath();
+                rect(r.x, r.y, r.w, r.h);
+                fillColor(Color(0.24f, 0.40f, 0.56f));
+                fill();
+            }
+
+            fontSize(10.5f);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(cur ? Color(0.96f, 0.98f, 1.00f)
+                          : Color(0.78f, 0.82f, 0.88f));
+
+            const char* label = (v == kExtFollowRing)
+                ? "Follow the ring"
+                : kExtensionName[v];
+
+            text(r.x + 6.0f, r.y + r.h * 0.5f, label, nullptr);
+        }
+    }
+
+    bool wheelEditClick(double px, double py)
+    {
+        const float x = static_cast<float>(px);
+        const float y = static_cast<float>(py);
+
+        for (int row = 0; row < wheelEditRows(); ++row) {
+            if (! hit(wheelEditRowRect(row), x, y))
+                continue;
+
+            fCellExt[fEditCellRing][fEditCellPos % 24] =
+                static_cast<int8_t>(wheelEditValueAt(row));
+
+            /* The pushed value is now stale, so the next press re-sends. */
+            fPushedExtRing = -1;
+
+            fWheelEditOpen = false;
+            repaint();
+            return true;
+        }
+
+        /* Anywhere else dismisses, and that click does nothing else - a
+         * dismissing click must not also play a cell. */
+        fWheelEditOpen = false;
+        repaint();
+        return true;
+    }
+
     /* Which key's wedge is drawn as the diatonic set. Locked, it stays where
      * it was pinned; otherwise it follows the selection. */
     int highlightKey() const
@@ -447,6 +673,30 @@ protected:
     bool onMouse(const MouseEvent& ev) override
     {
         if (ev.press) {
+            /*
+             * Right-click on a wheel cell edits it rather than playing it.
+             *
+             * A left click has to keep playing - that is the instrument - so
+             * editing needs a gesture of its own, and the right button was
+             * otherwise unused. The same modal the sequencer uses opens here,
+             * so a cell's chord type is set the same way on both screens.
+             */
+            if (ev.button == 2 && fScreen == kScreenCircle) {
+                Ring r;
+                const int p = hitTest(ev.pos.getX(), ev.pos.getY(), r);
+                if (p >= 0) {
+                    fEditCellPos  = p;
+                    fEditCellRing = r;
+                    fWheelEditOpen = true;
+                    fOpenMenu      = kMenuNone;
+                    repaint();
+                    return true;
+                }
+            }
+
+            if (fWheelEditOpen && wheelEditClick(ev.pos.getX(), ev.pos.getY()))
+                return true;
+
             if (handleControlClick(ev.pos.getX(), ev.pos.getY()))
                 return true;
 
@@ -461,6 +711,16 @@ protected:
                  * it - including clicks on its dead space. */
                 if (cellEditClick(ev.pos.getX(), ev.pos.getY()))
                     return true;
+
+                /*
+                 * Right-click edits a cell; left-click AUDITIONS it. The same
+                 * division as the wheel, so one gesture means the same thing
+                 * on both screens - and a grid you cannot hear is hard to
+                 * build, since the whole point is choosing chords by ear.
+                 */
+                if (ev.button == 2)
+                    return progEditPress(ev.pos.getX(), ev.pos.getY());
+
                 return progPress(ev.pos.getX(), ev.pos.getY());
             }
 
@@ -479,6 +739,9 @@ protected:
              * the DSP's toggle. */
             const bool same = (fLatchEnabled &&
                                pos == fActivePosition && ring == fActiveRing);
+
+            /* This cell's own extension, before the gesture that reads it. */
+            pushCellExtension(pos, ring);
 
             sendGesture("press", pos, ring);
 
@@ -607,9 +870,11 @@ protected:
         if (pos < 0 || (pos == fActivePosition && ring == fActiveRing))
             return false;
 
-        /* Crossing into a new position mid-drag is the glide gesture. */
+        /* Crossing into a new position mid-drag is the glide gesture. The new
+         * cell may carry a different extension, so assert it first. */
         fActivePosition = pos;
         fActiveRing     = ring;
+        pushCellExtension(pos, ring);
         sendGesture("move", pos, ring);
         repaint();
         return true;
@@ -2483,10 +2748,13 @@ protected:
                 }
 
                 /*
-                 * A filled cell arms a drag instead of opening the menu
-                 * outright. The menu still opens on release, provided the
-                 * pointer never left the cell - so a click edits and a drag
-                 * moves, without a modifier or a second gesture to learn.
+                 * A filled cell arms a drag AND sounds. The drag still moves
+                 * the chord if the pointer leaves the cell; if it does not,
+                 * the press was an audition and the note stops on release.
+                 *
+                 * Editing moved to the right button, so a left click no longer
+                 * opens the menu - it plays, which is what makes a grid
+                 * buildable by ear.
                  */
                 if (fProg.section[s].cell[i].filled) {
                     fDragCellSection = s;
@@ -2497,19 +2765,92 @@ protected:
                     fDropStep        = i;
                     fEditSection     = s;
                     fEditStep        = i;
+
+                    auditionCell(s, i);
+
                     repaint();
                     return true;
                 }
 
-                fEditSection  = s;
-                fEditStep     = i;
-                fCellEditOpen = true;
+                /* An empty cell has nothing to sound, so a left click selects
+                 * it - which is where a preset will load and what the right
+                 * button will edit. */
+                fEditSection = s;
+                fEditStep    = i;
                 repaint();
                 return true;
             }
         }
 
         return false;
+    }
+
+    /*
+     * Right-click on the grid: open the cell editor.
+     *
+     * Only the cells respond. The row buttons, presets and transport already
+     * do one thing each on a left click, and giving them a second meaning on
+     * the right would be a trap.
+     */
+    bool progEditPress(double px, double py)
+    {
+        int s = -1, i = -1;
+        if (! progCellAt(px, py, s, i))
+            return false;
+
+        /* A cell past the section's end is not in the loop, so editing it
+         * would set a chord that never plays. Lengthen first, as a left click
+         * does. */
+        if (i >= fProg.section[s].length) {
+            fProg.section[s].length = i + 1;
+            pushProgression();
+        }
+
+        fEditSection  = s;
+        fEditStep     = i;
+        fMenuSection  = s;
+        fCellEditOpen = true;
+        repaint();
+        return true;
+    }
+
+    /*
+     * Audition one cell: sound its chord for as long as the button is held.
+     *
+     * Built through the same path a wheel press uses - the extension is
+     * asserted, then a gesture is sent - so what is heard is exactly what the
+     * sequencer will play, rather than an approximation assembled here.
+     */
+    void auditionCell(int section, int step)
+    {
+        const ProgCell& c = fProg.section[section].cell[step];
+        if (! c.filled)
+            return;
+
+        int  position = 0;
+        Ring ring     = kRingKey;
+        cellForDegree(c.degree, fSelectedKey, position, ring);
+
+        /* The cell's own extension, and its octave offset, before the
+         * gesture that reads them. */
+        char key[8], buf[16];
+        std::snprintf(key, sizeof key, "ext%d", static_cast<int>(ring));
+        std::snprintf(buf, sizeof buf, "%d", static_cast<int>(c.ext));
+        setState(key, buf);
+        fPushedExtRing = -1;          /* next wheel press must re-assert */
+
+        const int oct = fOctave + c.octave;
+        if (oct != fPushedOctave) {
+            fPushedOctave = oct;
+            std::snprintf(buf, sizeof buf, "%d", oct);
+            setState("octave", buf);
+        }
+
+        sendGesture("press", position, ring);
+
+        fAuditionActive = true;
+        fActivePosition = position;
+        fActiveRing     = ring;
     }
 
     /* Which cell the pointer is over, or false when it is over none. */
@@ -2562,8 +2903,18 @@ protected:
             return true;
         }
 
-        if (s != fDragCellSection || i != fDragCellStep)
+        if (s != fDragCellSection || i != fDragCellStep) {
+            /* The gesture has become a drag, so silence the audition: the
+             * chord being moved should not go on sounding while it travels. */
+            if (! fDragCellMoved && fAuditionActive) {
+                sendGesture("release",
+                            fActivePosition < 0 ? 0 : fActivePosition,
+                            fActiveRing);
+                fAuditionActive = false;
+                fActivePosition = -1;
+            }
             fDragCellMoved = true;
+        }
 
         if (s != fDropSection || i != fDropStep) {
             fDropSection = s;
@@ -2592,11 +2943,19 @@ protected:
         fDropStep        = -1;
         fDragCellMoved   = false;
 
+        /* An audition ends with the press that started it, whether or not the
+         * pointer moved - a chord left sounding after the button came up is a
+         * stuck note. */
+        if (fAuditionActive) {
+            sendGesture("release", fActivePosition < 0 ? 0 : fActivePosition,
+                        fActiveRing);
+            fAuditionActive = false;
+            fActivePosition = -1;
+        }
+
         if (! moved) {
-            /* A click, not a drag: edit the cell. */
-            fEditSection  = fromS;
-            fEditStep     = fromI;
-            fCellEditOpen = true;
+            /* A click that did not move was an audition, already handled
+             * above. Nothing further to do. */
             repaint();
             return true;
         }
@@ -4743,6 +5102,35 @@ private:
     /* Per-ring, never per cell: uniform shape within a ring is what makes
      * single-bend glide valid. */
     Extension fRingExt[kRingCount]   = { kExtNone, kExtNone, kExtNone };
+
+    /*
+     * ---- per-cell extensions on the wheel -----------------------------------
+     *
+     * Every cell may carry its own extension. kExtFollowRing means "whatever
+     * the ring is set to", which is the default, so the per-ring dropdowns
+     * keep working as a bulk control and only cells the user has deliberately
+     * changed diverge from them.
+     *
+     * This became possible when single-bend glide was removed. That mode could
+     * only move between chords of identical shape, so a ring whose cells had
+     * different extensions could not glide within itself - which is why the
+     * setting was per-ring in the first place. MPE bends each voice on its own
+     * channel and does not care.
+     *
+     * Stored for the largest ring, and indexed by ring, so the minor ring's
+     * twenty-four cells fit alongside the key ring's twelve.
+     */
+    static constexpr int kExtFollowRing = -1;
+    int8_t fCellExt[kRingCount][24];
+
+    /* The wheel cell being edited, and whether its panel is open. */
+    bool fWheelEditOpen = false;
+    int  fEditCellPos   = 0;
+    Ring fEditCellRing  = kRingKey;
+
+    /* A sequencer cell is sounding from a press, so its release must be sent
+     * even if the gesture turns into a drag. */
+    bool fAuditionActive = false;
     Voicing   fRingVoice[kRingCount] = {
         kVoicingRegular, kVoicingRegular, kVoicingRegular
     };
