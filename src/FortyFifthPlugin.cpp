@@ -2074,61 +2074,10 @@ private:
             ? findGroupByNote(fLastKeyboardNote) : nullptr;
 
         if (from != nullptr && from->midiNote != midiNote &&
-            fGlideMode != kGlideOff) {
-
-            const bool canGlide = canGlideBetween(from, type, root, ring, oct);
-
-            /* Octave changes are exactly what the vertical slider produces when
-             * dragged, and a glide across them is the instrumental gesture the
-             * feature exists for - so distance is measured in real semitones,
-             * not just pitch class. */
-            if (canGlide) {
-                const int semis = (root - from->root) +
-                                  (oct - from->octave) * 12;
-
-                fGlideTargetSemis = semis;
-                fGlideTargetRoot  = root;
-                fGlideTargetType  = type;
-                fGlideTargetRing  = ring;
-                fGlideTargetOct   = oct;
-                fGlideSource      = from->source;
-                fGlideElapsed     = 0;
-                fGlideDuration    = static_cast<uint32_t>(
-                    fGlideTimeMs * fSampleRate / 1000.0);
-
-                /* The gliding group becomes this note's group: the key that is
-                 * now down owns what is sounding, so its release ends it. */
-                from->midiNote = midiNote;
-
-                if (fGlideMode == kGlideMpe) {
-                    uint8_t want[kMaxGroupNotes];
-                    const int n = buildCellChord(root, type, ring, oct, want);
-                    for (int i = 0; i < from->count; ++i)
-                        from->target[i] = (i < n) ? want[i] : from->note[i];
-
-                    bool moves = false;
-                    for (int i = 0; i < from->count && ! moves; ++i)
-                        moves = (from->target[i] != from->note[i]);
-                    fGlideActive = moves;
-                } else {
-                    fGlideActive = (semis != 0);
-                }
-
-                if (fGlideActive) {
-                    /* The group is committed to the new chord, so it is now
-                     * sounding a different cell and the lights follow it
-                     * there. Only here: the fall-through below abandons the
-                     * glide and starts a fresh group instead, and moving the
-                     * cell for a glide that does not happen would light a cell
-                     * this group never plays. */
-                    setGroupCell(from, source);
-                    fLastKeyboardNote = midiNote;
-                    return;
-                }
-
-                /* Nothing to travel: fall through and start normally. */
-                from->midiNote = fLastKeyboardNote;
-            }
+            fGlideMode != kGlideOff &&
+            glideGroupTo(from, source, root, type, ring, oct, midiNote)) {
+            fLastKeyboardNote = midiNote;
+            return;
         }
 
         startGroup(frame, source, root, type, ring, vel,
@@ -2136,6 +2085,83 @@ private:
                    oct, midiNote);
 
         fLastKeyboardNote = midiNote;
+    }
+
+    /*
+     * Glide a sounding group onto a different chord, and hand it to a new key.
+     *
+     * The one implementation of "this group now plays that instead", used both
+     * when a newer key takes over and when a released key hands the phrase back
+     * to one still held. Those are the same operation - only the destination
+     * differs - and writing the second one separately is how the release path
+     * came to move the ownership without moving the sound.
+     *
+     * Returns false when the move cannot be carried by a glide, leaving the
+     * group untouched so the caller can start a fresh one instead.
+     */
+    bool glideGroupTo(VoiceGroup* g, int source, int root, ChordType type,
+                      Ring ring, int oct, int owner)
+    {
+        if (g == nullptr || ! canGlideBetween(g, type, root, ring, oct))
+            return false;
+
+        /* A real distance: both roots are intervals above the same tonic, and
+         * the octaves are absolute. */
+        const int semis = (root - g->root) + (oct - g->octave) * 12;
+
+        /*
+         * Where each voice must land, paired by index. A voice with no
+         * counterpart - the chords differ in size - stays where it is and is
+         * resolved by the snap at the end.
+         *
+         * Computed into the group's targets directly, then inspected: building
+         * the chord twice, once to ask whether anything moves and again to
+         * record it, is how the two answers drift apart.
+         */
+        bool moves = false;
+
+        if (fGlideMode == kGlideMpe) {
+            uint8_t want[kMaxGroupNotes];
+            const int n = buildCellChord(root, type, ring, oct, want);
+            for (int i = 0; i < g->count; ++i) {
+                g->target[i] = (i < n) ? want[i] : g->note[i];
+                if (g->target[i] != g->note[i])
+                    moves = true;
+            }
+        } else {
+            moves = (semis != 0);
+        }
+
+        /*
+         * Nothing to travel: refuse, so the caller can decide. Committing to a
+         * glide of zero distance would leave the group claiming a cell it
+         * never moved to.
+         *
+         * The targets just written are left as they are. advanceGlide() is the
+         * only reader and runs only while fGlideActive, which this path never
+         * sets, so they are overwritten by the next glide before anything can
+         * see them.
+         */
+        if (! moves)
+            return false;
+
+        fGlideTargetSemis = semis;
+        fGlideTargetRoot  = root;
+        fGlideTargetType  = type;
+        fGlideTargetRing  = ring;
+        fGlideTargetOct   = oct;
+        fGlideSource      = g->source;
+        fGlideElapsed     = 0;
+        fGlideDuration    = static_cast<uint32_t>(
+            fGlideTimeMs * fSampleRate / 1000.0);
+        fGlideActive      = true;
+
+        /* The key that now owns the phrase: its release is what ends it. */
+        g->midiNote = owner;
+
+        /* And the group is sounding a different cell, so the lights follow. */
+        setGroupCell(g, source);
+        return true;
     }
 
     /* Release the group a played note started - deferring while the pedal is
@@ -2155,15 +2181,53 @@ private:
         }
 
         /*
-         * A glide gave this group to the key that is lifting, but an earlier key
-         * may still be held. Hand the group back to it rather than silencing it:
-         * the player still has a finger down, so the phrase continues. This is
-         * what makes overlapping legato behave like an instrument instead of
-         * cutting out whenever the newer of two keys is released.
+         * An earlier key is still held, so the phrase falls back to it.
+         *
+         * This is how a monosynth behaves: press A, press B, release B, and
+         * the sound returns to A because a finger is still on it. The fall
+         * back GLIDES, exactly as the move to B did - it is the same operation
+         * with the destination reversed.
+         *
+         * Handing over ownership alone was the bug: the group kept sounding
+         * the released key's chord and the highlight stayed on its cell, so
+         * lifting a finger changed nothing that could be heard or seen.
          */
         const int fallback = topHeldKey();
         if (! fPedalDown && fallback >= 0 && fallback != midiNote &&
             findGroupByNote(fallback) == nullptr) {
+
+            int  pos; Ring ring;
+            if (cellForMidiNote(fKeyMap, fallback,
+                                fSelectedKey.load(std::memory_order_acquire),
+                                pos, ring)) {
+                const int       root = cellAboveTonic(pos, ring);
+                const ChordType type = chordTypeForRing(ring, pos);
+                const int       oct  = octaveForMidiNote(fallback);
+                const int       src  = (static_cast<int>(ring) << 8) | pos;
+
+                if (fGlideMode != kGlideOff &&
+                    glideGroupTo(g, src, root, type, ring, oct, fallback)) {
+                    fLastKeyboardNote = fallback;
+                    return;
+                }
+
+                /*
+                 * No glide available - glide is off, or the chords are the
+                 * same. Rebuild on the held key's chord anyway, so what
+                 * sounds is what is still under the finger. Retriggering is
+                 * the honest option here: with glide off that is what a press
+                 * would have done.
+                 */
+                const uint8_t vel = g->velocity;
+                stopGroup(frame, g);
+                startGroup(frame, src, root, type, ring, vel,
+                           /* retriggerDuplicates */ true, oct, fallback);
+                fLastKeyboardNote = fallback;
+                return;
+            }
+
+            /* The held key maps to nothing playable; keep the sound with it
+             * rather than cutting off a finger that is still down. */
             g->midiNote       = fallback;
             fLastKeyboardNote = fallback;
             return;
