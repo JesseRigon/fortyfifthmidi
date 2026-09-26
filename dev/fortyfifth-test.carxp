@@ -20,6 +20,21 @@
   or on Windows:  dev\carla.bat
 -->
 <CARLA-PROJECT VERSION='2.5'>
+ <!--
+   RACK MODE MATTERS HERE, and it is not what Carla defaults to.
+
+   In Rack, plugins are chained top to bottom automatically - FortyFifthMidi's
+   MIDI output feeds Helm because Helm sits below it, with no cables to draw.
+   Every MIDI input is fed into the top of the rack, so the V49 is connected as
+   soon as Carla sees it.
+
+   In Patchbay, NOTHING is connected until you draw it. Loading this project
+   under Patchbay puts both plugins on screen looking perfectly correct while
+   producing silence, because the link between them was never made - which is
+   exactly what happened the first time this was opened.
+
+   ProcessMode 2 is CARLA_PROCESS_MODE_CONTINUOUS_RACK.
+ -->
  <EngineSettings>
   <ForceStereo>false</ForceStereo>
   <PreferPluginBridges>false</PreferPluginBridges>
@@ -27,7 +42,10 @@
   <UIsAlwaysOnTop>false</UIsAlwaysOnTop>
   <MaxParameters>200</MaxParameters>
   <UIBridgesTimeout>4000</UIBridgesTimeout>
+  <ProcessMode>2</ProcessMode>
+  <TransportMode>1</TransportMode>
  </EngineSettings>
+
 
  <Transport>
   <BeatsPerMinute>120</BeatsPerMinute>
