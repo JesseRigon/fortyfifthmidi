@@ -259,8 +259,14 @@ step. Behaviour is verified between steps, not only at the end.
       tree committed, Windows build staged.
 - [x] **1. Land the 1.9 fix and its test first**, before any restructuring, so
       the bug fix is separable from the refactor and provable on its own.
-- [ ] **2. Introduce `ChordTarget`** and thread it through `buildCellChord()`
+- [x] **2. Introduce `ChordTarget`** and thread it through `buildCellChord()`
       and the four glide callers. Pure mechanical substitution; no logic moves.
+      Done in 2d40738. Also extracted semitonesBetween(), sameChord() and
+      glideDurationFrames(), each of which had been written out three times.
+      test-octave's literal-text guard was rewritten to assert the property
+      rather than the spelling, and verified to still catch the original bug
+      (3 failures, up from 1 - the first attempt matched the wrong occurrence
+      and passed with the bug present).
 - [ ] **3. Extract `Glide`** with the state private and `begin()`/`cancel()`/
       `owns()`. All 17 write sites route through it. Still source-identified.
 - [ ] **4. Switch `Glide` to hold `VoiceGroup*`**, add `forget()` in
