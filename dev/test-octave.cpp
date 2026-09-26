@@ -196,6 +196,82 @@ int main()
         check("same shift now sounds at 1", clampOctave(e.base + oct), 1);
     }
 
+
+    /* --- a drag must land where a click does -------------------------- */
+    /*
+     * Reported: "selecting the first degree and gliding (click and drag) up to
+     * the next 1st degree at the 8th col position plays the original octave not
+     * the octave up. but clicking it works as it should."
+     *
+     * Slide Mode's last strip is the tonic AN OCTAVE UP - that is what makes it
+     * worth having, since it closes the scale. Both gestures carry the shift:
+     * a press sends it, and so does a move.
+     *
+     * The MOVE branch discarded it, keeping g->octave - the octave the group
+     * already had - on the reasoning that a drag stays where it started. True
+     * on the wheel, where every cell sits at the base octave and the two agree,
+     * which is why the fault was invisible there and showed only on the screen
+     * whose cells disagree.
+     *
+     * This is a source check rather than an arithmetic one: the arithmetic was
+     * never wrong, the branch simply read the wrong variable. Asserting on the
+     * numbers would have passed throughout.
+     */
+    std::printf("\n=== a move uses the gesture's octave, not the group's ===\n");
+    {
+        FILE* f = std::fopen("src/FortyFifthPlugin.cpp", "rb");
+        if (f == nullptr) {
+            std::printf("%-62s %s\n", "could not open src/FortyFifthPlugin.cpp", "FAIL");
+            ++failures;
+        } else {
+            std::fseek(f, 0, SEEK_END);
+            const long len = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            char* buf = static_cast<char*>(std::malloc(len + 1));
+            const size_t rd = std::fread(buf, 1, len, f);
+            buf[rd] = '\0';
+            std::fclose(f);
+
+            /* Isolate the move gesture: from its case label to the next one. */
+            const char* start = std::strstr(buf, "case kGestureMove:");
+            const char* end   = start ? std::strstr(start, "case kGestureRetrigger:")
+                                      : nullptr;
+
+            if (start == nullptr || end == nullptr) {
+                std::printf("%-62s %s\n", "could not locate the move gesture", "FAIL");
+                ++failures;
+            } else {
+                const size_t n = static_cast<size_t>(end - start);
+                char* move = static_cast<char*>(std::malloc(n + 1));
+                std::memcpy(move, start, n);
+                move[n] = '\0';
+
+                /*
+                 * One g->octave is legitimate: the glide distance measures FROM
+                 * where the group is TO where the gesture asks, so the group's
+                 * octave is the starting point. Every other use would be the
+                 * bug returning.
+                 */
+                int uses = 0;
+                for (const char* q = move; (q = std::strstr(q, "g->octave")) != nullptr; ++q)
+                    ++uses;
+
+                std::printf("%-62s %d\n", "  g->octave appearances in the move branch", uses);
+                checkBool("the gesture's octave is used",
+                          std::strstr(move, "gestureOct") != nullptr, true);
+                check("g->octave survives only as the distance's origin", uses, 1);
+
+                /* And the one that remains must be inside the subtraction. */
+                checkBool("  that one is the travel calculation",
+                          std::strstr(move, "(gestureOct - g->octave) * 12") != nullptr,
+                          true);
+
+                std::free(move);
+            }
+            std::free(buf);
+        }
+    }
+
     /* ------------------------------------------------------------------ */
     /* Guard the invariant in the source itself: no screen may write an     */
     /* effective octave into the "octave" state key.                        */

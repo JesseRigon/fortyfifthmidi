@@ -1589,7 +1589,7 @@ private:
 
                 /* See canGlideBetween() for why a bend is or is not enough. */
                 const bool canGlide =
-                    canGlideBetween(g, type, root, r, g->octave);
+                    canGlideBetween(g, type, root, r, gestureOct);
 
                 if (! canGlide) {
                     /*
@@ -1607,7 +1607,18 @@ private:
                      * instrument sorts out the overlap.
                      */
                     const uint8_t vel  = g->velocity;
-                    const int     oct  = g->octave;
+                    /*
+                     * The octave the GESTURE asks for, not the one the group
+                     * happens to hold.
+                     *
+                     * They are the same on the wheel, where every cell sits at
+                     * the base octave. They are not on Slide Mode, whose last
+                     * strip is the tonic an octave up: keeping the group's
+                     * octave made a drag into that strip sound the low tonic,
+                     * while a click on it sounded the high one. Same cell, two
+                     * answers.
+                     */
+                    const int     oct  = gestureOct;
                     const int     note = g->midiNote;
 
                     if (! withinMergeWindow(g)) {
@@ -1634,12 +1645,14 @@ private:
                  * where the octave was arbitrary; it is wrong here, where the
                  * distance is the answer.
                  */
-                fGlideTargetSemis = root - g->root;
+                /* The distance covers the octave too, so a drag into an
+                 * octave-shifted strip travels the whole way rather than
+                 * bending within the octave it started in. */
+                fGlideTargetSemis = (root - g->root) + (gestureOct - g->octave) * 12;
                 fGlideTargetRoot  = root;
                 fGlideTargetType  = type;
                 fGlideTargetRing  = r;
-                /* A pointer drag stays in the octave the group already has. */
-                fGlideTargetOct   = g->octave;
+                fGlideTargetOct   = gestureOct;
                 fGlideSource      = g->source;
                 fGlideElapsed     = 0;
                 fGlideDuration    = static_cast<uint32_t>(
@@ -1652,7 +1665,7 @@ private:
                     /* Same builder startGroup uses, so the ramp heads exactly
                      * where the snap will land. */
                     uint8_t want[kMaxGroupNotes];
-                    const int n = buildCellChord(root, type, r, g->octave, want);
+                    const int n = buildCellChord(root, type, r, gestureOct, want);
 
                     for (int i = 0; i < g->count; ++i)
                         g->target[i] = (i < n) ? want[i] : g->note[i];
@@ -1669,7 +1682,9 @@ private:
                 /* Nothing to travel, but the voicing or shape may still differ. */
                 if (! fGlideActive && (type != g->type || r != g->ring)) {
                     const uint8_t vel  = g->velocity;
-                    const int     oct  = g->octave;
+                    /* The gesture's octave, like every other branch here: the
+                     * cell the drag reached decides where it sounds. */
+                    const int     oct  = gestureOct;
                     const int     note = g->midiNote;
                     stopGroup(0, g);
                     startGroup(0, source, root, type, r, vel, false, oct, note);
