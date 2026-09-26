@@ -33,13 +33,31 @@ CARLA_EXE='C:\Tools\Carla-2.5.10-win64\Carla\Carla.exe'
 PROJECT_WIN='J:\My Drive\Life\5 Media\Music\VSTs\fortyfifthmidi\fortyfifth-test.carxp'
 STAGE='/mnt/j/My Drive/Life/5 Media/Music/VSTs/fortyfifthmidi'
 
+# Close Carla so it SAVES.
+#
+# Stop-Process -Force kills it outright, and Carla writes its engine settings
+# and its patchbay connections on a clean exit - so a forced kill silently
+# discards the audio device and the cables you just drew, and the next launch
+# comes up unconnected again. CloseMainWindow asks it to quit properly; the
+# force is only a fallback for a hung process.
+close_carla() {
+  powershell.exe -NoProfile -Command "
+    \$p = Get-Process Carla -ErrorAction SilentlyContinue
+    if (\$p) {
+      \$p.CloseMainWindow() | Out-Null
+      if (-not \$p.WaitForExit(6000)) {
+        Write-Host '  (Carla did not close cleanly; forcing)'
+        \$p | Stop-Process -Force
+      }
+    }" >/dev/null 2>&1
+  sleep 1
+}
+
 do_build=1
 case "${1:-}" in
   --no-build) do_build=0 ;;
   --kill)
-    powershell.exe -NoProfile -Command \
-      "Get-Process Carla -ErrorAction SilentlyContinue | Stop-Process -Force" \
-      >/dev/null 2>&1
+    close_carla
     echo "Carla closed."
     exit 0
     ;;
@@ -48,10 +66,8 @@ case "${1:-}" in
 esac
 
 # --- close Carla before touching the DLL it has open ------------------------
-powershell.exe -NoProfile -Command \
-  "Get-Process Carla -ErrorAction SilentlyContinue | Stop-Process -Force" \
-  >/dev/null 2>&1
-sleep 1
+# Windows holds the VST3 open while Carla runs, so staging would fail.
+close_carla
 
 if [ "${do_build}" -eq 1 ]; then
   echo "=== tests ==="
@@ -91,13 +107,33 @@ cat <<'NOTE'
 
 Carla is opening with FortyFifthMidi -> Helm already loaded.
 
-First run only:
-  1. Settings > Configure Carla > Engine
-       Audio driver   : DirectSound or WASAPI
-  2. The rack's MIDI input takes the V49 automatically. If it does not,
-     click the plugin's left-hand MIDI port and pick it.
-  3. Double-click a plugin to open its editor.
+FIRST RUN ONLY - two connections to make by hand, in the PATCHBAY tab.
 
-After that, just run this script again: it closes Carla, rebuilds, restages
-and reopens, so a change is audible in one command.
+Rack mode chains the PLUGINS to each other automatically, and that part works:
+FortyFifthMidi feeds Helm because Helm sits below it. What it does NOT do is
+connect the rack to the outside world. Nothing is auto-connected - not the
+keyboard, not the speakers. Carla only DISCOVERS devices; it opens one when you
+connect it, and never before (CarlaEngineRtAudio.cpp, kExternalGraphConnection*).
+
+So there is no MIDI menu to find. With DirectSound the device list lives on the
+Patchbay canvas, not in Settings, and the rack appears there as a box named
+"Carla" with these ports:
+
+    Carla
+      audio-in1  audio-in2     <- inputs to the rack
+      audio-out1 audio-out2    -> the LAST plugin's output
+      midi-in                  <- feeds the TOP of the rack
+      midi-out
+
+Open the Patchbay tab and drag two cables:
+
+    V49          midi-in   ->  Carla:midi-in        (so the keyboard plays)
+    Carla:audio-out1/2     ->  your interface       (so you hear it)
+
+Carla saves both into the project when it exits cleanly, as <ExternalPatchbay>,
+so this is once - not once per session. Quit with File > Quit rather than
+killing it, or the connections are not written.
+
+After that, run this script again to rebuild: it closes Carla, rebuilds,
+restages and reopens with the connections restored.
 NOTE
