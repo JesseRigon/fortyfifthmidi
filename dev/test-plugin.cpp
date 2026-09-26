@@ -248,6 +248,94 @@ int main()
         eq("  with no lit cell left", h.litCells(), 0);
     }
 
+    /*
+     * A glide lands when its time is up - no sooner, and no later.
+     *
+     * Nothing asserted the TIMING before, only the destination, and that gap let
+     * a real fault through: while migrating the three start sequences into
+     * Glide::begin(), a substitution left a SECOND begin() call after the MPE
+     * targets were computed. It reset fElapsed, so every octave glide restarted
+     * its ramp and took twice as long to arrive. Correct destination, correct
+     * pitches, no compiler complaint - and the whole suite passed.
+     *
+     * The bend is the observable: it ramps while travelling and returns to centre
+     * once the snap has happened. So "has it landed?" is answerable from the wire
+     * alone, which is the only place this suite looks.
+     */
+    std::printf("\n=== a glide lands on time, not late ===\n");
+    {
+        /* 120ms at 48k is 5760 frames. Blocks of 1024 put the landing between
+         * the fifth and sixth, comfortably clear of the boundary either side. */
+        const uint32_t kBlock = 1024;
+
+        Host h;
+        setGlideMode(h, kGlideMpe);
+        h.set("glideTimeMs", 120);   /* the state key's real name, not glideTime */
+
+        h.gesture("press", 0, 0);
+        h.block(kBlock);
+
+        harness::reset();
+        h.gesture("move", 4, 0);
+
+        /* Step until the bend comes back to centre, which is the snap. */
+        int blocksToLand = -1;
+        for (int i = 1; i <= 40 && blocksToLand < 0; ++i) {
+            h.block(kBlock);
+            for (size_t e = 0; e < harness::sent.size(); ++e) {
+                if (harness::sent[e].isBend() &&
+                    harness::sent[e].d1 == 0x00 && harness::sent[e].d2 == 0x40) {
+                    blocksToLand = i;
+                    break;
+                }
+            }
+        }
+
+        char d[96];
+        std::snprintf(d, sizeof d, "landed after %d blocks of %u frames",
+                      blocksToLand, kBlock);
+        ok("the glide lands at all", blocksToLand > 0, d);
+
+        /*
+         * 5760 frames / 1024 = 5.6, so the snap is due on the sixth block. A
+         * generous ceiling of 8 still catches a doubled ramp, which would need
+         * eleven.
+         */
+        ok("  and within the time it was given",
+           blocksToLand > 0 && blocksToLand <= 8, d);
+
+        /*
+         * Half a ramp must be a partial bend, not silence and not the full
+         * distance. Without this, a glide that never moved and then jumped at the
+         * end would satisfy everything above - which is what "is it actually
+         * gliding, or just a retrigger?" was asking, and what could not be
+         * answered before there was a way to read the output.
+         */
+        Host h2;
+        setGlideMode(h2, kGlideMpe);
+        h2.set("glideTimeMs", 120);
+        h2.gesture("press", 0, 0);
+        h2.block(kBlock);
+
+        harness::reset();
+        h2.gesture("move", 4, 0);
+        h2.block(2048);          /* ~36% of the way */
+
+        int bends = 0, centred = 0;
+        for (size_t e = 0; e < harness::sent.size(); ++e) {
+            if (! harness::sent[e].isBend()) continue;
+            ++bends;
+            if (harness::sent[e].d1 == 0x00 && harness::sent[e].d2 == 0x40)
+                ++centred;
+        }
+
+        char d2[96];
+        std::snprintf(d2, sizeof d2, "%d bends mid-flight, %d of them centred",
+                      bends, centred);
+        ok("the pitch is bending part way through", bends > 0, d2);
+        ok("  and has not snapped back yet", centred == 0, d2);
+    }
+
     /* ---- 1.7 and 1.8: keyboard handover and ownership ----------------- */
 
     std::printf("\n=== keyboard: last-note priority, both directions ===\n");

@@ -280,22 +280,38 @@ int main()
                                             "g->ring, g->octave)") != nullptr,
                           true);
                 /*
-                 * The DESTINATION specifically - the assignment to fGlideTo,
-                 * not merely the presence of that constructor somewhere in the
-                 * branch. canGlideBetween() is called a few lines above with an
-                 * identically spelled temporary, so searching for the
+                 * The DESTINATION specifically - the one the glide is started
+                 * with, not merely the presence of that constructor somewhere in
+                 * the branch. canGlideBetween() is called a few lines above with
+                 * an identically spelled temporary, so searching for the
                  * constructor alone passes even with the bug reintroduced. The
                  * count check above does catch it, but an assertion that cannot
                  * fail is worse than no assertion: it reads as coverage.
+                 *
+                 * Now pinned to the named local that begin() is handed, since the
+                 * destination stopped being a member the moment glide state
+                 * became an object.
                  */
                 checkBool("  and the destination carries the gesture's octave",
-                          std::strstr(move, "fGlideTo          = "
-                                            "ChordTarget(root, type, r, gestureOct)")
-                              != nullptr,
+                          std::strstr(move, "const ChordTarget to(root, type, r, "
+                                            "gestureOct)") != nullptr,
                           true);
                 checkBool("  with the distance derived, not hand-rolled",
-                          std::strstr(move, "semitonesBetween(from, fGlideTo)")
+                          std::strstr(move, "semitonesBetween(from, to)")
                               != nullptr,
+                          true);
+
+                /*
+                 * And the glide is started in ONE call, so the destination and
+                 * the distance cannot disagree.
+                 *
+                 * This replaces what used to be the real risk here: ten separate
+                 * assignments, of which a site could make nine. There is no
+                 * spelling of begin() that sets the target without the distance.
+                 */
+                checkBool("  and both are handed to begin() together",
+                          std::strstr(move, "fGlide.begin(g, to, "
+                                            "semitonesBetween(from, to)") != nullptr,
                           true);
 
                 std::free(move);

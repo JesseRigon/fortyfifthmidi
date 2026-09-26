@@ -633,14 +633,14 @@ protected:
     {
         fSampleRate  = getSampleRate();
         fNeedsRpn    = true;
-        fGlideActive = false;
+        fGlide.clear();
 
         for (int i = 0; i < kMaxGroups; ++i)
             fGroup[i].active = false;
         std::memset(fHeld, 0, sizeof(fHeld));
 
         fDragSource  = -1;
-        fGlideSource = -1;
+        fGlide.clear();
         /* A pedal or note left down across a restart would defer releases
          * forever, so clear the input state too. */
         fPedalDown        = false;
@@ -744,7 +744,7 @@ protected:
 
             stopAllGroups(0);
             zeroAllBends(0);
-            fGlideActive  = false;
+            fGlide.clear();
             /* A panic is a full reset: forget the pedal and the keys too, or a
              * pedal believed to be down would defer every later release. */
             fPedalDown    = false;
@@ -776,7 +776,7 @@ protected:
          * be sounding by the time the glide is advanced over it. */
         runSequencer();
 
-        if (fGlideActive)
+        if (fGlide.active())
             advanceGlide(frames);
 
         /* Age every sounding group, for the merge window. Counted in frames
@@ -1101,6 +1101,110 @@ private:
     VoiceGroup fGroup[kMaxGroups];
     uint8_t    fHeld[128] = {0};
 
+    /*
+     * A glide in flight: which group is moving, where it is heading, how far
+     * that is, and how much of the journey is done.
+     *
+     * WHY THIS IS AN OBJECT. It used to be nine loose fields, and fGlideActive
+     * alone had seventeen write sites. Nine values that are really one fact -
+     * "this group is travelling to there" - but independently assignable, so any
+     * site that set eight of nine left the ninth stale and nothing said so. The
+     * start sequence was written out three times, which is exactly how one copy
+     * came to read the group's octave where the other two read the gesture's:
+     * the Slide-mode drag bug.
+     *
+     * WHY THE GROUP IS A POINTER, not a source. A source is the packed cell a
+     * phrase STARTED on, and it identified the gliding group in five places. But
+     * a keyboard group's source never changes as ownership moves between keys,
+     * so two groups can share one; a merge rewrites source to kMergedSource
+     * outright; and findGroup(source) returns the FIRST active match. The handle
+     * was therefore neither unique nor stable, and "is this the gliding group?"
+     * had five copies of a question it could answer wrongly.
+     *
+     * A pointer is unique by construction. The one obligation it creates is that
+     * a group being retired must be forgotten here - forget() - which is a
+     * single rule in a single place, rather than five comparisons that each had
+     * to be remembered.
+     */
+    class Glide
+    {
+    public:
+        bool active() const { return fGroup != nullptr; }
+
+        /* Is this the group currently travelling? What all five of the old
+         * source comparisons were really asking. */
+        bool owns(const VoiceGroup* g) const
+        {
+            return g != nullptr && fGroup == g;
+        }
+
+        VoiceGroup*        group() const { return fGroup; }
+        const ChordTarget& to()    const { return fTo; }
+        int                semis() const { return fSemis; }
+
+        /*
+         * Begin, replacing whatever was in flight.
+         *
+         * Every field is set together or not at all, which is the point of the
+         * type: there is no longer a way to start a glide carrying a stale
+         * destination or a stale distance.
+         */
+        void begin(VoiceGroup* g, const ChordTarget& to, int semis,
+                   uint32_t durationFrames)
+        {
+            fGroup    = g;
+            fTo       = to;
+            fSemis    = semis;
+            fElapsed  = 0;
+            fDuration = durationFrames;
+        }
+
+        /* Progress through the ramp, 0..1. Reaching 1 means the snap is due. */
+        float advance(uint32_t frames)
+        {
+            fElapsed += frames;
+            if (fDuration == 0)
+                return 1.0f;
+            return static_cast<float>(fElapsed) / static_cast<float>(fDuration);
+        }
+
+        /*
+         * Nothing is travelling any more.
+         *
+         * Deliberately does NOT touch the wire: zeroing the bend is the caller's
+         * business, because only the caller knows which channels carried one and
+         * at which frame. Keeping emission out of here is what lets this class be
+         * pure bookkeeping, and testable as such.
+         */
+        void clear()
+        {
+            fGroup = nullptr;
+            fSemis = 0;
+        }
+
+        /*
+         * A group is being retired, so stop pointing at it.
+         *
+         * The one rule that keeps the pointer safe, and the reason it can be a
+         * pointer at all. Called from stopGroup(), which every path to a group's
+         * death passes through.
+         */
+        void forget(const VoiceGroup* g)
+        {
+            if (fGroup == g)
+                clear();
+        }
+
+    private:
+        VoiceGroup* fGroup    = nullptr;   /* the group itself, not its source */
+        ChordTarget fTo;
+        int         fSemis    = 0;
+        uint32_t    fElapsed  = 0;
+        uint32_t    fDuration = 0;
+    };
+
+    Glide fGlide;
+
     /* A source packs the cell as (ring << 8) | position. Decoded here rather
      * than open-coded at each use, so the two halves cannot drift apart. */
     static int position_from_source(int source) { return source & 0xFF; }
@@ -1354,6 +1458,17 @@ private:
         if (g == nullptr || ! g->active)
             return;
 
+        /*
+         * The glide must not be left pointing at a group that is going away.
+         *
+         * This is the single obligation that holding a VoiceGroup* creates, and
+         * it belongs here because every path to a group's death passes through
+         * this function: a press replacing it, a release, a panic, an eviction,
+         * the snap's own rebuild. Five scattered source comparisons used to
+         * stand in for this, and each of them could answer wrongly.
+         */
+        fGlide.forget(g);
+
         for (int i = 0; i < g->count; ++i) {
             const uint8_t note = g->note[i];
 
@@ -1478,19 +1593,22 @@ private:
      * holds real, editable note numbers rather than permanently bent ones. */
     void advanceGlide(uint32_t frames)
     {
-        VoiceGroup* g = findGroup(fGlideSource);
+        /*
+         * The group itself, not a lookup by source.
+         *
+         * It cannot be stale: stopGroup() tells the glide to forget any group it
+         * retires, so a non-null pointer here is a live group by construction.
+         * findGroup(fGlideSource) could instead return a DIFFERENT group that
+         * happened to share the source, which two keyboard groups routinely do.
+         */
+        VoiceGroup* g = fGlide.group();
         if (g == nullptr) {
-            /* The gliding group went away underneath us. */
-            fGlideActive = false;
+            fGlide.clear();
             sendPitchBend(0, fChannel, 0.0f);
             return;
         }
 
-        fGlideElapsed += frames;
-
-        const float progress = fGlideDuration > 0
-            ? static_cast<float>(fGlideElapsed) / static_cast<float>(fGlideDuration)
-            : 1.0f;
+        const float progress = fGlide.advance(frames);
 
         if (progress < 1.0f) {
             if (g->mpe) {
@@ -1503,7 +1621,7 @@ private:
                 }
             } else {
                 sendPitchBend(0, fChannel,
-                              progress * static_cast<float>(fGlideTargetSemis));
+                              progress * static_cast<float>(fGlide.semis()));
             }
             return;
         }
@@ -1518,7 +1636,7 @@ private:
                 sendPitchBend(0, g->chan[i], delta);
             }
         } else {
-            sendPitchBend(0, fChannel, static_cast<float>(fGlideTargetSemis));
+            sendPitchBend(0, fChannel, static_cast<float>(fGlide.semis()));
         }
 
         const uint8_t vel    = g->velocity;
@@ -1537,7 +1655,7 @@ private:
         const int     landed = g->cell;
         /* Carry the originating note across the rebuild, or the key holding
          * this chord could no longer release it. The octave comes from
-         * fGlideTo.octave, since a glide may have crossed octaves. */
+         * fGlide.to().octave, since a glide may have crossed octaves. */
         const int     note   = g->midiNote;
         uint8_t       chans[kMaxGroupNotes];
         const int     nchan  = g->count;
@@ -1545,9 +1663,9 @@ private:
             chans[i] = g->chan[i];
 
         stopGroup(0, g);
-        startGroup(0, source, fGlideTo.rootAbove, fGlideTo.type,
-                   fGlideTo.ring, vel, /* retriggerDuplicates */ false,
-                   fGlideTo.octave, note);
+        startGroup(0, source, fGlide.to().rootAbove, fGlide.to().type,
+                   fGlide.to().ring, vel, /* retriggerDuplicates */ false,
+                   fGlide.to().octave, note);
 
         /* Restore the cell the glide landed on, since startGroup took it from
          * the stale source. */
@@ -1562,8 +1680,7 @@ private:
             sendPitchBend(0, fChannel, 0.0f);
         }
 
-        fGlideActive      = false;
-        fGlideTargetSemis = 0;
+        fGlide.clear();
     }
 
     /*
@@ -1601,15 +1718,15 @@ private:
                 if (fLatchEnabled) {
                     VoiceGroup* same = findGroup(source);
                     if (same != nullptr) {
-                        if (fGlideActive && fGlideSource == source) {
-                            fGlideActive = false;
+                        if (fGlide.owns(same)) {
+                            fGlide.clear();
                             sendPitchBend(0, fChannel, 0.0f);
                         }
                         stopGroup(0, same);
                         break;
                     }
 
-                    fGlideActive = false;
+                    fGlide.clear();
                     stopAllGroups(0);
                     fGestureVelocity = pickVelocity();
                     startGroup(0, source, root, type, r, fGestureVelocity, true,
@@ -1707,11 +1824,9 @@ private:
                  * octave-shifted strip travels the whole way rather than
                  * bending within the octave it started in. */
                 const ChordTarget from(g->root, g->type, g->ring, g->octave);
-                fGlideTo          = ChordTarget(root, type, r, gestureOct);
-                fGlideTargetSemis = semitonesBetween(from, fGlideTo);
-                fGlideSource      = g->source;
-                fGlideElapsed     = 0;
-                fGlideDuration    = glideDurationFrames();
+                const ChordTarget to(root, type, r, gestureOct);
+                fGlide.begin(g, to, semitonesBetween(from, to),
+                             glideDurationFrames());
 
                 if (fGlideMode == kGlideMpe) {
                     /* Work out where each voice must land, pairing by index. A
@@ -1720,7 +1835,7 @@ private:
                     /* Same builder startGroup uses, so the ramp heads exactly
                      * where the snap will land. */
                     uint8_t want[kMaxGroupNotes];
-                    const int n = buildCellChord(fGlideTo, want);
+                    const int n = buildCellChord(fGlide.to(), want);
 
                     for (int i = 0; i < g->count; ++i)
                         g->target[i] = (i < n) ? want[i] : g->note[i];
@@ -1729,13 +1844,14 @@ private:
                     bool moves = false;
                     for (int i = 0; i < g->count && ! moves; ++i)
                         moves = (g->target[i] != g->note[i]);
-                    fGlideActive = moves;
-                } else {
-                    fGlideActive = (fGlideTargetSemis != 0);
+                    if (! moves)
+                        fGlide.clear();
+                } else if (fGlide.semis() == 0) {
+                    fGlide.clear();
                 }
 
                 /* Nothing to travel, but the voicing or shape may still differ. */
-                if (! fGlideActive && (type != g->type || r != g->ring)) {
+                if (! fGlide.active() && (type != g->type || r != g->ring)) {
                     const uint8_t vel  = g->velocity;
                     /* The gesture's octave, like every other branch here: the
                      * cell the drag reached decides where it sounds. */
@@ -1761,8 +1877,8 @@ private:
                  * drag's, because a latched chord on the same cell must not be
                  * left sounding with the old voicing beside the new one.
                  */
-                if (fGlideActive) {
-                    fGlideActive = false;
+                if (fGlide.active()) {
+                    fGlide.clear();
                     zeroAllBends(0);
                 }
 
@@ -1795,15 +1911,14 @@ private:
                  * plugin generated should still be sounding. Silence it all and
                  * the class of stuck-note bugs goes with it.
                  */
-                if (fGlideActive) {
-                    fGlideActive = false;
+                if (fGlide.active()) {
+                    fGlide.clear();
                     zeroAllBends(0);
                 }
 
                 if (fHoldToSustain) {
                     stopAllGroups(0);
                     fDragSource = -1;
-                    fGlideSource = -1;
                 }
                 /* In fixed-length mode the countdown owns the note-off. */
                 break;
@@ -1839,15 +1954,15 @@ private:
 
         /* Glide off, or a glide already running: move immediately rather than
          * queueing a second ramp on top of the first. */
-        if (fGlideMode == kGlideOff || fGlideActive) {
+        if (fGlideMode == kGlideOff || fGlide.active()) {
             const uint8_t vel  = g->velocity;
             const int     src  = g->source;
             const int     root = g->root;
             const ChordType ty = g->type;
             const Ring      rg = g->ring;
 
-            if (fGlideActive) {
-                fGlideActive = false;
+            if (fGlide.active()) {
+                fGlide.clear();
                 zeroAllBends(frame);
             }
 
@@ -1857,11 +1972,8 @@ private:
         }
 
         /* Same chord, different octave: only the octave moves. */
-        fGlideTo          = ChordTarget(g->root, g->type, g->ring, fOctave);
-        fGlideTargetSemis = delta;
-        fGlideSource      = g->source;
-        fGlideElapsed     = 0;
-        fGlideDuration    = glideDurationFrames();
+        fGlide.begin(g, ChordTarget(g->root, g->type, g->ring, fOctave), delta,
+                     glideDurationFrames());
 
         if (fGlideMode == kGlideMpe) {
             /* Every voice travels the same octave, so the targets are simply
@@ -1872,8 +1984,6 @@ private:
                     ? static_cast<uint8_t>(t) : g->note[i];
             }
         }
-
-        fGlideActive = true;
     }
 
     /* ---- MIDI input: the keyboard plays the wheel -------------------------
@@ -1994,7 +2104,7 @@ private:
             fHeldKeyCount = 0;
             stopAllGroups(ev.frame);
             zeroAllBends(ev.frame);
-            fGlideActive = false;
+            fGlide.clear();
             writeMidiEvent(ev);
             return;
         }
@@ -2207,19 +2317,14 @@ private:
          * never moved to.
          *
          * The targets just written are left as they are. advanceGlide() is the
-         * only reader and runs only while fGlideActive, which this path never
+         * only reader and runs only while the glide is active, which this path never
          * sets, so they are overwritten by the next glide before anything can
          * see them.
          */
         if (! moves)
             return false;
 
-        fGlideTo          = to;
-        fGlideTargetSemis = semis;
-        fGlideSource      = g->source;
-        fGlideElapsed     = 0;
-        fGlideDuration    = glideDurationFrames();
-        fGlideActive      = true;
+        fGlide.begin(g, to, semis, glideDurationFrames());
 
         /* The key that now owns the phrase: its release is what ends it. */
         g->midiNote = owner;
@@ -2302,8 +2407,8 @@ private:
         if (fPedalDown) {
             g->deferred = true;
         } else {
-            if (fGlideActive && fGlideSource == g->source) {
-                fGlideActive = false;
+            if (fGlide.owns(g)) {
+                fGlide.clear();
                 zeroAllBends(frame);
             }
             stopGroup(frame, g);
@@ -2358,7 +2463,7 @@ private:
 
             /* The group that a glide is currently moving is not orphaned - it
              * is mid-flight and owned by whichever key it was handed to. */
-            if (fGlideActive && fGlideSource == g->source && isKeyHeld(fLastKeyboardNote))
+            if (fGlide.owns(g) && isKeyHeld(fLastKeyboardNote))
                 continue;
 
             logLine("reclaimed orphaned group (key %d is up)", g->midiNote);
@@ -2411,8 +2516,8 @@ private:
     {
         for (int i = 0; i < kMaxGroups; ++i) {
             if (fGroup[i].active && fGroup[i].deferred) {
-                if (fGlideActive && fGlideSource == fGroup[i].source) {
-                    fGlideActive = false;
+                if (fGlide.owns(&fGroup[i])) {
+                    fGlide.clear();
                     zeroAllBends(frame);
                 }
                 stopGroup(frame, &fGroup[i]);
@@ -2846,7 +2951,6 @@ private:
     int32_t  fNoteOffCountdown = 0;
     /* The group a drag is currently moving, as a packed position|ring. */
     int      fDragSource  = -1;
-    int      fGlideSource = -1;
 
     /* Written by setState() on the UI thread, claimed by run() on the audio
      * thread. See queueGesture(). */
@@ -2869,21 +2973,8 @@ private:
     std::atomic<bool> fPanic { false };
 
 
-    bool      fGlideActive      = false;
-    uint32_t  fGlideElapsed     = 0;
-    uint32_t  fGlideDuration    = 0;
-    int       fGlideTargetSemis = 0;
-
-    /*
-     * Where the glide is heading, as one address.
-     *
-     * Was four separate fields - root, type, ring and octave - set individually
-     * at three different sites. The octave in particular has to be carried
-     * rather than assumed, because a keyboard glide or a drag into a shifted
-     * strip can cross octaves and the snap at the end must land where the
-     * gesture asked, not where the group began.
-     */
-    ChordTarget fGlideTo;
+    /* Glide state lives in the Glide object declared beside fGroup: it is one
+     * fact about one group, so it is kept as one thing. */
 
     /* ---- MIDI input state -------------------------------------------------- */
 
