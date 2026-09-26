@@ -2260,6 +2260,99 @@ private:
 
         if (fLastKeyboardNote == midiNote)
             fLastKeyboardNote = topHeldKey();
+
+        reclaimOrphanedKeyGroups(frame);
+    }
+
+    /*
+     * Retire every keyboard group whose owning key is no longer down.
+     *
+     * A keyboard group is released by OWNER - findGroupByNote() - because two
+     * octaves of one key share a cell, so the cell cannot identify it. A glide
+     * hands that ownership to the newer key. Both are right on their own, and
+     * together they leave a gap: when a press cannot glide (a zero-distance
+     * move, or any non-MPE mode, where canGlideBetween() always refuses) it
+     * falls through to startGroup() and a SECOND group begins, while
+     * fLastKeyboardNote follows only the newest key. Nothing then points at the
+     * older group, and the key that owned it is already back up - so no release
+     * will ever reach it and its pitches stay up for good.
+     *
+     * That is the reported fault: rapid alternation strands a group per cycle.
+     * Bypassing the plugin could not help, because nothing here was sustaining
+     * the note - the note-off simply never went out. Only retriggering the
+     * instrument cleared it.
+     *
+     * This is a sweep rather than a special case at one call site because the
+     * gap is structural: any path that starts a group without retiring the one
+     * it displaced reopens it. The condition is exact rather than heuristic - a
+     * group whose owner is not in the held-key stack is unreachable BY
+     * DEFINITION, so this can never cut short a note anyone is still holding.
+     * The pedal is respected: a deferred group is meant to outlive its key.
+     */
+    void reclaimOrphanedKeyGroups(uint32_t frame)
+    {
+        if (fPedalDown)
+            return;
+
+        for (int i = 0; i < kMaxGroups; ++i) {
+            VoiceGroup* g = &fGroup[i];
+
+            /* Pointer-triggered groups have no owning key; they are released by
+             * the drag that made them. */
+            if (! g->active || g->midiNote < 0 || g->deferred)
+                continue;
+
+            if (isKeyHeld(g->midiNote))
+                continue;
+
+            /* The group that a glide is currently moving is not orphaned - it
+             * is mid-flight and owned by whichever key it was handed to. */
+            if (fGlideActive && fGlideSource == g->source && isKeyHeld(fLastKeyboardNote))
+                continue;
+
+            logLine("reclaimed orphaned group (key %d is up)", g->midiNote);
+            stopGroup(frame, g);
+        }
+
+        /*
+         * With every key up and nothing latched or pedalled, no keyboard group
+         * may remain and no pitch may still be counted as held.
+         *
+         * A surviving REFCOUNT is as damaging as a surviving note, and quieter:
+         * stopGroup() suppresses the note-off whenever fHeld[note] > 1, so a
+         * phantom reference means that pitch can never sound again for the rest
+         * of the session - the count can no longer reach zero. Two groups on the
+         * same chord produce exactly that, and nothing else would ever clear it.
+         *
+         * Checked only in the all-keys-up state, where the correct answer is
+         * known outright rather than inferred, so this cannot mask a live bug in
+         * the paths above - it records one.
+         */
+        if (fHeldKeyCount == 0 && ! fLatchEnabled && ! anyKeyboardGroupActive()) {
+            for (int n = 0; n < 128; ++n) {
+                if (fHeld[n] == 0)
+                    continue;
+
+                logLine("stranded refcount on note %d (%d refs) - clearing", n, fHeld[n]);
+                fHeld[n] = 0;
+                sendRaw(frame, 0x80 | fChannel, static_cast<uint8_t>(n), 0);
+                if (fGlideMode == kGlideMpe) {
+                    for (int v = 0; v < kMaxGroupNotes; ++v)
+                        sendRaw(frame, 0x80 | mpeChannelFor(v),
+                                static_cast<uint8_t>(n), 0);
+                }
+            }
+        }
+    }
+
+    /* Any group still owned by a key. Pointer and sequencer groups do not count:
+     * they outlive the keyboard quite legitimately. */
+    bool anyKeyboardGroupActive() const
+    {
+        for (int i = 0; i < kMaxGroups; ++i)
+            if (fGroup[i].active && fGroup[i].midiNote >= 0)
+                return true;
+        return false;
     }
 
     /* Pedal up: everything whose key was already released now stops. */
@@ -2795,6 +2888,18 @@ private:
     int topHeldKey() const
     {
         return fHeldKeyCount > 0 ? fHeldKey[fHeldKeyCount - 1] : -1;
+    }
+
+    /* Is this key physically down? The stack is the authority on that, and it is
+     * what makes the orphan test exact rather than a guess. */
+    bool isKeyHeld(int note) const
+    {
+        if (note < 0)
+            return false;
+        for (int i = 0; i < fHeldKeyCount; ++i)
+            if (fHeldKey[i] == note)
+                return true;
+        return false;
     }
 
     /* The most recent played note still sounding, for glide between
