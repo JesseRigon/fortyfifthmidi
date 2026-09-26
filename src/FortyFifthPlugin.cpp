@@ -1113,6 +1113,53 @@ private:
     }
 
     /*
+     * Move a group's lit cell, for a glide that changes which cell sounds.
+     *
+     * A glide does not stop one group and start another - it retargets the
+     * notes of the group already sounding, which is the point: nothing
+     * retriggers. But that left the HIGHLIGHT behind on the cell the glide
+     * started from, because litCell is written when a group starts and never
+     * again.
+     *
+     * The symptom was on the keyboard, where holding a second key glides the
+     * first key's group onto the new chord. One group means one lit cell, so
+     * two held keys lit one cell, and it never moved to the newer one - while
+     * both chords sounded correctly, because the audio path never consults any
+     * of this.
+     *
+     * Unlighting is conditional for the same reason stopGroup's is: another
+     * group may still be holding the cell being left.
+     */
+    void moveLitCell(VoiceGroup* g, int newSource)
+    {
+        if (g == nullptr)
+            return;
+
+        const int oldCell = g->litCell;
+        const int newCell = sourceIsCell(newSource) ? newSource : -1;
+
+        if (oldCell == newCell)
+            return;
+
+        if (sourceIsCell(oldCell)) {
+            bool stillHeld = false;
+            for (int i = 0; i < kMaxGroups && ! stillHeld; ++i)
+                stillHeld = (&fGroup[i] != g &&
+                             fGroup[i].active &&
+                             fGroup[i].litCell == oldCell);
+            if (! stillHeld)
+                fCells.set(ring_from_source(oldCell),
+                           position_from_source(oldCell), false);
+        }
+
+        g->litCell = newCell;
+
+        if (newCell >= 0)
+            fCells.set(ring_from_source(newCell),
+                       position_from_source(newCell), true);
+    }
+
+    /*
      * Start a chord as its own group.
      *
      * retriggerDuplicates decides what happens to a pitch another group already
@@ -1583,6 +1630,10 @@ private:
                 /* A pointer drag stays in the octave the group already has. */
                 fGlideTargetOct   = g->octave;
                 fGlideSource      = g->source;
+
+                /* The glide lands on a different cell, so the highlight moves
+                 * with it rather than staying where the drag began. */
+                moveLitCell(g, source);
                 fGlideElapsed     = 0;
                 fGlideDuration    = static_cast<uint32_t>(
                     fGlideTimeMs * fSampleRate / 1000.0);
@@ -2035,6 +2086,10 @@ private:
                 /* The gliding group becomes this note's group: the key that is
                  * now down owns what is sounding, so its release ends it. */
                 from->midiNote = midiNote;
+
+                /* ...and it now sounds a different cell, so the highlight has
+                 * to follow it there. */
+                moveLitCell(from, source);
 
                 if (fGlideMode == kGlideMpe) {
                     uint8_t want[kMaxGroupNotes];

@@ -116,6 +116,46 @@ struct Engine {
         }
     }
 
+    /*
+     * Mirrors FortyFifthPlugin::moveLitCell().
+     *
+     * A glide retargets the notes of a group that is ALREADY sounding rather
+     * than starting a new one - that is the whole point, nothing retriggers.
+     * But litCell is written when a group starts and never again, so the
+     * highlight stayed on the cell the glide began from.
+     */
+    void moveLit(Group* g, int newSource)
+    {
+        if (g == nullptr) return;
+
+        const int oldCell = g->litCell;
+        const int newCell = sourceIsCell(newSource) ? newSource : -1;
+        if (oldCell == newCell) return;
+
+        if (sourceIsCell(oldCell)) {
+            bool stillHeld = false;
+            for (int i = 0; i < kMaxGroups && ! stillHeld; ++i)
+                stillHeld = (&group[i] != g && group[i].active &&
+                             group[i].litCell == oldCell);
+            if (! stillHeld)
+                cells.set(ringFromSource(oldCell), positionFromSource(oldCell), false);
+        }
+
+        g->litCell = newCell;
+        if (newCell >= 0)
+            cells.set(ringFromSource(newCell), positionFromSource(newCell), true);
+    }
+
+    /* Which cells are lit, as a sorted list, for exact comparison. */
+    void litCells(int* out, int& n) const
+    {
+        n = 0;
+        for (int r = 0; r < kRingCount; ++r)
+            for (int p = 0; p < segmentsInRing(static_cast<Ring>(r)); ++p)
+                if (cells.isOn(static_cast<Ring>(r), p))
+                    out[n++] = (r << 8) | p;
+    }
+
     Group* find(int source)
     {
         for (int i = 0; i < kMaxGroups; ++i)
@@ -270,6 +310,127 @@ int main()
 
         e.stopAll();
         ok("clear at the end", e.litCount() == 0, "nothing lit");
+    }
+
+
+    /* --- glide moves the highlight ------------------------------------ */
+    /*
+     * Reported: "when two keys on the keyboard midi inputs overlap only 1 cell
+     * can be highlighted at once and they don't both show up and it doesn't
+     * switch highlighting when new keys play. the sounds trigger fine."
+     *
+     * Exactly right, and the "sounds trigger fine" is the clue: the audio path
+     * never consults the highlight. With glide on, a second held key does not
+     * start a second group - it GLIDES the first key's group onto the new
+     * chord, so one group sounds and one cell is lit. The cell was simply the
+     * wrong one, and never moved.
+     */
+    std::printf("\n=== a glide takes the highlight with it ===\n");
+    {
+        Engine e;
+        const int a = packSource(kRingKey, 0);
+        const int b = packSource(kRingKey, 1);
+
+        e.start(a);
+        ok("first key lights its cell", e.cells.isOn(kRingKey, 0), "cell 0");
+
+        /* Second key glides the SAME group onto cell b. */
+        Group* g = e.find(a);
+        e.moveLit(g, b);
+
+        ok("the new cell is lit",      e.cells.isOn(kRingKey, 1), "cell 1");
+        ok("the old cell is dark",   ! e.cells.isOn(kRingKey, 0), "moved, not added");
+        std::snprintf(d, sizeof d, "%d lit", e.litCount());
+        ok("exactly one cell is lit",  e.litCount() == 1, d);
+
+        /* Releasing ends it, and nothing is stranded on either cell. */
+        e.stopAll();
+        ok("nothing left lit", e.litCount() == 0, "clean");
+    }
+
+    /* A run of keys, which is what playing actually does. */
+    std::printf("\n=== a legato run lights only where it is ===\n");
+    {
+        Engine e;
+        int prev = packSource(kRingKey, 0);
+        e.start(prev);
+
+        bool always1 = true;
+        for (int p = 1; p < 12; ++p) {
+            const int s = packSource(kRingKey, p);
+            e.moveLit(e.find(prev), s);
+            if (e.litCount() != 1) always1 = false;
+            if (! e.cells.isOn(kRingKey, p)) always1 = false;
+        }
+        ok("12 glided keys keep exactly one cell lit, the current one",
+           always1, "follows the phrase");
+
+        e.stopAll();
+        ok("and nothing survives the release", e.litCount() == 0, "clean");
+    }
+
+    /*
+     * Two groups genuinely sounding at once - what happens with glide OFF,
+     * where a second key starts its own group. Both must light.
+     */
+    std::printf("\n=== two real groups light two cells ===\n");
+    {
+        Engine e;
+        const int a = packSource(kRingKey, 2);
+        const int b = packSource(kRingMinor, 5);
+
+        e.start(a);
+        e.start(b);
+        std::snprintf(d, sizeof d, "%d lit", e.litCount());
+        ok("both cells lit", e.litCount() == 2, d);
+        ok("  on their own rings",
+           e.cells.isOn(kRingKey, 2) && e.cells.isOn(kRingMinor, 5), "key + minor");
+
+        /* Stopping one must not darken the other. */
+        e.stop(e.find(a));
+        ok("one stops, the other stays lit",
+           e.litCount() == 1 && e.cells.isOn(kRingMinor, 5), "independent");
+
+        e.stopAll();
+        ok("both clear", e.litCount() == 0, "clean");
+    }
+
+    /* A glide onto a cell a DIFFERENT group already holds must not darken it
+     * when the glide later leaves. */
+    std::printf("\n=== gliding across a cell someone else holds ===\n");
+    {
+        Engine e;
+        const int held  = packSource(kRingKey, 4);
+        const int start = packSource(kRingKey, 6);
+
+        e.start(held);                 /* group 1 sits on cell 4 */
+        e.start(start);                /* group 2 starts on cell 6 */
+        ok("two cells lit", e.litCount() == 2, "4 and 6");
+
+        Group* g = e.find(start);
+        e.moveLit(g, held);            /* group 2 glides ONTO cell 4 */
+        ok("still lit where both now are", e.cells.isOn(kRingKey, 4), "shared");
+        ok("the vacated cell went dark", ! e.cells.isOn(kRingKey, 6), "left it");
+
+        e.moveLit(g, packSource(kRingKey, 8));   /* and glides away again */
+        ok("the held cell survives the departure",
+           e.cells.isOn(kRingKey, 4), "its owner still holds it");
+        ok("the new cell is lit", e.cells.isOn(kRingKey, 8), "arrived");
+
+        e.stopAll();
+        ok("all clear", e.litCount() == 0, "clean");
+    }
+
+    /* A glide to a sentinel is not a cell, so it just unlights. */
+    std::printf("\n=== gliding to a non-cell ===\n");
+    {
+        Engine e;
+        const int a = packSource(kRingKey, 3);
+        e.start(a);
+        e.moveLit(e.find(a), kProgSource);
+        ok("no cell lit", e.litCount() == 0, "a sentinel has none");
+        e.stopAll();
+        ok("and stopping is still safe", e.litCount() == 0, "clean");
     }
 
     std::printf("\n%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
