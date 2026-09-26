@@ -13,28 +13,30 @@
   the synth here because it was already installed; any VST2 or VST3 synth can
   replace it by swapping the second plugin.
 
-  Carla's rack routes each plugin's output into the next, so the MIDI link is
-  implied by the order and needs no patchbay wiring.
-
   Open with:  bash dev/carla.sh
-  or on Windows:  dev\carla.bat
+
+  THIS FILE WAS SAVED BY CARLA, and then had these comments put back. Hand-
+  writing it did not work: <ProcessMode> inside <EngineSettings> is ignored and
+  Carla strips it on save, so Rack mode comes from Carla's own settings
+  (Settings > Engine > Process mode, stored per user in the registry on
+  Windows) and not from here.
+
+  The part that DOES belong here is
+ <!--
+   The three cables that connect the rack to the world. Carla makes none of
+   these itself - it only discovers devices and opens one when connected.
+ -->
+ <ExternalPatchbay> at the bottom. Rack mode
+  chains the plugins to each other, but it connects the rack to nothing - not
+  the keyboard, not the speakers. Those three cables are the connection to the
+  outside world, and without them the rack runs in silence with every level
+  meter moving.
+
+  The audio port names are plain "Left" and "Right" rather than the sound
+  card's own name: the device itself is chosen in engine settings, so the ports
+  are generic. Which is why this could have been written by hand all along.
 -->
 <CARLA-PROJECT VERSION='2.5'>
- <!--
-   RACK MODE MATTERS HERE, and it is not what Carla defaults to.
-
-   In Rack, plugins are chained top to bottom automatically - FortyFifthMidi's
-   MIDI output feeds Helm because Helm sits below it, with no cables to draw.
-   Every MIDI input is fed into the top of the rack, so the V49 is connected as
-   soon as Carla sees it.
-
-   In Patchbay, NOTHING is connected until you draw it. Loading this project
-   under Patchbay puts both plugins on screen looking perfectly correct while
-   producing silence, because the link between them was never made - which is
-   exactly what happened the first time this was opened.
-
-   ProcessMode 2 is CARLA_PROCESS_MODE_CONTINUOUS_RACK.
- -->
  <EngineSettings>
   <ForceStereo>false</ForceStereo>
   <PreferPluginBridges>false</PreferPluginBridges>
@@ -42,14 +44,12 @@
   <UIsAlwaysOnTop>false</UIsAlwaysOnTop>
   <MaxParameters>200</MaxParameters>
   <UIBridgesTimeout>4000</UIBridgesTimeout>
-  <ProcessMode>2</ProcessMode>
-  <TransportMode>1</TransportMode>
  </EngineSettings>
-
 
  <Transport>
   <BeatsPerMinute>120</BeatsPerMinute>
  </Transport>
+
 
  <!--
    The plugin under test. Carla wants the binary INSIDE the .vst3 bundle, not
@@ -60,42 +60,55 @@
   <Info>
    <Type>VST3</Type>
    <Name>FortyFifthMidi</Name>
-   <URI></URI>
-   <Label>FortyFifthMidi</Label>
    <Binary>J:\My Drive\Life\5 Media\Music\VSTs\fortyfifthmidi\FortyFifthMidi.vst3\Contents\x86_64-win\FortyFifthMidi.vst3</Binary>
+   <Label>FortyFifthMidi</Label>
   </Info>
+
   <Data>
    <Active>Yes</Active>
-   <Volume>1</Volume>
-   <DryWet>1</DryWet>
-   <Balance-Left>-1</Balance-Left>
-   <Balance-Right>1</Balance-Right>
-   <Panning>0</Panning>
    <ControlChannel>N</ControlChannel>
-   <Options>0x0</Options>
+   <Options>0x1</Options>
   </Data>
  </Plugin>
 
+
  <!--
    The synth. Second in the rack, so it receives the plugin's MIDI output.
+   Its saved parameters are deliberately not kept here: they are one patch at
+   one moment, they churn on every save, and the wiring is the point.
  -->
  <Plugin>
   <Info>
    <Type>VST2</Type>
    <Name>Helm</Name>
-   <URI></URI>
-   <Label>helm64</Label>
    <Binary>J:\My Drive\Life\5 Media\Music\VSTs\Helm\helm64.dll</Binary>
+   <UniqueID>1214606445</UniqueID>
   </Info>
+
   <Data>
    <Active>Yes</Active>
-   <Volume>1</Volume>
-   <DryWet>1</DryWet>
-   <Balance-Left>-1</Balance-Left>
-   <Balance-Right>1</Balance-Right>
-   <Panning>0</Panning>
    <ControlChannel>N</ControlChannel>
-   <Options>0x0</Options>
+   <Options>0x1</Options>
   </Data>
  </Plugin>
+
+
+ <!--
+   The three cables that connect the rack to the world. Carla makes none of
+   these itself - it only discovers devices and opens one when connected.
+ -->
+ <ExternalPatchbay>
+  <Connection>
+   <Source>MidiIn:V49</Source>
+   <Target>Carla:MidiIn</Target>
+  </Connection>
+  <Connection>
+   <Source>Carla:AudioOut1</Source>
+   <Target>AudioOut:Left</Target>
+  </Connection>
+  <Connection>
+   <Source>Carla:AudioOut2</Source>
+   <Target>AudioOut:Right</Target>
+  </Connection>
+ </ExternalPatchbay>
 </CARLA-PROJECT>
