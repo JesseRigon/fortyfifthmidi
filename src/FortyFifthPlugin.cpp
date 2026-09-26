@@ -1520,7 +1520,9 @@ private:
         const int position = packed & 0xFF;
 
         const Ring      r    = static_cast<Ring>(ring);
-        const int       root = rootForPosition(position, r);
+        /* Where this cell sits in the key, not its pitch class: that is what
+         * places the chord in an octave. */
+        const int       root = cellAboveTonic(position, r);
         const ChordType type = chordTypeForRing(r, position);
 
         const int source = (ring << 8) | position;
@@ -1621,7 +1623,18 @@ private:
                     break;
                 }
 
-                fGlideTargetSemis = shortestSemitoneDelta(g->root, root);
+                /*
+                 * A real distance, not a wrapped one.
+                 *
+                 * Both roots are intervals above the same tonic now, so their
+                 * difference IS how far the chord travels - and it is allowed
+                 * to exceed six semitones, because I to vii is genuinely
+                 * eleven and bending the short way would land on the wrong
+                 * chord. shortestSemitoneDelta() was right for pitch classes,
+                 * where the octave was arbitrary; it is wrong here, where the
+                 * distance is the answer.
+                 */
+                fGlideTargetSemis = root - g->root;
                 fGlideTargetRoot  = root;
                 fGlideTargetType  = type;
                 fGlideTargetRing  = r;
@@ -2032,7 +2045,7 @@ private:
         if (existing != nullptr)
             stopGroup(frame, existing);
 
-        const int       root = rootForPosition(position, ring);
+        const int       root = cellAboveTonic(position, ring);
         const ChordType type = chordTypeForRing(ring, position);
         const int       oct  = octaveForMidiNote(midiNote);
         const int    source  = (static_cast<int>(ring) << 8) | position;
@@ -2199,6 +2212,21 @@ private:
      */
     bool leadingAppliesNow() const { return true; }
 
+
+    /*
+     * Where a cell sits in the current key, as semitones above its tonic.
+     *
+     * The one conversion from "which cell" to "which degree", so nothing
+     * downstream has to hold a pitch class and guess at an octave. Called
+     * wherever a gesture, a key press or a sequencer step resolves to a cell.
+     */
+    int cellAboveTonic(int position, Ring ring) const
+    {
+        const int key = fSelectedKey.load(std::memory_order_acquire);
+        return intervalAboveTonic(rootForPosition(position, ring),
+                                  rootForPosition(key, kRingKey));
+    }
+
     /*
      * The one definition of what notes a cell produces.
      *
@@ -2208,10 +2236,20 @@ private:
      * differently the glide would ramp toward pitches the snap never lands on.
      * So they all call here instead.
      */
-    int buildCellChord(int root, ChordType type, Ring ring, int octave,
+    int buildCellChord(int rootAbove, ChordType type, Ring ring, int octave,
                        uint8_t* out) const
     {
-        const int n = buildChord(root, type, octave * 12, out, kMaxChordTones);
+        /*
+         * rootAbove is the interval above the KEY'S TONIC, and the tonic is
+         * what sits on the octave floor - see intervalAboveTonic() and
+         * tonicMidi() in CircleTheory.hpp for why a pitch class cannot do this
+         * job. The key is read here rather than passed in because it is the
+         * same key every caller would have had to look up.
+         */
+        const int key   = fSelectedKey.load(std::memory_order_acquire);
+        const int tonic = tonicMidi(rootForPosition(key, kRingKey), octave);
+
+        const int n = buildChord(rootAbove, type, tonic, out, kMaxChordTones);
 
         /*
          * Build, then voice. That is the whole chain now.
@@ -2348,7 +2386,7 @@ private:
                       fSelectedKey.load(std::memory_order_acquire),
                       position, ring);
 
-        const int       root = rootForPosition(position, ring);
+        const int       root = cellAboveTonic(position, ring);
         const ChordType type = chordTypeFor(ring, cell.ext, cell.degree);
 
         /* The previous chord goes first: two chords sounding at once would be

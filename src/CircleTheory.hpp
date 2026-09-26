@@ -1242,11 +1242,66 @@ inline int shortestSemitoneDelta(int fromPitchClass, int toPitchClass)
     return delta;
 }
 
-/* Build the MIDI note numbers for a chord. Returns the voice count.
- * octave is a semitone offset already multiplied out by the caller. */
-inline int buildChord(int rootPitchClass,
+/*
+ * ---- where a chord sounds --------------------------------------------------
+ *
+ * A pitch class cannot say which octave it belongs in. It is a number 0..11
+ * with C at 0, and that zero point is an accident of notation, not of music -
+ * nothing about the key of A flat makes C its floor.
+ *
+ * Adding a pitch class to an octave floor therefore does not place a chord; it
+ * scatters chords by where their root happens to fall in the C-based ordering.
+ * In C that is invisible, because C's tonic IS 0 and every diatonic degree
+ * ascends from it. In A flat the tonic is 8, so the degrees whose pitch class
+ * is lower - IV at C sharp, V at E flat - wrapped to the BOTTOM of the same
+ * octave instead of rising into the next one, and the subdominant sounded
+ * below the tonic. Seven of the twelve keys voiced a I ii IV V differently
+ * from C.
+ *
+ * So a chord's position is expressed as an INTERVAL ABOVE THE KEY'S TONIC, and
+ * the tonic is what sits on the octave floor. That is the musical statement -
+ * "the fourth degree, in this key, in this octave" - and it transposes
+ * correctly by construction, because moving the key moves the floor and every
+ * degree with it.
+ */
+
+/*
+ * Semitones from a key's tonic up to a root, always 0..11.
+ *
+ * The one place the wrap is decided. A degree is never below its own tonic:
+ * the fourth is five semitones UP, not seven down, which is what keeps a
+ * progression the same shape in every key.
+ */
+inline int intervalAboveTonic(int rootPitchClass, int tonicPitchClass)
+{
+    return ((rootPitchClass - tonicPitchClass) % 12 + 12) % 12;
+}
+
+/*
+ * The MIDI note a key's tonic sits on for a given octave.
+ *
+ * MIDI 60 is C4 by the convention used here, so octave n starts at 12(n+1).
+ * The tonic's own pitch class is included, which is what anchors every chord
+ * in the key to the same floor.
+ */
+inline int tonicMidi(int tonicPitchClass, int octave)
+{
+    return (octave + 1) * 12 + (((tonicPitchClass % 12) + 12) % 12);
+}
+
+/*
+ * Build the MIDI note numbers for a chord.
+ *
+ * rootAbove is the interval above the tonic (0..11), NOT a pitch class, and
+ * tonicNote is where that tonic sits. Together they say "this degree of this
+ * key, in this octave", which is the whole of what places a chord.
+ *
+ * Notes outside MIDI range are dropped rather than wrapped: a wrapped note
+ * would be a different chord, and silence is the more honest failure.
+ */
+inline int buildChord(int rootAbove,
                       ChordType type,
-                      int baseOctaveMidi,
+                      int tonicNote,
                       uint8_t* outNotes,
                       size_t outCapacity)
 {
@@ -1254,7 +1309,7 @@ inline int buildChord(int rootPitchClass,
     int written = 0;
 
     for (int i = 0; i < shape.count && static_cast<size_t>(written) < outCapacity; ++i) {
-        const int note = baseOctaveMidi + rootPitchClass + shape.interval[i];
+        const int note = tonicNote + rootAbove + shape.interval[i];
         if (note >= 0 && note <= 127) {
             outNotes[written++] = static_cast<uint8_t>(note);
         }
