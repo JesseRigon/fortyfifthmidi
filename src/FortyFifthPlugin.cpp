@@ -98,6 +98,25 @@ using namespace fortyfifth;
 
 class FortyFifthPlugin : public Plugin
 {
+    /*
+     * A test may inspect the internals it is asserting about.
+     *
+     * dev/test-plugin.cpp compiles this file whole and drives it through
+     * setState() and run(), exactly as a host does, then checks both the emitted
+     * MIDI and the invariants behind it - that no group outlives its key, and
+     * that no refcount outlives the note it was counting. Those two are not
+     * visible in the output stream, which is precisely why they went wrong
+     * unnoticed.
+     *
+     * FORTYFIFTH_TESTING is defined only by that test's compile line, never by
+     * any build script, so nothing ships with wider access than before. The
+     * alternative - making the state public, or adding accessors used by nothing
+     * else - would weaken the real code to suit the test.
+     */
+#ifdef FORTYFIFTH_TESTING
+    friend class ::Host;
+#endif
+
 public:
     FortyFifthPlugin()
         : Plugin(0 /* parameters: see the rule above - intentionally none */,
@@ -655,11 +674,42 @@ protected:
          * an all-notes-off is cheap and a stuck note is not.
          */
         if (fStuckNotes) {
-            fStuckNotes = false;
+            /*
+             * The recovery can ITSELF be refused, and that is not a corner case:
+             * the buffer is most likely to be full during exactly the busy
+             * passage that stranded the note in the first place.
+             *
+             * So the latch is cleared only once every channel's all-notes-off
+             * has actually gone out, and the refcounts are reset only then too.
+             * Clearing either one up front is what made this unrecoverable:
+             *
+             *   - clearing fStuckNotes first meant a refused retry was never
+             *     retried again, because nothing remembered it was needed;
+             *   - clearing fHeld regardless meant the plugin forgot which
+             *     pitches were down, so no later release could name them.
+             *
+             * Together they produced the reported state: notes sounding while
+             * the plugin believed it was completely idle - no groups, no
+             * refcounts, no keys held - so nothing on this side would ever send
+             * another note-off. Bypassing the plugin could not help, because it
+             * was not sustaining anything; only retriggering the instrument
+             * cleared it. Measured with a host queue that fills mid-block:
+             * 3 to 5 pitches left up, every time.
+             */
+            bool recovered = true;
             for (uint8_t ch = 0; ch < 16; ++ch)
-                sendRaw(0, 0xB0 | ch, 123, 0);   /* all notes off */
-            std::memset(fHeld, 0, sizeof(fHeld));
-            logLine("recovered from refused note-offs: all notes off");
+                if (! sendRaw(0, 0xB0 | ch, 123, 0))   /* all notes off */
+                    recovered = false;
+
+            if (recovered) {
+                fStuckNotes = false;
+                std::memset(fHeld, 0, sizeof(fHeld));
+                logLine("recovered from refused note-offs: all notes off");
+            } else {
+                /* Left set deliberately: the next block tries again, and keeps
+                 * trying until the host has room. */
+                logLine("stuck-note recovery refused; will retry next block");
+            }
         }
 
         /* Announce the bend range once, before any glide can need it (spec 6.2
