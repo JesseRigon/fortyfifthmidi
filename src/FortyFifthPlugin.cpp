@@ -1588,9 +1588,16 @@ private:
 
     /* ---- glide ------------------------------------------------------------ */
 
-    /* Ramp the bend toward the target, then resolve with snap-and-reset (spec 6.2
-     * step 4a): re-trigger at true pitches and zero the bend, so the recorded clip
-     * holds real, editable note numbers rather than permanently bent ones. */
+    /*
+     * One block of a glide: ramp, and land if the time is up.
+     *
+     * This used to be one function doing four jobs - the ramp arithmetic, the
+     * MPE-versus-single dispatch, the snap, and the group rebuild that follows
+     * it - with theory, timing, voice bookkeeping and MIDI emission interleaved.
+     * It is now three, each with one job, because the snap's group handling is a
+     * different kind of work from interpolating a bend and was the harder half to
+     * reason about.
+     */
     void advanceGlide(uint32_t frames)
     {
         /*
@@ -1598,8 +1605,9 @@ private:
          *
          * It cannot be stale: stopGroup() tells the glide to forget any group it
          * retires, so a non-null pointer here is a live group by construction.
-         * findGroup(fGlideSource) could instead return a DIFFERENT group that
-         * happened to share the source, which two keyboard groups routinely do.
+         * The old findGroup(fGlideSource) could instead return a DIFFERENT group
+         * that happened to share the source, which two keyboard groups routinely
+         * do.
          */
         VoiceGroup* g = fGlide.group();
         if (g == nullptr) {
@@ -1611,61 +1619,87 @@ private:
         const float progress = fGlide.advance(frames);
 
         if (progress < 1.0f) {
-            if (g->mpe) {
-                /* Each voice travels its own distance, which is the whole point
-                 * of MPE mode: it makes shape changes glidable. */
-                for (int i = 0; i < g->count; ++i) {
-                    const float delta = static_cast<float>(g->target[i]) -
-                                        static_cast<float>(g->note[i]);
-                    sendPitchBend(0, g->chan[i], progress * delta);
-                }
-            } else {
-                sendPitchBend(0, fChannel,
-                              progress * static_cast<float>(fGlide.semis()));
-            }
+            sendGlideBend(g, progress);
             return;
         }
 
-        /* Snap-and-reset (spec 6.2 step 4a): land on the bend, retire the bent
-         * notes, restate the true ones, zero the bend. The recorded clip then
-         * holds real, editable pitches rather than permanently bent ones. */
+        landGlide(g);
+    }
+
+    /*
+     * Bend every voice `progress` of the way to where it is heading.
+     *
+     * The ramp, and nothing else. At progress 1 this is the full distance, which
+     * is what the snap sends before restating the true pitches - so the same
+     * function serves both, and the bend the listener hears cannot disagree with
+     * the bend the snap lands on.
+     */
+    void sendGlideBend(const VoiceGroup* g, float progress)
+    {
         if (g->mpe) {
+            /* Each voice travels its own distance, which is the whole point of
+             * MPE mode: it makes shape changes glidable. */
             for (int i = 0; i < g->count; ++i) {
                 const float delta = static_cast<float>(g->target[i]) -
                                     static_cast<float>(g->note[i]);
-                sendPitchBend(0, g->chan[i], delta);
+                sendPitchBend(0, g->chan[i], progress * delta);
             }
         } else {
-            sendPitchBend(0, fChannel, static_cast<float>(fGlide.semis()));
+            sendPitchBend(0, fChannel,
+                          progress * static_cast<float>(fGlide.semis()));
         }
+    }
 
+    /*
+     * Snap-and-reset (spec 6.2 step 4a).
+     *
+     * Land on the bend, retire the bent notes, restate the true ones, zero the
+     * bend. The recorded clip then holds real, editable pitches rather than
+     * permanently bent ones - which is the whole reason the glide does not simply
+     * leave the bend where it ended.
+     */
+    void landGlide(VoiceGroup* g)
+    {
+        /* Arrive: the full distance, from the same function that drew the ramp. */
+        sendGlideBend(g, 1.0f);
+
+        /*
+         * Everything that must survive the rebuild, read before the group dies.
+         *
+         * stopGroup() clears the group, so each of these has to be copied out
+         * first. They are gathered here rather than used in place because the
+         * rebuild is a stop and a start, and between those two the group is gone.
+         */
         const uint8_t vel    = g->velocity;
         const int     source = g->source;
         const bool    wasMpe = g->mpe;
         /*
-         * The cell the glide LANDED on, carried across the rebuild.
+         * The cell the glide LANDED on.
          *
-         * startGroup() derives the cell from the source it is handed, and the
-         * source here is still the one the glide started from - a drag keeps
-         * its identity so a later move can find it, and a merge may have
-         * replaced it with a sentinel outright. Rebuilding from that relit the
-         * cell the phrase began on, which is why moving the highlight when the
-         * glide STARTED did not stick: this ran moments later and put it back.
+         * startGroup() derives the cell from the source it is handed, and that
+         * source is still the one the glide started from - a drag keeps its
+         * identity so a later move can find it, and a merge may have replaced it
+         * with a sentinel outright. Rebuilding from it relit the cell the phrase
+         * BEGAN on, which is why moving the highlight when the glide started did
+         * not stick: this ran moments later and put it back.
          */
         const int     landed = g->cell;
-        /* Carry the originating note across the rebuild, or the key holding
-         * this chord could no longer release it. The octave comes from
-         * fGlide.to().octave, since a glide may have crossed octaves. */
+        /* Carry the owning key across the rebuild, or the finger holding this
+         * chord could no longer release it. */
         const int     note   = g->midiNote;
+
         uint8_t       chans[kMaxGroupNotes];
         const int     nchan  = g->count;
         for (int i = 0; i < nchan; ++i)
             chans[i] = g->chan[i];
 
+        /* The destination, read once. A glide may have crossed octaves, so this
+         * is where the chord is rebuilt - not where the group started. */
+        const ChordTarget to = fGlide.to();
+
         stopGroup(0, g);
-        startGroup(0, source, fGlide.to().rootAbove, fGlide.to().type,
-                   fGlide.to().ring, vel, /* retriggerDuplicates */ false,
-                   fGlide.to().octave, note);
+        startGroup(0, source, to.rootAbove, to.type, to.ring, vel,
+                   /* retriggerDuplicates */ false, to.octave, note);
 
         /* Restore the cell the glide landed on, since startGroup took it from
          * the stale source. */

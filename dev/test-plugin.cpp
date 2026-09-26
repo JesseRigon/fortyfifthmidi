@@ -158,6 +158,28 @@ public:
         }
         return n;
     }
+
+    /*
+     * WHICH cell is lit, packed as (ring << 8) | position, or -1 for none.
+     *
+     * Counting lit cells was not enough, and the gap was exactly where the
+     * reported highlight bugs lived: after a glide exactly one cell is lit
+     * either way - it is simply the WRONG one, the cell the phrase began on
+     * rather than the one it reached. A count cannot tell those apart.
+     *
+     * Returns the first, which is unambiguous wherever the tests assert on it
+     * because they check litCells() == 1 alongside.
+     */
+    int litCell() const
+    {
+        for (int r = 0; r < kRingCount; ++r) {
+            const Ring ring = static_cast<Ring>(r);
+            for (int p = 0; p < segmentsInRing(ring); ++p)
+                if (fCells.isOn(ring, p))
+                    return (r << 8) | p;
+        }
+        return -1;
+    }
 };
 
 /* Set a glide mode by its state key, so the test drives it as the UI would. */
@@ -240,6 +262,26 @@ int main()
         }
         ok("the bend is zeroed after landing", bendCentred, "");
         ok("exactly one cell is lit after the glide", h.litCells() == 1, "");
+
+        /*
+         * And it is the cell the glide REACHED, not the one it left.
+         *
+         * This is the assertion that was missing, and the gap it left is exactly
+         * where the reported highlight faults lived - "errant highlighting", then
+         * "still doesn't work right" after a fix that looked correct. A count
+         * cannot tell the two apart, because one cell is lit either way.
+         *
+         * The mechanism is in landGlide(): startGroup() derives the lit cell from
+         * the SOURCE it is handed, which is still the one the phrase began on - so
+         * the rebuild relights the starting cell moments after the glide moved the
+         * highlight, undoing it. The landed cell has to be carried across
+         * deliberately.
+         */
+        const int reached = (static_cast<int>(kRingKey) << 8) | 4;
+        char cd[80];
+        std::snprintf(cd, sizeof cd, "lit 0x%03X, dragged to 0x%03X",
+                      h.litCell(), reached);
+        ok("  and it is the cell the drag REACHED", h.litCell() == reached, cd);
 
         h.gesture("release", 4, 0);
         h.settle();
