@@ -1290,6 +1290,66 @@ inline int tonicMidi(int tonicPitchClass, int octave)
 }
 
 /*
+ * Everything needed to place one chord: which degree, what quality, on which
+ * ring, in which octave.
+ *
+ * These four have always travelled together - every chord builder, every glide
+ * destination and every group takes exactly this set - but they travelled as
+ * four positional arguments, so a caller could set three and leave the fourth
+ * stale and nothing would say so. That is not hypothetical: the Slide-mode drag
+ * bug was one branch passing the group's octave where its three neighbours
+ * passed the gesture's.
+ *
+ * Passing them as one value makes that class of mistake unrepresentable, and
+ * gives the thing a name: a chord's ADDRESS, independent of whether it is
+ * currently sounding.
+ *
+ * `rootAbove` is the interval above the tonic (0..11), NOT a pitch class - the
+ * distinction that anchors chords to the key rather than to C. `octave` is
+ * absolute, already resolved from any per-screen shift.
+ */
+struct ChordTarget {
+    int       rootAbove;
+    ChordType type;
+    Ring      ring;
+    int       octave;
+
+    /* Constructors rather than default member initialisers: the plugin builds
+     * against a pre-C++17 standard, where a class with NSDMIs is not an
+     * aggregate and so cannot be brace-initialised from its four values. */
+    ChordTarget()
+        : rootAbove(0), type(kChordMajor), ring(kRingKey), octave(4) {}
+
+    ChordTarget(int rootAbove_, ChordType type_, Ring ring_, int octave_)
+        : rootAbove(rootAbove_), type(type_), ring(ring_), octave(octave_) {}
+};
+
+/* Do these name the same chord in the same place? The question every glide asks
+ * before deciding there is anywhere to travel to. */
+inline bool sameChord(const ChordTarget& a, const ChordTarget& b)
+{
+    return a.rootAbove == b.rootAbove && a.type == b.type &&
+           a.ring == b.ring && a.octave == b.octave;
+}
+
+/*
+ * How far apart two chord addresses are, in semitones.
+ *
+ * Both roots are intervals above the SAME tonic, so their difference is the
+ * real distance - and it is allowed to exceed six semitones, because I to vii
+ * is genuinely eleven and bending the short way would land on the wrong chord.
+ * shortestSemitoneDelta() is right for pitch classes, where the octave is
+ * arbitrary; it is wrong here, where the distance is the answer.
+ *
+ * The octave term is what makes a drag into an octave-shifted strip travel the
+ * whole way rather than bending within the octave it started in.
+ */
+inline int semitonesBetween(const ChordTarget& from, const ChordTarget& to)
+{
+    return (to.rootAbove - from.rootAbove) + (to.octave - from.octave) * 12;
+}
+
+/*
  * Build the MIDI note numbers for a chord.
  *
  * rootAbove is the interval above the tonic (0..11), NOT a pitch class, and

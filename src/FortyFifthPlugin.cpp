@@ -1290,6 +1290,14 @@ private:
         }
     }
 
+    /* The glide time in frames. One conversion, because three sites each did
+     * this arithmetic and a glide whose duration disagreed with its ramp would
+     * simply land at the wrong moment. */
+    uint32_t glideDurationFrames() const
+    {
+        return static_cast<uint32_t>(fGlideTimeMs * fSampleRate / 1000.0);
+    }
+
     /* Release one group, silencing only the pitches no other group still wants. */
     void stopGroup(uint32_t frame, VoiceGroup* g)
     {
@@ -1479,7 +1487,7 @@ private:
         const int     landed = g->cell;
         /* Carry the originating note across the rebuild, or the key holding
          * this chord could no longer release it. The octave comes from
-         * fGlideTargetOct, since a glide may have crossed octaves. */
+         * fGlideTo.octave, since a glide may have crossed octaves. */
         const int     note   = g->midiNote;
         uint8_t       chans[kMaxGroupNotes];
         const int     nchan  = g->count;
@@ -1487,9 +1495,9 @@ private:
             chans[i] = g->chan[i];
 
         stopGroup(0, g);
-        startGroup(0, source, fGlideTargetRoot, fGlideTargetType,
-                   fGlideTargetRing, vel, /* retriggerDuplicates */ false,
-                   fGlideTargetOct, note);
+        startGroup(0, source, fGlideTo.rootAbove, fGlideTo.type,
+                   fGlideTo.ring, vel, /* retriggerDuplicates */ false,
+                   fGlideTo.octave, note);
 
         /* Restore the cell the glide landed on, since startGroup took it from
          * the stale source. */
@@ -1589,7 +1597,7 @@ private:
 
                 /* See canGlideBetween() for why a bend is or is not enough. */
                 const bool canGlide =
-                    canGlideBetween(g, type, root, r, gestureOct);
+                    canGlideBetween(g, ChordTarget(root, type, r, gestureOct));
 
                 if (! canGlide) {
                     /*
@@ -1648,15 +1656,12 @@ private:
                 /* The distance covers the octave too, so a drag into an
                  * octave-shifted strip travels the whole way rather than
                  * bending within the octave it started in. */
-                fGlideTargetSemis = (root - g->root) + (gestureOct - g->octave) * 12;
-                fGlideTargetRoot  = root;
-                fGlideTargetType  = type;
-                fGlideTargetRing  = r;
-                fGlideTargetOct   = gestureOct;
+                const ChordTarget from(g->root, g->type, g->ring, g->octave);
+                fGlideTo          = ChordTarget(root, type, r, gestureOct);
+                fGlideTargetSemis = semitonesBetween(from, fGlideTo);
                 fGlideSource      = g->source;
                 fGlideElapsed     = 0;
-                fGlideDuration    = static_cast<uint32_t>(
-                    fGlideTimeMs * fSampleRate / 1000.0);
+                fGlideDuration    = glideDurationFrames();
 
                 if (fGlideMode == kGlideMpe) {
                     /* Work out where each voice must land, pairing by index. A
@@ -1665,7 +1670,7 @@ private:
                     /* Same builder startGroup uses, so the ramp heads exactly
                      * where the snap will land. */
                     uint8_t want[kMaxGroupNotes];
-                    const int n = buildCellChord(root, type, r, gestureOct, want);
+                    const int n = buildCellChord(fGlideTo, want);
 
                     for (int i = 0; i < g->count; ++i)
                         g->target[i] = (i < n) ? want[i] : g->note[i];
@@ -1801,15 +1806,12 @@ private:
             return;
         }
 
+        /* Same chord, different octave: only the octave moves. */
+        fGlideTo          = ChordTarget(g->root, g->type, g->ring, fOctave);
         fGlideTargetSemis = delta;
-        fGlideTargetRoot  = g->root;
-        fGlideTargetType  = g->type;
-        fGlideTargetRing  = g->ring;
-        fGlideTargetOct   = fOctave;
         fGlideSource      = g->source;
         fGlideElapsed     = 0;
-        fGlideDuration    = static_cast<uint32_t>(
-            fGlideTimeMs * fSampleRate / 1000.0);
+        fGlideDuration    = glideDurationFrames();
 
         if (fGlideMode == kGlideMpe) {
             /* Every voice travels the same octave, so the targets are simply
@@ -2088,9 +2090,11 @@ private:
         VoiceGroup* from = fLastKeyboardNote >= 0
             ? findGroupByNote(fLastKeyboardNote) : nullptr;
 
+        const ChordTarget to(root, type, ring, oct);
+
         if (from != nullptr && from->midiNote != midiNote &&
             fGlideMode != kGlideOff &&
-            glideGroupTo(from, source, root, type, ring, oct, midiNote)) {
+            glideGroupTo(from, source, to, midiNote)) {
             fLastKeyboardNote = midiNote;
             return;
         }
@@ -2114,15 +2118,15 @@ private:
      * Returns false when the move cannot be carried by a glide, leaving the
      * group untouched so the caller can start a fresh one instead.
      */
-    bool glideGroupTo(VoiceGroup* g, int source, int root, ChordType type,
-                      Ring ring, int oct, int owner)
+    bool glideGroupTo(VoiceGroup* g, int source, const ChordTarget& to, int owner)
     {
-        if (g == nullptr || ! canGlideBetween(g, type, root, ring, oct))
+        if (g == nullptr || ! canGlideBetween(g, to))
             return false;
 
         /* A real distance: both roots are intervals above the same tonic, and
          * the octaves are absolute. */
-        const int semis = (root - g->root) + (oct - g->octave) * 12;
+        const ChordTarget from(g->root, g->type, g->ring, g->octave);
+        const int semis = semitonesBetween(from, to);
 
         /*
          * Where each voice must land, paired by index. A voice with no
@@ -2137,7 +2141,7 @@ private:
 
         if (fGlideMode == kGlideMpe) {
             uint8_t want[kMaxGroupNotes];
-            const int n = buildCellChord(root, type, ring, oct, want);
+            const int n = buildCellChord(to, want);
             for (int i = 0; i < g->count; ++i) {
                 g->target[i] = (i < n) ? want[i] : g->note[i];
                 if (g->target[i] != g->note[i])
@@ -2160,15 +2164,11 @@ private:
         if (! moves)
             return false;
 
+        fGlideTo          = to;
         fGlideTargetSemis = semis;
-        fGlideTargetRoot  = root;
-        fGlideTargetType  = type;
-        fGlideTargetRing  = ring;
-        fGlideTargetOct   = oct;
         fGlideSource      = g->source;
         fGlideElapsed     = 0;
-        fGlideDuration    = static_cast<uint32_t>(
-            fGlideTimeMs * fSampleRate / 1000.0);
+        fGlideDuration    = glideDurationFrames();
         fGlideActive      = true;
 
         /* The key that now owns the phrase: its release is what ends it. */
@@ -2221,7 +2221,8 @@ private:
                 const int       src  = (static_cast<int>(ring) << 8) | pos;
 
                 if (fGlideMode != kGlideOff &&
-                    glideGroupTo(g, src, root, type, ring, oct, fallback)) {
+                    glideGroupTo(g, src, ChordTarget(root, type, ring, oct),
+                                 fallback)) {
                     fLastKeyboardNote = fallback;
                     return;
                 }
@@ -2408,6 +2409,13 @@ private:
      * differently the glide would ramp toward pitches the snap never lands on.
      * So they all call here instead.
      */
+    /* The address form, which is what callers should use: the four values that
+     * place a chord cannot then be supplied in the wrong combination. */
+    int buildCellChord(const ChordTarget& at, uint8_t* out) const
+    {
+        return buildCellChord(at.rootAbove, at.type, at.ring, at.octave, out);
+    }
+
     int buildCellChord(int rootAbove, ChordType type, Ring ring, int octave,
                        uint8_t* out) const
     {
@@ -2593,7 +2601,7 @@ private:
      * build the target chord and verify that every voice moved by the same
      * delta. That mode is gone, and the check with it.
      */
-    bool canGlideBetween(const VoiceGroup* from, ChordType, int, Ring, int) const
+    bool canGlideBetween(const VoiceGroup* from, const ChordTarget&) const
     {
         return fGlideMode == kGlideMpe && from != nullptr;
     }
@@ -2815,12 +2823,17 @@ private:
     uint32_t  fGlideElapsed     = 0;
     uint32_t  fGlideDuration    = 0;
     int       fGlideTargetSemis = 0;
-    int       fGlideTargetRoot  = 0;
-    ChordType fGlideTargetType  = kChordMajor;
-    Ring      fGlideTargetRing  = kRingKey;
-    /* Octave to resolve at. A keyboard glide can cross octaves, so the snap at
-     * the end must know where it is landing rather than assuming it stayed. */
-    int       fGlideTargetOct   = 4;
+
+    /*
+     * Where the glide is heading, as one address.
+     *
+     * Was four separate fields - root, type, ring and octave - set individually
+     * at three different sites. The octave in particular has to be carried
+     * rather than assumed, because a keyboard glide or a drag into a shifted
+     * strip can cross octaves and the snap at the end must land where the
+     * gesture asked, not where the group began.
+     */
+    ChordTarget fGlideTo;
 
     /* ---- MIDI input state -------------------------------------------------- */
 

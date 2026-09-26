@@ -632,6 +632,88 @@ int main()
         }
     }
 
+    /*
+     * The travel arithmetic itself, now that it has a name.
+     *
+     * It used to be written out at three call sites, which is how one of them
+     * came to read the group's octave where the other two read the gesture's.
+     * Testing it here, once, is only possible BECAUSE it was extracted - the
+     * inline version could be checked only by reading the source, which is what
+     * the source check above had to do.
+     */
+    std::printf("\n=== semitonesBetween: the distance a glide travels ===\n");
+    {
+        /* Same chord, same place: nowhere to go. */
+        checkInt("a chord to itself travels nothing",
+              semitonesBetween(ChordTarget(0, kChordMajor, kRingKey, 4),
+                               ChordTarget(0, kChordMajor, kRingKey, 4)), 0);
+
+        /* I to V in the same octave: seven semitones up. */
+        checkInt("I to V is seven up",
+              semitonesBetween(ChordTarget(0, kChordMajor, kRingKey, 4),
+                               ChordTarget(7, kChordMajor, kRingKey, 4)), 7);
+
+        /* And back down again, which must be the exact negative. */
+        checkInt("V to I is seven down",
+              semitonesBetween(ChordTarget(7, kChordMajor, kRingKey, 4),
+                               ChordTarget(0, kChordMajor, kRingKey, 4)), -7);
+
+        /*
+         * I to vii is ELEVEN, not one. Bending the short way would land on the
+         * wrong chord, which is why shortestSemitoneDelta() is wrong here: it
+         * is right for pitch classes, where the octave is arbitrary.
+         */
+        checkInt("I to vii is eleven up, not one down",
+              semitonesBetween(ChordTarget(0, kChordMajor, kRingKey, 4),
+                               ChordTarget(11, kChordDim, kRingKey, 4)), 11);
+
+        /* The reported Slide case: the same degree, one octave up. */
+        checkInt("the 8th strip is a full octave",
+              semitonesBetween(ChordTarget(0, kChordMajor, kRingKey, 4),
+                               ChordTarget(0, kChordMajor, kRingKey, 5)), 12);
+        checkInt("and dragging back down is minus one",
+              semitonesBetween(ChordTarget(0, kChordMajor, kRingKey, 5),
+                               ChordTarget(0, kChordMajor, kRingKey, 4)), -12);
+
+        /* Degree and octave together, so neither term swallows the other. */
+        checkInt("IV an octave up travels seventeen",
+              semitonesBetween(ChordTarget(0, kChordMajor, kRingKey, 4),
+                               ChordTarget(5, kChordMajor, kRingKey, 5)), 17);
+
+        /* Antisymmetry across the whole space: a distance and its reverse must
+         * cancel, or a glide there and back would not return. */
+        bool antisymmetric = true;
+        for (int r1 = 0; r1 < 12 && antisymmetric; ++r1) {
+            for (int o1 = 1; o1 <= 7 && antisymmetric; ++o1) {
+                for (int r2 = 0; r2 < 12 && antisymmetric; ++r2) {
+                    for (int o2 = 1; o2 <= 7; ++o2) {
+                        const ChordTarget a(r1, kChordMajor, kRingKey, o1);
+                        const ChordTarget b(r2, kChordMajor, kRingKey, o2);
+                        if (semitonesBetween(a, b) != -semitonesBetween(b, a)) {
+                            antisymmetric = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        checkInt("every distance is its reverse negated",
+                 antisymmetric ? 1 : 0, 1);
+
+        /* sameChord must agree with a zero distance for identical addresses,
+         * and disagree wherever the quality alone differs - a shape change is
+         * a real move even at zero semitones, which is what MPE glide exists
+         * for. */
+        const ChordTarget maj(0, kChordMajor, kRingKey, 4);
+        const ChordTarget min(0, kChordMinor, kRingKey, 4);
+        checkInt("a chord is the same as itself",
+                 sameChord(maj, maj) ? 1 : 0, 1);
+        checkInt("major and minor are different chords",
+                 sameChord(maj, min) ? 1 : 0, 0);
+        checkInt("  even though they are zero semitones apart",
+              semitonesBetween(maj, min), 0);
+    }
+
     std::printf("\n%s (%d failure%s)\n",
                 failures == 0 ? "PASS" : "FAIL",
                 failures, failures == 1 ? "" : "s");

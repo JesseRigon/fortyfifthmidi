@@ -261,9 +261,41 @@ int main()
                           std::strstr(move, "gestureOct") != nullptr, true);
                 check("g->octave survives only as the distance's origin", uses, 1);
 
-                /* And the one that remains must be inside the subtraction. */
-                checkBool("  that one is the travel calculation",
-                          std::strstr(move, "(gestureOct - g->octave) * 12") != nullptr,
+                /*
+                 * And the one that remains must be the ORIGIN of the travel.
+                 *
+                 * The arithmetic moved into semitonesBetween(), which takes the
+                 * two chord addresses and is unit-tested on its own below - so
+                 * this no longer looks for the subtraction spelled out inline.
+                 * What it still checks is the thing that was actually wrong:
+                 * the group's octave appears only as the FROM address, and the
+                 * destination is built from the gesture's octave.
+                 *
+                 * Asserting the old literal would only prove the expression had
+                 * not been reworded, which is not the property anyone cares
+                 * about.
+                 */
+                checkBool("  that one is the travel's origin",
+                          std::strstr(move, "ChordTarget from(g->root, g->type, "
+                                            "g->ring, g->octave)") != nullptr,
+                          true);
+                /*
+                 * The DESTINATION specifically - the assignment to fGlideTo,
+                 * not merely the presence of that constructor somewhere in the
+                 * branch. canGlideBetween() is called a few lines above with an
+                 * identically spelled temporary, so searching for the
+                 * constructor alone passes even with the bug reintroduced. The
+                 * count check above does catch it, but an assertion that cannot
+                 * fail is worse than no assertion: it reads as coverage.
+                 */
+                checkBool("  and the destination carries the gesture's octave",
+                          std::strstr(move, "fGlideTo          = "
+                                            "ChordTarget(root, type, r, gestureOct)")
+                              != nullptr,
+                          true);
+                checkBool("  with the distance derived, not hand-rolled",
+                          std::strstr(move, "semitonesBetween(from, fGlideTo)")
+                              != nullptr,
                           true);
 
                 std::free(move);
