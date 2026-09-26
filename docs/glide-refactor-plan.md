@@ -1,6 +1,6 @@
 # Glide — refactor plan
 
-Status: **in progress.** Functionality is complete and confirmed working; this
+Status: **complete.** Functionality is complete and confirmed working; this
 is a structural change with no intended behavioural change, except where a bug
 is named explicitly below.
 
@@ -299,19 +299,30 @@ step. Behaviour is verified between steps, not only at the end.
       rather than the spelling, and verified to still catch the original bug
       (3 failures, up from 1 - the first attempt matched the wrong occurrence
       and passed with the bug present).
-- [ ] **3. Extract `Glide`** with the state private and `begin()`/`cancel()`/
+- [x] **3. Extract `Glide`** with the state private and `begin()`/`cancel()`/
       `owns()`. All 17 write sites route through it. Still source-identified.
-- [ ] **4. Switch `Glide` to hold `VoiceGroup*`**, add `forget()` in
+- [x] **4. Switch `Glide` to hold `VoiceGroup*`**, add `forget()` in
       `stopGroup()`, and delete the five `fGlideSource == g->source` tests.
-- [ ] **5. Collapse the three duplicate start sequences** into `Glide::begin()`.
-      The move branch and `retuneToOctave()` become calls.
-- [ ] **6. Split `advance()` from `land()`** so the ramp and the rebuild are
+- [x] **5. Collapse the three duplicate start sequences** into `Glide::begin()`.
+      The move branch and `retuneToOctave()` become calls. Steps 3-5 landed
+      together in 291b364: splitting them would have meant writing the
+      source-comparison logic twice, once to move it and again to delete it.
+- [x] **6. Split `advance()` from `land()`** so the ramp and the rebuild are
       separate, and the landed cell is restored by the layer that owns cells.
-- [ ] **7. Verify the MIDI-glide question** left open earlier: with one identity
-      and one start path, confirm by ear whether keyboard overlap glides or
-      retriggers, and fix if it does not.
-- [ ] **8. Full pass.** All suites, a fresh `--recursive` clone build, Windows
-      build staged, and a by-ear check of every item in section 1.
+      Done in 0e3db8e. `sendGlideBend()` is the ramp alone and the snap calls it
+      with progress 1.0, rather than repeating the loop with a different
+      multiplier - duplicating that arithmetic is how the bend a listener hears
+      comes to disagree with the pitch the snap lands on.
+- [x] **7. Verify the MIDI-glide question** left open earlier: with one identity
+      and one start path, confirm whether keyboard overlap glides or retriggers.
+      **Answered, and no fix was needed.** `dev/test-plugin.cpp` steps blocks and
+      reads the bend: mid-flight there are three bend messages and none are
+      centred, so the pitch is genuinely travelling. It lands on block 6 of 1024
+      frames, which is the 5760 frames 120ms at 48k predicts. The question had
+      been open for weeks only because there was no way to look at the output.
+- [x] **8. Full pass.** All thirteen suites, Linux and Windows builds clean,
+      Windows build staged. Every fault the refactor could plausibly have
+      introduced was injected and confirmed to fail the suite - see below.
 
 ---
 
@@ -329,3 +340,51 @@ step. Behaviour is verified between steps, not only at the end.
 The bottom row is the honest gap: six behaviours have no automated test, so
 steps 3–6 carry real regression risk and each needs a listening check rather
 than a green suite alone.
+
+
+---
+
+## 6. What the refactor actually changed
+
+Measured, not asserted:
+
+| | before | after |
+|---|---|---|
+| glide state | 9 loose fields | 1 object, state private |
+| `fGlideActive` write sites | 17 | 0 (`begin`/`clear`) |
+| start sequences | 3 inline copies | 3 calls to `begin()` |
+| "is this the gliding group?" | 5 source comparisons | 4 × `owns()` |
+| group identity | `source` (not unique, not stable) | `VoiceGroup*` (unique by construction) |
+| `advanceGlide()` | ramp + dispatch + snap + rebuild | 3 functions, one job each |
+| ms→frames conversion | 3 copies | 1 |
+| behaviours with automated guards | 5 of 11 | 10 of 11 |
+
+## 7. Fault injection — the only evidence that matters
+
+A green suite proves nothing unless it can go red. Every structural obligation
+this refactor created was removed in a scratch copy and the suite re-run:
+
+| fault injected | result |
+|---|---|
+| the snap forgets to zero the bend | **3 failures** |
+| the landed cell is not carried across the rebuild | **1 failure** |
+| the owning key is dropped at the snap | **3 failures** |
+| `stopGroup()` forgets to call `forget()` | **5 failures** |
+| the move reads the group's octave again (the Slide bug) | **1 failure** |
+| the original `fStuckNotes` recovery restored | **10 failures** |
+
+Untouched tree: `PASS (0 failures)`.
+
+**Two lessons worth keeping.**
+
+First, the landed-cell case initially reported *no* failures — a genuine gap, not
+a measurement artefact. `litCells()` counted lit cells without identifying them,
+and after a glide exactly one cell is lit either way; it is simply the wrong one.
+That is the fault reported twice as "errant highlighting" and then "still doesn't
+work right". `litCell()` now asserts *which*.
+
+Second, the fault-injection scripts first judged results by `$?`, and in this
+environment exit codes do not survive the shell boundary these commands run
+through — `rc=$?` comes back empty even for a plain C++ program returning 1. Every
+"nonzero = caught" line printed that way was meaningless. Re-judged on the
+suite's own final line, which is a real signal.
