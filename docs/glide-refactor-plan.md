@@ -17,8 +17,12 @@ is a failure of the refactor, not an acceptable trade.
 | Mode | Behaviour |
 |---|---|
 | `kGlideOff` | No ramp. A new chord retriggers immediately. |
-| `kGlideSingle` | One channel-wide pitch bend carries the whole chord. |
 | `kGlideMpe` | Every voice on its own channel (2–16), each bending its own distance, so a chord can change SHAPE mid-glide. |
+
+There are **two**, not three. An earlier draft of this table listed a
+`kGlideSingle` that no longer exists — single-bend glide was removed once MPE
+could express re-inversions, which one channel-wide bend cannot. Corrected after
+`dev/test-plugin.cpp` failed to compile against the name.
 
 MPE is the only mode where `canGlideBetween()` currently returns true. That is
 deliberate for shape changes, but it is also why non-MPE overlaps fall through
@@ -78,27 +82,55 @@ Guarded by `dev/test-legato.cpp`.
 across the snap's rebuild, or the key holding the chord could no longer release
 it.
 
-### 1.9 Known bug, to be fixed by this refactor — not preserved
-
-A press that CANNOT glide falls through to `startGroup()`, and the group it
-displaced keeps sounding with its owning key already up. Nothing points at it
-and no release can reach it, so its notes stay up permanently.
+### 1.9 The reported stuck note — fixed in 7fa6701
 
 Reported as: rapid two-key alternation ~20 times, after which MIDI continued
-with the plugin bypassed; only retriggering the instrument cleared it.
-Bypass could not help because nothing here was sustaining the note — the
-note-off simply never went out.
+**with the plugin bypassed**; only retriggering the Kontakt instrument cleared
+it, and neither the plugin's panic nor Ardour's helped.
 
-Proven against the real refcount rules (`dev/test-stuck.cpp`, first block):
+**Two wrong diagnoses came first, and both had passing tests.** Worth recording,
+because the failure mode was the tests agreeing with the theory instead of with
+the plugin:
 
-| Mode | After a lost release |
-|---|---|
-| non-MPE | **3 notes sounding**, 3 refs — audible stuck chord |
-| MPE | 0 sounding, **3 refs** — silent, but those pitches can never sound again |
+1. *Orphaned group* — a press that cannot glide falls through to `startGroup()`
+   and leaves the displaced group owned by a key already up. Plausible, and
+   `dev/test-stuck.cpp` was built around it. But disabling the fix changed
+   nothing in either suite, because the model self-heals and the harness was
+   feeding one event per block — a slow trill, however often repeated.
+2. *Source ambiguity* — `findGroup(source)` returning the wrong group. Traced,
+   modelled, and disproved by instrumenting the real group table.
 
-The second row matters as much as the first: `stopGroup()` suppresses the
-note-off whenever `fHeld[note] > 1`, so a phantom reference means that pitch's
-count can never reach zero again for the rest of the session.
+**The actual mechanism** needed two ordinary conditions the tests were missing:
+
+- **Several events in one block.** A host delivers a buffer's events together.
+  At 48k/64 frames that is ~1.3ms, so a fast trill puts note-on and note-off in
+  the *same* `run()` call.
+- **A host that refuses events.** Rapid alternation emits note-offs, note-ons
+  and a bend per voice per block; a modest queue refuses some, which is why
+  `fOutputFull` and `fStuckNotes` exist at all.
+
+With both, the recovery path in `run()` was the fault:
+
+```cpp
+if (fStuckNotes) {
+    fStuckNotes = false;                      // cleared before the retry
+    for (ch = 0..15) sendRaw(0xB0|ch, 123, 0);// which can itself be refused
+    memset(fHeld, 0, sizeof fHeld);           // forgets what was held, regardless
+}
+```
+
+The retry is most likely to be refused during exactly the busy passage that
+stranded the note — but the latch was already cleared, so nothing remembered it
+was needed, and `fHeld` was wiped either way.
+
+That produces the reported state precisely: notes **sounding** while the plugin
+believes it is idle — no groups, no refcounts, no keys held — so nothing on this
+side would ever send another note-off. Bypass cannot fix an unsent note-off, and
+both panics work through the bookkeeping that had just been erased.
+
+Measured, before the fix: **3–5 pitches left sounding at every queue size from
+4 to 64, in both glide modes.** Guarded by `dev/test-plugin.cpp`, verified to
+produce 10 failures with the original recovery restored.
 
 ### 1.10 Refused note-off recovery
 
