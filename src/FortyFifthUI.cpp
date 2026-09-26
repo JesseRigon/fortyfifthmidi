@@ -468,50 +468,38 @@ protected:
     }
 
     /*
-     * Push the extension for the cell about to be played.
+     * Send the per-cell chord table to the DSP.
      *
-     * The DSP holds one extension per ring, not per cell, and does not need to
-     * know cells can differ: the editor asserts the right value immediately
-     * before the gesture that reads it. This is the same mechanism Slide Mode
-     * already uses, for the same reason - only one cell can be triggered at a
-     * time, so one value is always enough.
+     * This replaces pushCellExtension(), which wrote the RING-wide setting
+     * immediately before each pointer gesture - a workaround for a DSP that had
+     * no per-cell storage. Its own comment described the trick plainly: "the
+     * editor asserts the right value immediately before the gesture that reads
+     * it."
+     *
+     * It worked while the pointer was the only source. It had two callers, both
+     * mouse paths, so a MIDI note - which never passes through the editor - read
+     * whatever the last click had left behind. Hence the reported faults: one
+     * cell's chord type appearing to change its whole ring, and a key playing the
+     * type of whichever cell was clicked last. Slide Mode pushed nothing at all
+     * and inherited the same residue.
+     *
+     * Sending the table on EDIT rather than on play also removes a real
+     * thread-safety smell: the UI thread was writing settings the audio thread
+     * read, ordered only by the hope that the write landed first.
      */
-    void pushCellExtension(int position, Ring ring)
+    void sendCellSettings()
     {
-        const Extension e = cellExtension(position, ring);
-
-        if (fPushedExtRing != static_cast<int>(ring) || fPushedExt != e) {
-            fPushedExtRing = static_cast<int>(ring);
-            fPushedExt     = e;
-
-            char key[8], buf[16];
-            std::snprintf(key, sizeof key, "ext%d", static_cast<int>(ring));
-            std::snprintf(buf, sizeof buf, "%d", static_cast<int>(e));
-            setState(key, buf);
+        CellSettings cs;
+        for (int r = 0; r < kRingCount; ++r) {
+            for (int p = 0; p < kRingSegments[r]; ++p) {
+                cs.ext[r][p]     = fCellExt[r][p % 24];
+                cs.voicing[r][p] = fCellVoicing[r][p % 24];
+            }
         }
 
-        /*
-         * And this cell's inversion - the third axis, pushed the same way and
-         * for the same reason: the DSP holds one value, and the editor asserts
-         * the right one immediately before the gesture that reads it.
-         *
-         * Voice leading would override a chosen bass, so taking manual control
-         * per cell means leading is off. That is the same rule the ROOT button
-         * already followed; it is now decided per cell rather than globally.
-         */
-        /* And the voicing - inversion and spacing in one axis. */
-        const int8_t voi = fCellVoicing[ring][position % 24];
-
-        if (fPushedVoiceRing != static_cast<int>(ring) ||
-            fPushedVoicing != voi) {
-            fPushedVoiceRing = static_cast<int>(ring);
-            fPushedVoicing   = voi;
-
-            char key[8], buf[16];
-            std::snprintf(key, sizeof key, "voice%d", static_cast<int>(ring));
-            std::snprintf(buf, sizeof buf, "%d", static_cast<int>(voi));
-            setState(key, buf);
-        }
+        char out[kCellSettingsStringMax];
+        encodeCellSettings(cs, out, sizeof out);
+        setState("cellSettings", out);
     }
 
     /* ---- the wheel's cell editor -------------------------------------------
@@ -734,16 +722,26 @@ protected:
                     case 0:
                         fCellExt[fEditCellRing][i] =
                             static_cast<int8_t>(wheelEditValueAt(row));
-                        /* The pushed value is stale, so the next press
-                         * re-sends it. */
-                        fPushedExtRing = -1;
                         break;
                     default:
                         fCellVoicing[fEditCellRing][i] =
                             static_cast<int8_t>(row);
-                        fPushedVoiceRing = -1;
                         break;
                 }
+
+                /*
+                 * Send the whole table, rather than arranging to push this one
+                 * cell's value just before the next gesture.
+                 *
+                 * The old mechanism wrote the RING's setting immediately before
+                 * each pointer press. That kept the pointer correct and left
+                 * every other source reading whatever the last click had left
+                 * behind - a MIDI note plays the chord type of the cell last
+                 * clicked, and one cell's setting appears to change its whole
+                 * ring. The DSP now holds the table itself, so every source
+                 * resolves the same cell identically.
+                 */
+                sendCellSettings();
 
                 repaint();
                 return true;
@@ -902,7 +900,8 @@ protected:
                                pos == fActivePosition && ring == fActiveRing);
 
             /* This cell's own extension, before the gesture that reads it. */
-            pushCellExtension(pos, ring);
+            /* Nothing to push: the DSP holds the per-cell table and resolves this
+             * cell itself, exactly as it does for a keyboard note. */
 
             sendGesture("press", pos, ring);
 
@@ -1032,10 +1031,10 @@ protected:
             return false;
 
         /* Crossing into a new position mid-drag is the glide gesture. The new
-         * cell may carry a different extension, so assert it first. */
+         * cell may carry a different extension - the DSP resolves that from the
+         * table, so nothing needs asserting here first. */
         fActivePosition = pos;
         fActiveRing     = ring;
-        pushCellExtension(pos, ring);
         sendGesture("move", pos, ring);
         repaint();
         return true;
@@ -5029,6 +5028,27 @@ protected:
         /* Structured keys first: atoi would read only their first field. */
         if (std::strcmp(key, "keyMap") == 0) {
             decodeKeyMap(value, fKeyMap);
+            repaint();
+            return;
+        }
+
+        /*
+         * The per-cell chord table, restored from a saved session.
+         *
+         * DPF replays the whole state map into here whenever the UI attaches, so
+         * this is what makes a reopened project show the chord types it was saved
+         * with. The DSP already has the same string - it is the authority while
+         * playing - and this copy is what the editor draws from.
+         */
+        if (std::strcmp(key, "cellSettings") == 0) {
+            CellSettings cs;
+            decodeCellSettings(value, cs);
+            for (int r = 0; r < kRingCount; ++r) {
+                for (int p = 0; p < kRingSegments[r] && p < 24; ++p) {
+                    fCellExt[r][p]     = cs.ext[r][p];
+                    fCellVoicing[r][p] = cs.voicing[r][p];
+                }
+            }
             repaint();
             return;
         }

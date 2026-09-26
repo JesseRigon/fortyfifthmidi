@@ -292,9 +292,16 @@ int main()
                  * destination stopped being a member the moment glide state
                  * became an object.
                  */
+                /*
+                 * Matched WITHOUT the closing paren, so adding a further
+                 * argument - voicing did exactly this - does not break an
+                 * assertion about the octave. The property is that the
+                 * destination is built from gestureOct; what follows it is not
+                 * this test's business.
+                 */
                 checkBool("  and the destination carries the gesture's octave",
                           std::strstr(move, "const ChordTarget to(root, type, r, "
-                                            "gestureOct)") != nullptr,
+                                            "gestureOct") != nullptr,
                           true);
                 checkBool("  with the distance derived, not hand-rolled",
                           std::strstr(move, "semitonesBetween(from, to)")

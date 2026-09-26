@@ -182,6 +182,15 @@ protected:
         kStateSelectedKey,
         kStateSingleNotes,
         kStateKeyMap,
+        /*
+         * Per-cell chord settings, the whole table in one value.
+         *
+         * Declared here for the reason the sequencer's comment below gives: DPF
+         * routes only the keys initState() declares. Without this the editor's
+         * per-cell table would be silently dropped and the keyboard would keep
+         * reading ring-wide residue, which is the bug this is here to fix.
+         */
+        kStateCellSettings,
         kStatePedalAction,
         /*
          * The sequencer.
@@ -312,6 +321,16 @@ protected:
                 state.label = "Keyboard Map";
                 state.defaultValue = defaultKeyMapString();
                 break;
+            case kStateCellSettings:
+                /* Every cell that differs from its ring's default, as
+                 * "ring.position.ext.voicing" - one value, because DPF replays
+                 * the state map on UI attach and a table split across keys could
+                 * arrive half-applied. An empty string is "all defaults", which
+                 * is what a fresh session and every pre-existing project mean. */
+                state.key = "cellSettings";
+                state.label = "Per-Cell Chords";
+                state.defaultValue = "";
+                break;
             case kStatePedalAction:
                 state.key = "pedalAction";
                 state.label = "Sustain Pedal";
@@ -407,6 +426,12 @@ protected:
          * atoi would read only its first field. */
         if (std::strcmp(key, "keyMap") == 0) {
             parseKeyMap(value);
+            return;
+        }
+        /* Structured like keyMap, and for the same reason: atoi would read only
+         * its first field. */
+        if (std::strcmp(key, "cellSettings") == 0) {
+            decodeCellSettings(value, fCellSettings);
             return;
         }
         if (std::strcmp(key, "progression") == 0) {
@@ -588,6 +613,11 @@ protected:
         if (std::strcmp(key, "keyMap") == 0) {
             char out[kKeyMapStringMax];
             encodeKeyMap(fKeyMap, out, sizeof out);
+            return String(out);
+        }
+        if (std::strcmp(key, "cellSettings") == 0) {
+            char out[kCellSettingsStringMax];
+            encodeCellSettings(fCellSettings, out, sizeof out);
             return String(out);
         }
 
@@ -1322,9 +1352,21 @@ private:
      * a non-glide overlap. With glide on we skip it, since retriggering undercuts
      * the smooth motion. Either way the refcount is what governs note-off.
      */
+    /*
+     * `voicingOverride` is for the glide's snap, which rebuilds the group from
+     * the source the phrase STARTED on - a drag keeps its identity so a later
+     * move can find it - while the chord it must now sound belongs to the cell it
+     * REACHED. Resolving voicing from `source` therefore gave the destination
+     * chord the origin cell's arrangement: the same pitches a press would give,
+     * in a different inversion, heard as the glide arriving and then jumping.
+     *
+     * kVoicingCount means "no override, resolve it from the source", which is
+     * what every ordinary press wants.
+     */
     void startGroup(uint32_t frame, int source, int root, ChordType type,
                     Ring ring, uint8_t velocity, bool retriggerDuplicates,
-                    int octave, int midiNote = -1)
+                    int octave, int midiNote = -1,
+                    Voicing voicingOverride = kVoicingCount)
     {
         VoiceGroup* g = allocGroup();
         if (g == nullptr) {
@@ -1339,8 +1381,21 @@ private:
             stopGroup(frame, g);
         }
 
+        /*
+         * The cell's own voicing, resolved here because `source` packs the
+         * position and so this is the first point that knows which cell is
+         * sounding. A sentinel source - the sequencer's, or a merged group's -
+         * has no cell, so it takes the ring's value, which is what it has always
+         * had.
+         */
+        const Voicing voicing =
+            (voicingOverride != kVoicingCount) ? voicingOverride
+            : sourceIsCell(source)
+                ? voicingForCell(ring, position_from_source(source))
+                : fRingVoicing[ring];
+
         uint8_t notes[kMaxGroupNotes];
-        const int n = buildCellChord(root, type, ring, octave, notes);
+        const int n = buildCellChord(root, type, ring, octave, notes, voicing);
 
         /*
          * What this chord was built from, before any of it reaches the wire.
@@ -1698,8 +1753,12 @@ private:
         const ChordTarget to = fGlide.to();
 
         stopGroup(0, g);
+        /* The destination's voicing, explicitly: `source` is where the phrase
+         * BEGAN, so letting startGroup resolve it from there would arrange the
+         * landed chord the way the origin cell wanted. */
         startGroup(0, source, to.rootAbove, to.type, to.ring, vel,
-                   /* retriggerDuplicates */ false, to.octave, note);
+                   /* retriggerDuplicates */ false, to.octave, note,
+                   to.voicing);
 
         /* Restore the cell the glide landed on, since startGroup took it from
          * the stale source. */
@@ -1732,7 +1791,7 @@ private:
         /* Where this cell sits in the key, not its pitch class: that is what
          * places the chord in an octave. */
         const int       root = cellAboveTonic(position, r);
-        const ChordType type = chordTypeForRing(r, position);
+        const ChordType type = chordTypeForCell(r, position);
 
         const int source = (ring << 8) | position;
 
@@ -1798,7 +1857,8 @@ private:
 
                 /* See canGlideBetween() for why a bend is or is not enough. */
                 const bool canGlide =
-                    canGlideBetween(g, ChordTarget(root, type, r, gestureOct));
+                    canGlideBetween(g, ChordTarget(root, type, r, gestureOct,
+                                                 voicingForCell(r, position)));
 
                 if (! canGlide) {
                     /*
@@ -1858,7 +1918,8 @@ private:
                  * octave-shifted strip travels the whole way rather than
                  * bending within the octave it started in. */
                 const ChordTarget from(g->root, g->type, g->ring, g->octave);
-                const ChordTarget to(root, type, r, gestureOct);
+                const ChordTarget to(root, type, r, gestureOct,
+                                     voicingForCell(r, position));
                 fGlide.begin(g, to, semitonesBetween(from, to),
                              glideDurationFrames());
 
@@ -2005,9 +2066,19 @@ private:
             return;
         }
 
-        /* Same chord, different octave: only the octave moves. */
-        fGlide.begin(g, ChordTarget(g->root, g->type, g->ring, fOctave), delta,
-                     glideDurationFrames());
+        /*
+         * Same chord, different octave: only the octave moves.
+         *
+         * The voicing comes from the group's own cell, so a transpose does not
+         * silently re-invert a chord the user had arranged deliberately.
+         */
+        const Voicing keepVoicing = sourceIsCell(g->source)
+            ? voicingForCell(g->ring, position_from_source(g->source))
+            : fRingVoicing[g->ring];
+
+        fGlide.begin(g, ChordTarget(g->root, g->type, g->ring, fOctave,
+                                    keepVoicing),
+                     delta, glideDurationFrames());
 
         if (fGlideMode == kGlideMpe) {
             /* Every voice travels the same octave, so the targets are simply
@@ -2257,7 +2328,7 @@ private:
             stopGroup(frame, existing);
 
         const int       root = cellAboveTonic(position, ring);
-        const ChordType type = chordTypeForRing(ring, position);
+        const ChordType type = chordTypeForCell(ring, position);
         const int       oct  = octaveForMidiNote(midiNote);
         const int    source  = (static_cast<int>(ring) << 8) | position;
 
@@ -2284,7 +2355,10 @@ private:
         VoiceGroup* from = fLastKeyboardNote >= 0
             ? findGroupByNote(fLastKeyboardNote) : nullptr;
 
-        const ChordTarget to(root, type, ring, oct);
+        /* The cell's own voicing, exactly as a pointer press resolves it - this
+         * is the keyboard path, and it agreeing with the pointer is the point. */
+        const ChordTarget to(root, type, ring, oct,
+                             voicingForCell(ring, position));
 
         if (from != nullptr && from->midiNote != midiNote &&
             fGlideMode != kGlideOff &&
@@ -2405,12 +2479,13 @@ private:
                                 fSelectedKey.load(std::memory_order_acquire),
                                 pos, ring)) {
                 const int       root = cellAboveTonic(pos, ring);
-                const ChordType type = chordTypeForRing(ring, pos);
+                const ChordType type = chordTypeForCell(ring, pos);
                 const int       oct  = octaveForMidiNote(fallback);
                 const int       src  = (static_cast<int>(ring) << 8) | pos;
 
                 if (fGlideMode != kGlideOff &&
-                    glideGroupTo(g, src, ChordTarget(root, type, ring, oct),
+                    glideGroupTo(g, src, ChordTarget(root, type, ring, oct,
+                                                     voicingForCell(ring, pos)),
                                  fallback)) {
                     fLastKeyboardNote = fallback;
                     return;
@@ -2602,11 +2677,18 @@ private:
      * place a chord cannot then be supplied in the wrong combination. */
     int buildCellChord(const ChordTarget& at, uint8_t* out) const
     {
-        return buildCellChord(at.rootAbove, at.type, at.ring, at.octave, out);
+        return buildCellChord(at.rootAbove, at.type, at.ring, at.octave, out,
+                              at.voicing);
     }
 
+    /*
+     * `voicing` is passed rather than looked up because this function has a
+     * rootAbove and no position, so it cannot ask what the cell wanted - which is
+     * exactly why it used to reach for the ring-wide value and produce the
+     * reported bug. The source resolves it; the builder obeys.
+     */
     int buildCellChord(int rootAbove, ChordType type, Ring ring, int octave,
-                       uint8_t* out) const
+                       uint8_t* out, Voicing voicing = kVoicingRegular) const
     {
         /*
          * rootAbove is the interval above the KEY'S TONIC, and the tonic is
@@ -2639,7 +2721,18 @@ private:
         if (fSingleNotes)
             return n;
 
-        return applyVoicing(out, n, fRingVoicing[ring], kMaxGroupNotes);
+        /*
+         * The voicing the SOURCE asked for. The comment above already said
+         * voicing was "set per cell" - it was the code that read a ring-wide
+         * value, kept momentarily correct by the editor pushing to it before
+         * each click.
+         *
+         * Moving both axes together matters. Fixing the extension alone would
+         * leave voicing with the old fault, so a keyboard note would get the
+         * right chord in the wrong inversion - a more confusing state than the
+         * original bug.
+         */
+        return applyVoicing(out, n, voicing, kMaxGroupNotes);
     }
 
     /*
@@ -2846,16 +2939,39 @@ private:
      * a combination being chosen at all; this is the backstop for a state
      * restored from an older session, or a key changed under a held setting.
      */
-    ChordType chordTypeForRing(Ring ring, int position) const
+    /*
+     * The chord a CELL produces - whatever triggered it.
+     *
+     * This used to read fRingExtension[ring], one value for a whole ring, and the
+     * editor compensated by overwriting that value immediately before each
+     * pointer gesture. A MIDI note never passed through the editor, so it read
+     * whatever the last click had left behind: one cell's setting appeared to
+     * change every cell in its ring, and a key played the type of whichever cell
+     * was clicked last.
+     *
+     * Reading the cell's own setting here - with the ring's value as the default
+     * for a cell never individually set - is what makes a key, a click, a slide
+     * and a recorded note resolve the same cell identically. There is no longer
+     * any shared mutable state for one source to leave stale for another.
+     */
+    ChordType chordTypeForCell(Ring ring, int position) const
     {
         if (fSingleNotes)
             return kChordSingleNote;
 
         const int key = fSelectedKey.load(std::memory_order_acquire);
-        return extendChordOrTriad(defaultChordForRing(ring),
-                                  fRingExtension[ring],
+        const Extension ext =
+            fCellSettings.extFor(ring, position, fRingExtension[ring]);
+
+        return extendChordOrTriad(defaultChordForRing(ring), ext,
                                   cellIsDominant(position, ring, key),
                                   semitoneForCell(position, ring, key));
+    }
+
+    /* The voicing a cell asks for, on the same rule: its own, or the ring's. */
+    Voicing voicingForCell(Ring ring, int position) const
+    {
+        return fCellSettings.voicingFor(ring, position, fRingVoicing[ring]);
     }
 
     /* As above, but with the extension given rather than taken from the ring.
@@ -2879,6 +2995,15 @@ private:
      * every cell in a ring yields the same interval pattern, which is exactly
      * what spec 6.1 requires for a single pitch bend to carry all voices.
      */
+    /*
+     * Per-cell chord settings, read by every source.
+     *
+     * The ring values below remain as the DEFAULT for a cell never individually
+     * set, which is what lets a project saved before this table existed still
+     * sound exactly as it did: its ring value becomes every cell's default.
+     */
+    CellSettings fCellSettings;
+
     Extension fRingExtension[kRingCount] = { kExtNone, kExtNone, kExtNone };
     Voicing   fRingVoicing[kRingCount]   = {
         kVoicingRegular, kVoicingRegular, kVoicingRegular

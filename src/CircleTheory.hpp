@@ -1074,6 +1074,164 @@ inline void decodeKeyMap(const char* value, KeyMapEntry* out)
     std::memcpy(out, parsed, sizeof(parsed));
 }
 
+/* ------------------------------------------------------------------------- */
+/*
+ * Per-cell chord settings.
+ *
+ * WHY THESE EXIST. Chord type is a property of a CELL, not of a ring. A ii-V-I
+ * wants sevenths on the ii and the V and a plain I, which a ring-wide value
+ * cannot express - the sequencer's ProgCell has carried a per-cell extension for
+ * exactly that reason since it was written.
+ *
+ * The wheel had only fRingExtension[3] and fRingVoicing[3], and the editor
+ * worked around that by OVERWRITING the ring's value immediately before each
+ * pointer gesture. That works while the pointer is the only source. A MIDI note
+ * never passes through the editor, so it read whatever the last click had left
+ * behind: one cell's setting appeared to change a whole ring, and a key played
+ * the type of whichever cell was clicked last.
+ *
+ * Holding the table here, where every source can read it, is what lets a key, a
+ * click, a slide and a recorded note resolve the SAME cell identically.
+ *
+ * kCellDefault means "never set", which resolves to the ring's default rather
+ * than to any particular chord - so a project saved before this existed still
+ * sounds as it did, and a fresh session opens as triads everywhere.
+ */
+static constexpr int   kMaxCellsPerRing = 24;   /* max(kRingSegments) */
+static constexpr int8_t kCellDefault    = -1;
+
+struct CellSettings {
+    int8_t ext[kRingCount][kMaxCellsPerRing];
+    int8_t voicing[kRingCount][kMaxCellsPerRing];
+
+    CellSettings() { reset(); }
+
+    void reset()
+    {
+        std::memset(ext, kCellDefault, sizeof(ext));
+        std::memset(voicing, kCellDefault, sizeof(voicing));
+    }
+
+    /*
+     * The stored extension for a cell, or the ring's default where it was never
+     * set. One accessor, so no caller has to remember what kCellDefault means.
+     */
+    Extension extFor(Ring ring, int position, Extension ringDefault) const
+    {
+        const int r = static_cast<int>(ring);
+        if (r < 0 || r >= kRingCount)
+            return ringDefault;
+        const int p = wrapCell(ring, position);
+        const int8_t own = ext[r][p];
+        return (own == kCellDefault) ? ringDefault
+                                     : static_cast<Extension>(own);
+    }
+
+    Voicing voicingFor(Ring ring, int position, Voicing ringDefault) const
+    {
+        const int r = static_cast<int>(ring);
+        if (r < 0 || r >= kRingCount)
+            return ringDefault;
+        const int p = wrapCell(ring, position);
+        const int8_t own = voicing[r][p];
+        return (own == kCellDefault) ? ringDefault
+                                     : static_cast<Voicing>(own);
+    }
+
+    void setExt(Ring ring, int position, int8_t value)
+    {
+        const int r = static_cast<int>(ring);
+        if (r < 0 || r >= kRingCount) return;
+        ext[r][wrapCell(ring, position)] = value;
+    }
+
+    void setVoicing(Ring ring, int position, int8_t value)
+    {
+        const int r = static_cast<int>(ring);
+        if (r < 0 || r >= kRingCount) return;
+        voicing[r][wrapCell(ring, position)] = value;
+    }
+
+    /*
+     * A position, folded into the ring it belongs to.
+     *
+     * The ring's OWN segment count, not a blanket 24: the outer ring has 24 but
+     * the key and dim rings have 12, so a blanket modulo would let position 13
+     * on a 12-segment ring address a slot no cell can ever reach, and the value
+     * stored there would be invisible. Folding by the real count means position
+     * 13 and position 1 are the same cell, which is what they are on the wheel.
+     */
+    static int wrapCell(Ring ring, int position)
+    {
+        const int n = kRingSegments[static_cast<int>(ring)];
+        return ((position % n) + n) % n;
+    }
+};
+
+/*
+ * The table as one state string.
+ *
+ * Every cell of every ring, extension and voicing together, so the whole table
+ * travels as one value. DPF replays the state map into stateChanged() on UI
+ * attach, and a table split across many keys could arrive half-applied.
+ *
+ * Only cells that differ from the default are written, which keeps a fresh
+ * session's string short and makes the common case cheap to parse:
+ *
+ *     ring.position.ext.voicing,...
+ */
+static constexpr int kCellSettingsStringMax = 1024;
+
+inline void encodeCellSettings(const CellSettings& cs, char* out, size_t cap)
+{
+    out[0] = '\0';
+    int len = 0;
+    bool first = true;
+
+    for (int r = 0; r < kRingCount; ++r) {
+        for (int p = 0; p < kRingSegments[r]; ++p) {
+            const int8_t e = cs.ext[r][p];
+            const int8_t v = cs.voicing[r][p];
+            if (e == kCellDefault && v == kCellDefault)
+                continue;
+            if (static_cast<size_t>(len) + 20 >= cap)
+                return;          /* full: what fits is valid, the rest is default */
+            len += std::snprintf(out + len, cap - len, "%s%d.%d.%d.%d",
+                                 first ? "" : ",", r, p,
+                                 static_cast<int>(e), static_cast<int>(v));
+            first = false;
+        }
+    }
+}
+
+/*
+ * Anything malformed leaves that cell at its default, for the same reason
+ * decodeKeyMap() keeps factory bindings: a cell that quietly plays the ring's
+ * chord is a far better failure than one that plays nothing.
+ */
+inline void decodeCellSettings(const char* value, CellSettings& out)
+{
+    CellSettings parsed;   /* starts all-default */
+
+    const char* p = value;
+    while (p != nullptr && *p != '\0') {
+        int r = 0, pos = 0, e = 0, v = 0;
+        if (std::sscanf(p, "%d.%d.%d.%d", &r, &pos, &e, &v) == 4) {
+            if (r >= 0 && r < kRingCount &&
+                pos >= 0 && pos < kRingSegments[r]) {
+                if (e == kCellDefault || (e >= 0 && e < kExtCount))
+                    parsed.ext[r][pos] = static_cast<int8_t>(e);
+                if (v == kCellDefault || (v >= 0 && v < kVoicingCount))
+                    parsed.voicing[r][pos] = static_cast<int8_t>(v);
+            }
+        }
+        p = std::strchr(p, ',');
+        if (p != nullptr) ++p;
+    }
+
+    out = parsed;
+}
+
 /* Pedal bindings, so a player with a sustain pedal can spend it on something
  * other than sustain - and free C# for another use. */
 enum PedalAction {
@@ -1313,23 +1471,44 @@ struct ChordTarget {
     ChordType type;
     Ring      ring;
     int       octave;
+    /*
+     * How the chord is arranged - inversion and spacing in one axis.
+     *
+     * Part of the address because it is decided by the SOURCE, per cell, and
+     * every consumer needs it. Leaving it out meant the builder reached for a
+     * ring-wide value instead, which is the bug this carries the fix for: the
+     * builder has a rootAbove but no position, so it had no way to ask what the
+     * cell wanted and took what the ring said.
+     *
+     * kVoicingRegular is the neutral default, so a caller that does not care
+     * keeps the behaviour it had.
+     */
+    Voicing   voicing;
 
     /* Constructors rather than default member initialisers: the plugin builds
      * against a pre-C++17 standard, where a class with NSDMIs is not an
-     * aggregate and so cannot be brace-initialised from its four values. */
+     * aggregate and so cannot be brace-initialised from its values. */
     ChordTarget()
-        : rootAbove(0), type(kChordMajor), ring(kRingKey), octave(4) {}
+        : rootAbove(0), type(kChordMajor), ring(kRingKey), octave(4),
+          voicing(kVoicingRegular) {}
 
-    ChordTarget(int rootAbove_, ChordType type_, Ring ring_, int octave_)
-        : rootAbove(rootAbove_), type(type_), ring(ring_), octave(octave_) {}
+    ChordTarget(int rootAbove_, ChordType type_, Ring ring_, int octave_,
+                Voicing voicing_ = kVoicingRegular)
+        : rootAbove(rootAbove_), type(type_), ring(ring_), octave(octave_),
+          voicing(voicing_) {}
 };
 
 /* Do these name the same chord in the same place? The question every glide asks
  * before deciding there is anywhere to travel to. */
 inline bool sameChord(const ChordTarget& a, const ChordTarget& b)
 {
+    /* Voicing counts: a re-inversion moves voices by different intervals, so two
+     * addresses differing only in voicing are genuinely different chords to play
+     * even though their root and quality match. MPE glide exists to carry exactly
+     * that kind of move. */
     return a.rootAbove == b.rootAbove && a.type == b.type &&
-           a.ring == b.ring && a.octave == b.octave;
+           a.ring == b.ring && a.octave == b.octave &&
+           a.voicing == b.voicing;
 }
 
 /*
