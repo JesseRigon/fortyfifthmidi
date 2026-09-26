@@ -1,6 +1,6 @@
 # Chord building — one request, four sources
 
-Status: **proposed.** Review before implementation.
+Status: **partly done.** Steps 0-5 landed in e852b94; steps 6-7 (Slide Mode and the sequencer) remain.
 
 Reported: *"in the UI per-cell selections for how to build the chord are
 followed, but in keyboard mode it seems that it adheres to the old ring system.
@@ -187,20 +187,20 @@ UI thread was writing settings the audio thread read, ordered only by hope.
 
 ## 4. Steps
 
-- [ ] **0. Baseline.** 13 suites green, tree committed, build staged.
-- [ ] **1. Tests first, and they must fail.** Assert through the harness that a
+- [x] **0. Baseline.** 13 suites green, tree committed, build staged.
+- [x] **1. Tests first, and they must fail.** Assert through the harness that a
       keyboard note and a pointer click on the *same cell* emit the *same*
       notes, and that setting one cell's type leaves its neighbours alone. These
       must go red before any fix — this is the bug, so a test that passes now is
       testing the wrong thing.
-- [ ] **2. Introduce `ChordRequest`** composing `ChordTarget`. Thread it through
+- [x] **2. Per-cell settings carried as data** composing `ChordTarget`. Thread it through
       `buildCellChord()`/`startGroup()` with no behaviour change.
-- [ ] **3. Move per-cell storage into the DSP**, with a state key for the whole
+- [x] **3. Move per-cell storage into the DSP**, with a state key for the whole
       table and round-trip coverage.
-- [ ] **4. Resolve per cell, not per ring.** `chordTypeForRing()` becomes
+- [x] **4. Resolve per cell, not per ring.** `chordTypeForRing()` becomes
       `chordTypeForCell()`, reading `fCellExt[ring][pos]` and falling back to the
       ring default. The step-1 tests go green here.
-- [ ] **5. Delete `pushCellExtension()`** and the UI's push-before-gesture
+- [x] **5. Delete `pushCellExtension()`** and the UI's push-before-gesture
       mechanism. The UI becomes a pure source of requests.
 - [ ] **6. Slide Mode through the same path**, per-cell settings included.
 - [ ] **7. Sequencer onto `ChordRequest`**, so `chordTypeFor()` and
@@ -231,3 +231,43 @@ does. Worth an assertion rather than a comment.
 extension, but `applyVoicing()` is called with `fRingVoicing[ring]` inside the
 builder — so step 4 must move both, or voicing keeps the old bug while extension
 is fixed, which would be a confusing half-state.
+
+
+---
+
+## 6. What landed, and what did not
+
+**Done (e852b94).** The reported fault is fixed: a cell sounds the same chord
+whether it is clicked or played from a key, and one cell's type no longer moves
+its neighbours. `CellSettings` lives in the DSP, `chordTypeForCell()` and
+`voicingForCell()` replace the ring-wide lookups, the table travels as one state
+key, and `pushCellExtension()` is gone.
+
+Rather than a `ChordRequest` struct, voicing joined the existing `ChordTarget` —
+the chord's address already carried root, type, ring and octave, and voicing
+belongs with them. A separate request type would have duplicated four fields to
+add one.
+
+**A second bug the tests found.** The glide's snap rebuilds from the source the
+phrase *started* on, so it arranged the landed chord with the **origin** cell's
+voicing: a keyboard glide arrived on `[62 65 69]` where a press on the same cell
+gives `[65 69 74]`. Same chord, wrong inversion, heard as the glide landing and
+then jumping.
+
+**Not done.** Steps 6 and 7. Slide Mode still pushes its own `fSlideRingExt[]`
+before each gesture, and the sequencer still has its own `chordTypeFor()`. Both
+work today; neither shares the wheel's per-cell table. Slide Mode is the more
+interesting of the two, because its own source comment records a past bug where
+the two screens' settings leaked into each other — the same class of fault as the
+one just fixed, and the reason `fSlideRingExt[]` exists at all.
+
+## 7. Both axes had to move together
+
+Extension changes the *number* of notes; voicing changes *which* notes. So a note
+count catches a wrong extension and is blind to a wrong inversion — reverting
+voicing to a ring-wide lookup passed the entire suite until an assertion compared
+pitches. Fixing extension alone would have produced the right chord in the wrong
+inversion from a keyboard, which is harder to diagnose than the original bug.
+
+The same blindness hid the snap bug. Both were found by fault injection, not by
+reading the code.
