@@ -1,0 +1,110 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE CARLA-PROJECT>
+<!--
+  FortyFifthMidi test rig - TEMPLATE.
+
+  dev/carla.sh copies this to dev/fortyfifth-test.carxp when that file is
+  missing, substituting the @PLACEHOLDERS@. The generated file is gitignored:
+  it names one machine's paths and devices, and Carla rewrites it on every save
+  with the synth's entire parameter set, so it churns.
+
+  The chain:
+
+      keyboard  ->  FortyFifthMidi  ->  a synth  ->  speakers
+                    (MIDI in/out)       (sound)
+
+  FortyFifthMidi emits MIDI only, so something has to make the sound.
+
+  TWO THINGS THAT ARE NOT IN THIS FILE, because Carla ignores them here:
+
+    Process mode must be CONTINUOUS RACK, set in Settings > Engine. A
+    <ProcessMode> tag inside <EngineSettings> is ignored and stripped on the
+    next save. Rack is what chains the plugins to each other; under Patchbay
+    they load looking correct and produce silence.
+
+    The audio driver and device, likewise in Settings > Engine. On Windows both
+    live in the registry under HKCU\Software\falkTX\Carla2, not in a config
+    file.
+
+  WHAT *IS* IN THIS FILE is <ExternalPatchbay> at the bottom. Rack mode chains
+  the plugins but connects the rack to NOTHING - not the keyboard, not the
+  speakers. Carla only discovers devices; it opens one when connected and never
+  before. Those three cables are the whole connection to the outside world.
+
+  The audio ports are plain "Left" and "Right" rather than the sound card's own
+  name, because the device is already chosen in engine settings. The MIDI port
+  is the controller's name exactly as Windows reports it.
+-->
+<CARLA-PROJECT VERSION='2.5'>
+ <EngineSettings>
+  <ForceStereo>false</ForceStereo>
+  <PreferPluginBridges>false</PreferPluginBridges>
+  <PreferUiBridges>true</PreferUiBridges>
+  <UIsAlwaysOnTop>false</UIsAlwaysOnTop>
+  <MaxParameters>200</MaxParameters>
+  <UIBridgesTimeout>4000</UIBridgesTimeout>
+ </EngineSettings>
+
+ <Transport>
+  <BeatsPerMinute>120</BeatsPerMinute>
+ </Transport>
+
+ <!--
+   The plugin under test. Carla wants the binary INSIDE the .vst3 bundle, not
+   the bundle directory - pointing at the directory fails discovery with an
+   assertion about the file type.
+ -->
+ <Plugin>
+  <Info>
+   <Type>VST3</Type>
+   <Name>FortyFifthMidi</Name>
+   <Binary>@PLUGIN@</Binary>
+   <Label>FortyFifthMidi</Label>
+  </Info>
+
+  <Data>
+   <Active>Yes</Active>
+   <ControlChannel>N</ControlChannel>
+   <Options>0x1</Options>
+  </Data>
+ </Plugin>
+
+ <!--
+   The synth. Second in the rack, so it receives the plugin's MIDI output.
+   Swap the binary for any VST2 or VST3 synth; a VST2 needs its UniqueID, which
+   carla-discovery-native.exe will print.
+ -->
+ <Plugin>
+  <Info>
+   <Type>VST2</Type>
+   <Name>Helm</Name>
+   <Binary>@SYNTH@</Binary>
+   <UniqueID>1214606445</UniqueID>
+  </Info>
+
+  <Data>
+   <Active>Yes</Active>
+   <ControlChannel>N</ControlChannel>
+   <Options>0x1</Options>
+  </Data>
+ </Plugin>
+
+ <!--
+   The three cables that connect the rack to the world. Carla makes none of
+   these itself.
+ -->
+ <ExternalPatchbay>
+  <Connection>
+   <Source>MidiIn:@MIDI@</Source>
+   <Target>Carla:MidiIn</Target>
+  </Connection>
+  <Connection>
+   <Source>Carla:AudioOut1</Source>
+   <Target>AudioOut:Left</Target>
+  </Connection>
+  <Connection>
+   <Source>Carla:AudioOut2</Source>
+   <Target>AudioOut:Right</Target>
+  </Connection>
+ </ExternalPatchbay>
+</CARLA-PROJECT>

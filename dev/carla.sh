@@ -33,13 +33,24 @@ CARLA_EXE='C:\Tools\Carla-2.5.10-win64\Carla\Carla.exe'
 PROJECT_WIN='J:\My Drive\Life\5 Media\Music\VSTs\fortyfifthmidi\fortyfifth-test.carxp'
 STAGE='/mnt/j/My Drive/Life/5 Media/Music/VSTs/fortyfifthmidi'
 
-# Close Carla so it SAVES.
+# What the generated project points at. Overridable, because none of it is
+# portable: a Windows path to the staged plugin, a synth to make the sound, and
+# the controller's name exactly as Windows reports it (midiInGetDevCaps).
+RIG_PLUGIN="${RIG_PLUGIN:-J:\\My Drive\\Life\\5 Media\\Music\\VSTs\\fortyfifthmidi\\FortyFifthMidi.vst3\\Contents\\x86_64-win\\FortyFifthMidi.vst3}"
+RIG_SYNTH="${RIG_SYNTH:-J:\\My Drive\\Life\\5 Media\\Music\\VSTs\\Helm\\helm64.dll}"
+RIG_MIDI="${RIG_MIDI:-V49}"
+
+# Close Carla before the build, since Windows holds the plugin DLL open.
 #
-# Stop-Process -Force kills it outright, and Carla writes its engine settings
-# and its patchbay connections on a clean exit - so a forced kill silently
-# discards the audio device and the cables you just drew, and the next launch
-# comes up unconnected again. CloseMainWindow asks it to quit properly; the
-# force is only a fallback for a hung process.
+# CloseMainWindow is tried first and usually does NOT work - Carla ignores it,
+# probably because it wants to prompt - so the force is the normal path rather
+# than a fallback. That is survivable: engine settings live in the registry
+# under HKCU\\Software\\falkTX\\Carla2 and are written as you change them, and
+# the patchbay cables live in the project file, which Carla writes on File >
+# Save. Neither depends on a clean exit.
+#
+# What a forced kill DOES lose is anything unsaved since the last File > Save,
+# so save the project after rewiring.
 close_carla() {
   powershell.exe -NoProfile -Command "
     \$p = Get-Process Carla -ErrorAction SilentlyContinue
@@ -51,6 +62,47 @@ close_carla() {
       }
     }" >/dev/null 2>&1
   sleep 1
+}
+
+# The saved project is gitignored: it names one machine's paths and devices,
+# and Carla rewrites it on every save with the synth's whole parameter set.
+# Generate it from the template on a fresh checkout, then leave it alone - it
+# is the user's working rig from that point on.
+PROJECT_LOCAL="${REPO_DIR}/dev/fortyfifth-test.carxp"
+TEMPLATE="${REPO_DIR}/dev/fortyfifth-test.carxp.template"
+
+ensure_project() {
+  [ -f "${PROJECT_LOCAL}" ] && return 0
+
+  [ -f "${TEMPLATE}" ] || {
+    echo "Missing ${TEMPLATE}" >&2
+    return 1
+  }
+
+  echo "=== first run: generating dev/fortyfifth-test.carxp ==="
+
+  # Substituted with python, NOT sed.
+  #
+  # These are Windows paths, and sed reads a backslash in the REPLACEMENT as an
+  # escape: "\5 Media" in a path becomes a reference to capture group 5 and sed
+  # exits with "invalid reference \5 on `s' command's RHS", writing an empty
+  # file. Any path with a digit after a backslash hits it - which is most of
+  # them on Windows, and was this author's first one.
+  PLUGIN="${RIG_PLUGIN}" SYNTH="${RIG_SYNTH}" MIDI="${RIG_MIDI}" \
+  python3 - "${TEMPLATE}" "${PROJECT_LOCAL}" <<'PY' || return 1
+import os, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding='utf-8').read()
+for key in ('PLUGIN', 'SYNTH', 'MIDI'):
+    text = text.replace('@%s@' % key, os.environ[key])
+open(dst, 'w', encoding='utf-8').write(text)
+PY
+
+  echo "  plugin : ${RIG_PLUGIN}"
+  echo "  synth  : ${RIG_SYNTH}"
+  echo "  midi   : ${RIG_MIDI}"
+  echo "  Override any of these with RIG_PLUGIN / RIG_SYNTH / RIG_MIDI."
+  echo
 }
 
 do_build=1
@@ -89,6 +141,8 @@ if [ "${do_build}" -eq 1 ]; then
       if (\$?) { Write-Host \"  staged \$a\" } else { Write-Host \"  FAILED \$a\" }
     }" 2>&1 | grep -E 'staged|FAILED'
 fi
+
+ensure_project || exit 1
 
 # The project file lives in the repo; copy it out so Carla's recent-files list
 # points somewhere stable rather than into a WSL path.

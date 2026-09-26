@@ -11,3 +11,12 @@ compile_commands.json
 .cache/
 /bin-win/
 dist/
+
+# The Carla test rig's saved project.
+#
+# Machine-specific: it hardcodes an absolute plugin path, one particular
+# soundcard and one particular MIDI keyboard by name. Carla also rewrites it on
+# every save, dumping the synth's full parameter set, so it churns constantly.
+#
+# dev/carla.sh generates it from the template when it is missing.
+dev/fortyfifth-test.carxp
