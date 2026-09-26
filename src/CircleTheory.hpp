@@ -1419,6 +1419,21 @@ struct ActiveCells {
             ring[i].store(0, std::memory_order_release);
     }
 
+    /*
+     * Replace the whole picture at once.
+     *
+     * The DSP derives the lit set from the groups that are sounding rather
+     * than lighting and unlighting cells as it goes, so it always has the
+     * complete answer and never a delta. Publishing it wholesale means a cell
+     * cannot be left lit by a path that forgot to clear it - the failure mode
+     * that kept recurring while the two were maintained separately.
+     */
+    void setRings(const uint32_t* bits)
+    {
+        for (int i = 0; i < kRingCount; ++i)
+            ring[i].store(bits[i], std::memory_order_release);
+    }
+
     /* UI thread. Range-checked for the same reason set() is. */
     bool isOn(Ring r, int position) const
     {

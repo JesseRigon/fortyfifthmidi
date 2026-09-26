@@ -80,40 +80,44 @@ struct Engine {
         return nullptr;
     }
 
+    /*
+     * Mirrors FortyFifthPlugin::publishCells().
+     *
+     * The lit set is DERIVED from the groups that are sounding, not maintained
+     * alongside them. Every incremental version drifted, because there is
+     * always one more path that changes what sounds without remembering to
+     * change the lights too.
+     */
+    void publish()
+    {
+        uint32_t bits[kRingCount] = {0};
+        for (int i = 0; i < kMaxGroups; ++i) {
+            const Group& g = group[i];
+            if (! g.active || ! sourceIsCell(g.litCell)) continue;
+            const int r = (g.litCell >> 8) & 0xFF;
+            const int n = segmentsInRing(static_cast<Ring>(r));
+            bits[r] |= 1u << (((g.litCell & 0xFF) % n + n) % n);
+        }
+        cells.setRings(bits);
+    }
+
     void start(int source)
     {
         Group* g = alloc();
         if (g == nullptr) return;
-        g->active = true;
-        g->source = source;
-
-        if (sourceIsCell(source)) {
-            g->litCell = source;
-            cells.set(ringFromSource(source), positionFromSource(source), true);
-        } else {
-            g->litCell = -1;
-        }
+        g->active  = true;
+        g->source  = source;
+        g->litCell = sourceIsCell(source) ? source : -1;
+        publish();
     }
 
     void stop(Group* g)
     {
         if (! g->active) return;
-
-        const int  cell = g->litCell;
-        const Ring r    = ringFromSource(cell);
-        const int  pos  = positionFromSource(cell);
-
         g->active  = false;
         g->source  = -1;
         g->litCell = -1;
-
-        if (sourceIsCell(cell)) {
-            bool stillHeld = false;
-            for (int i = 0; i < kMaxGroups && ! stillHeld; ++i)
-                stillHeld = (group[i].active && group[i].litCell == cell);
-            if (! stillHeld)
-                cells.set(r, pos, false);
-        }
+        publish();      /* no "was anyone else holding it?" bookkeeping */
     }
 
     /*
@@ -127,23 +131,25 @@ struct Engine {
     void moveLit(Group* g, int newSource)
     {
         if (g == nullptr) return;
+        g->litCell = sourceIsCell(newSource) ? newSource : -1;
+        publish();
+    }
 
-        const int oldCell = g->litCell;
-        const int newCell = sourceIsCell(newSource) ? newSource : -1;
-        if (oldCell == newCell) return;
-
-        if (sourceIsCell(oldCell)) {
-            bool stillHeld = false;
-            for (int i = 0; i < kMaxGroups && ! stillHeld; ++i)
-                stillHeld = (&group[i] != g && group[i].active &&
-                             group[i].litCell == oldCell);
-            if (! stillHeld)
-                cells.set(ringFromSource(oldCell), positionFromSource(oldCell), false);
-        }
-
-        g->litCell = newCell;
-        if (newCell >= 0)
-            cells.set(ringFromSource(newCell), positionFromSource(newCell), true);
+    /*
+     * Mirrors the snap at the end of advanceGlide(): the group is stopped and
+     * restarted from its ORIGINAL source, then the cell it landed on is put
+     * back. Without that restore the snap relights the cell the phrase began
+     * on - which is why moving the highlight when the glide STARTED did not
+     * stick, and the reported symptom survived that fix.
+     */
+    void glideSnap(Group* g)
+    {
+        if (g == nullptr) return;
+        const int landed = g->litCell;
+        const int source = g->source;
+        stop(g);
+        start(source);
+        moveLit(find(source), landed);
     }
 
     /* Which cells are lit, as a sorted list, for exact comparison. */
@@ -431,6 +437,58 @@ int main()
         ok("no cell lit", e.litCount() == 0, "a sentinel has none");
         e.stopAll();
         ok("and stopping is still safe", e.litCount() == 0, "clean");
+    }
+
+
+    /* --- the snap at the end of a glide ------------------------------- */
+    /*
+     * The fix that did not hold.
+     *
+     * Moving the highlight when the glide STARTS is correct but insufficient:
+     * advanceGlide() finishes by stopping the group and restarting it from the
+     * source it began with, so the cell went straight back to where the phrase
+     * started. The lights only stay put if the landed cell survives that
+     * rebuild.
+     */
+    std::printf("\n=== the highlight survives the glide's snap ===\n");
+    {
+        Engine e;
+        const int a = packSource(kRingKey, 0);
+        const int b = packSource(kRingKey, 5);
+
+        e.start(a);
+        e.moveLit(e.find(a), b);          /* glide begins, cell moves */
+        ok("moved on the way", e.cells.isOn(kRingKey, 5), "cell 5");
+
+        e.glideSnap(e.find(a));           /* glide completes */
+        ok("still on the landed cell", e.cells.isOn(kRingKey, 5), "cell 5");
+        ok("not back at the start",  ! e.cells.isOn(kRingKey, 0), "cell 0 dark");
+        std::snprintf(d, sizeof d, "%d lit", e.litCount());
+        ok("exactly one lit", e.litCount() == 1, d);
+
+        e.stopAll();
+        ok("clean after release", e.litCount() == 0, "nothing lit");
+    }
+
+    /* A full phrase: several glides, each snapping, then release. */
+    std::printf("\n=== a phrase of glides, each one snapping ===\n");
+    {
+        Engine e;
+        int cur = packSource(kRingKey, 0);
+        e.start(cur);
+
+        bool right = true;
+        for (int p = 1; p < 12; ++p) {
+            const int nxt = packSource(kRingKey, p);
+            Group* g = e.find(cur);
+            e.moveLit(g, nxt);
+            e.glideSnap(e.find(cur));
+            if (e.litCount() != 1 || ! e.cells.isOn(kRingKey, p)) right = false;
+        }
+        ok("the lit cell tracks the phrase throughout", right, "12 glides");
+
+        e.stopAll();
+        ok("and nothing is stranded", e.litCount() == 0, "clean");
     }
 
     std::printf("\n%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);

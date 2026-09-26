@@ -999,17 +999,21 @@ private:
         bool      active    = false;
         int       source    = -1;   /* packed position|ring that started it */
         /*
-         * The cell this group LIT, kept apart from source.
+         * The cell this group is SOUNDING RIGHT NOW, as a packed ring|position,
+         * or -1 when it has no wheel cell (the sequencer's case).
          *
-         * source is reassigned while the group is still sounding: a merge sets
-         * it to kMergedSource so a later move does not try to move the group
-         * again. That destroyed the only record of which cell had been lit, so
-         * stopGroup() could not turn it off and the highlight stayed on
-         * forever with nothing playing.
+         * Not the cell it started on. A glide moves a group's notes onto a
+         * different chord without stopping it, so where it started stops being
+         * true the moment the glide begins; and source cannot answer either,
+         * since a merge reassigns it to a sentinel.
          *
-         * -1 when this group has no cell, which is the sequencer's case.
+         * This is the single fact the highlight is derived from, which is why
+         * it is updated everywhere the chord changes rather than only at the
+         * start. Anything that changes what a group sounds must set it, or the
+         * lights and the sound part company - which is exactly what kept
+         * happening while they were maintained separately.
          */
-        int       litCell   = -1;
+        int       cell      = -1;
         int       root      = 0;
         ChordType type      = kChordMajor;
         Ring      ring      = kRingKey;
@@ -1113,50 +1117,47 @@ private:
     }
 
     /*
-     * Move a group's lit cell, for a glide that changes which cell sounds.
+     * Republish the highlight from the groups that are actually sounding.
      *
-     * A glide does not stop one group and start another - it retargets the
-     * notes of the group already sounding, which is the point: nothing
-     * retriggers. But that left the HIGHLIGHT behind on the cell the glide
-     * started from, because litCell is written when a group starts and never
-     * again.
+     * THE LIGHTS ARE DERIVED, NOT MAINTAINED. Every earlier attempt kept a
+     * second set of books - light here, unlight there, remember to do both on
+     * every path - and every attempt drifted out of step with the sound,
+     * because there is always one more path. The glide was the one that kept
+     * being missed: it changes what a group sounds WITHOUT stopping it, and
+     * the snap at the end rebuilt the group from the original source, so even
+     * moving the highlight when the glide started was undone moments later.
      *
-     * The symptom was on the keyboard, where holding a second key glides the
-     * first key's group onto the new chord. One group means one lit cell, so
-     * two held keys lit one cell, and it never moved to the newer one - while
-     * both chords sounded correctly, because the audio path never consults any
-     * of this.
-     *
-     * Unlighting is conditional for the same reason stopGroup's is: another
-     * group may still be holding the cell being left.
+     * So the lit set is recomputed from the live groups whenever they change.
+     * At most kMaxGroups iterations over three words, and it cannot drift,
+     * because there is nothing to keep in step: if a group is sounding a cell,
+     * that cell is lit; if none is, it is not.
      */
-    void moveLitCell(VoiceGroup* g, int newSource)
+    void publishCells()
+    {
+        uint32_t bits[kRingCount] = {0};
+
+        for (int i = 0; i < kMaxGroups; ++i) {
+            const VoiceGroup& g = fGroup[i];
+            if (! g.active || ! sourceIsCell(g.cell))
+                continue;
+
+            const int r = (g.cell >> 8) & 0xFF;
+            const int n = segmentsInRing(static_cast<Ring>(r));
+            bits[r] |= 1u << (((g.cell & 0xFF) % n + n) % n);
+        }
+
+        fCells.setRings(bits);
+    }
+
+    /* A group is now sounding a different cell - during a glide, which moves
+     * a group's notes without stopping it. Updating the group is enough; the
+     * lights follow from it. */
+    void setGroupCell(VoiceGroup* g, int newSource)
     {
         if (g == nullptr)
             return;
-
-        const int oldCell = g->litCell;
-        const int newCell = sourceIsCell(newSource) ? newSource : -1;
-
-        if (oldCell == newCell)
-            return;
-
-        if (sourceIsCell(oldCell)) {
-            bool stillHeld = false;
-            for (int i = 0; i < kMaxGroups && ! stillHeld; ++i)
-                stillHeld = (&fGroup[i] != g &&
-                             fGroup[i].active &&
-                             fGroup[i].litCell == oldCell);
-            if (! stillHeld)
-                fCells.set(ring_from_source(oldCell),
-                           position_from_source(oldCell), false);
-        }
-
-        g->litCell = newCell;
-
-        if (newCell >= 0)
-            fCells.set(ring_from_source(newCell),
-                       position_from_source(newCell), true);
+        g->cell = sourceIsCell(newSource) ? newSource : -1;
+        publishCells();
     }
 
     /*
@@ -1276,12 +1277,8 @@ private:
          * errant highlight: chords sounded correctly throughout, because the
          * audio path never consulted any of this.
          */
-        if (sourceIsCell(source)) {
-            g->litCell = source;
-            fCells.set(ring_from_source(source), position_from_source(source), true);
-        } else {
-            g->litCell = -1;
-        }
+        g->cell = sourceIsCell(source) ? source : -1;
+        publishCells();
 
         /* Remember this chord as the reference the next one leads from. Kept
          * even after the chord stops, so a gap between chords still leads
@@ -1339,31 +1336,16 @@ private:
          * and clearing unconditionally would darken a cell that is still
          * sounding, which is the highlight telling a lie.
          */
-        /*
-         * Unlight by litCell, not by source.
-         *
-         * source can have been reassigned since this group started - a merge
-         * sets it to kMergedSource - so it no longer says which cell was lit.
-         * litCell is written once, when the cell is lit, and never changes.
-         */
-        const int  cell = g->litCell;
-        const Ring r    = ring_from_source(cell);
-        const int  pos  = position_from_source(cell);
+        /* The group is gone, so the lights are recomputed without it. No
+         * "was anyone else holding this cell?" bookkeeping: publishCells()
+         * asks every live group, so a cell two groups share simply stays lit
+         * while either one does. */
+        g->active = false;
+        g->count  = 0;
+        g->source = -1;
+        g->cell   = -1;
 
-        g->active  = false;
-        g->count   = 0;
-        g->source  = -1;
-        g->litCell = -1;
-
-        /* Only a group that lit a cell has one to clear. The sequencer lights
-         * none, and neither does a group whose voices were all refused. */
-        if (sourceIsCell(cell)) {
-            bool stillHeld = false;
-            for (int i = 0; i < kMaxGroups && ! stillHeld; ++i)
-                stillHeld = (fGroup[i].active && fGroup[i].litCell == cell);
-            if (! stillHeld)
-                fCells.set(r, pos, false);
-        }
+        publishCells();
         /* Clear the identity too. A recycled slot that kept a stale note number
          * would be found by the next lookup for that note and silence the wrong
          * chord - the same class of bookkeeping slip that stranded notes before. */
@@ -1384,10 +1366,10 @@ private:
             stopGroup(frame, &fGroup[i]);
         fNoteOffCountdown = 0;
 
-        /* Everything stopped, so nothing may still be lit. Clearing outright
-         * rather than relying on the per-group unlight, which cannot know
-         * about the stranded pitches this function also sweeps. */
-        fCells.clear();
+        /* Every group is inactive now, so this publishes an empty set. Kept as
+         * a republish rather than a clear() so there remains exactly one way
+         * the lit set is decided. */
+        publishCells();
 
         /* Nothing is sounding, so nothing may still be referenced. A stale
          * last-note would make the next keypress try to glide from a group
@@ -1484,6 +1466,17 @@ private:
         const uint8_t vel    = g->velocity;
         const int     source = g->source;
         const bool    wasMpe = g->mpe;
+        /*
+         * The cell the glide LANDED on, carried across the rebuild.
+         *
+         * startGroup() derives the cell from the source it is handed, and the
+         * source here is still the one the glide started from - a drag keeps
+         * its identity so a later move can find it, and a merge may have
+         * replaced it with a sentinel outright. Rebuilding from that relit the
+         * cell the phrase began on, which is why moving the highlight when the
+         * glide STARTED did not stick: this ran moments later and put it back.
+         */
+        const int     landed = g->cell;
         /* Carry the originating note across the rebuild, or the key holding
          * this chord could no longer release it. The octave comes from
          * fGlideTargetOct, since a glide may have crossed octaves. */
@@ -1497,6 +1490,11 @@ private:
         startGroup(0, source, fGlideTargetRoot, fGlideTargetType,
                    fGlideTargetRing, vel, /* retriggerDuplicates */ false,
                    fGlideTargetOct, note);
+
+        /* Restore the cell the glide landed on, since startGroup took it from
+         * the stale source. */
+        if (VoiceGroup* landedGroup = findGroup(source))
+            setGroupCell(landedGroup, landed);
 
         /* Zero every channel that carried a bend, not just the base one. */
         if (wasMpe) {
@@ -1630,10 +1628,6 @@ private:
                 /* A pointer drag stays in the octave the group already has. */
                 fGlideTargetOct   = g->octave;
                 fGlideSource      = g->source;
-
-                /* The glide lands on a different cell, so the highlight moves
-                 * with it rather than staying where the drag began. */
-                moveLitCell(g, source);
                 fGlideElapsed     = 0;
                 fGlideDuration    = static_cast<uint32_t>(
                     fGlideTimeMs * fSampleRate / 1000.0);
@@ -1667,6 +1661,12 @@ private:
                     stopGroup(0, g);
                     startGroup(0, source, root, type, r, vel, false, oct, note);
                     fDragSource = source;
+                } else {
+                    /* The group carries on, sounding the cell the drag reached
+                     * - whether it glided there or the chords happened to
+                     * share their notes. Either way that is where it is now,
+                     * so that is what lights. */
+                    setGroupCell(g, source);
                 }
                 break;
             }
@@ -2087,10 +2087,6 @@ private:
                  * now down owns what is sounding, so its release ends it. */
                 from->midiNote = midiNote;
 
-                /* ...and it now sounds a different cell, so the highlight has
-                 * to follow it there. */
-                moveLitCell(from, source);
-
                 if (fGlideMode == kGlideMpe) {
                     uint8_t want[kMaxGroupNotes];
                     const int n = buildCellChord(root, type, ring, oct, want);
@@ -2106,6 +2102,13 @@ private:
                 }
 
                 if (fGlideActive) {
+                    /* The group is committed to the new chord, so it is now
+                     * sounding a different cell and the lights follow it
+                     * there. Only here: the fall-through below abandons the
+                     * glide and starts a fresh group instead, and moving the
+                     * cell for a glide that does not happen would light a cell
+                     * this group never plays. */
+                    setGroupCell(from, source);
                     fLastKeyboardNote = midiNote;
                     return;
                 }
